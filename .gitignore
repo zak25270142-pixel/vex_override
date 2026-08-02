@@ -1,0 +1,19 @@
+# VEX/C++ build outputs
+/bin/
+/build/
+*.o
+*.obj
+*.elf
+*.bin
+*.map
+*.d
+
+# Generated compilation database
+/compile_commands.json
+
+# Editor and operating-system noise
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
