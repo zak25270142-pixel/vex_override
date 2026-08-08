@@ -100,9 +100,9 @@ void Screen_Button::draw_button(Draw_state need_draw)
     }
 }
 
-Control_key::Control_key(vex::timer *t, uint16_t press_gap, uint16_t first_press_gap,
+Control_key::Control_key(uint16_t press_gap, uint16_t first_press_gap,
                          uint16_t flag_clear_gap, KEY_MODE mode)
-    : TIMER(t), press_gap(press_gap), first_press_gap(first_press_gap),
+    : press_gap(press_gap), first_press_gap(first_press_gap),
       flag_clear_gap(flag_clear_gap), mode(mode)
 {
     first_press_time = 0;
@@ -115,10 +115,7 @@ Control_key::Control_key(vex::timer *t, uint16_t press_gap, uint16_t first_press
 }
 void Control_key::refresh()
 {
-    if (TIMER)
-        now_time = vex::timer::system();
-    else
-        now_time = TIMER->time();
+    now_time = get_time_ms();
     if (mode == disable)
         return;
     if (state)
@@ -265,11 +262,7 @@ void Remote_Control::set_state()
 
 void Remote_Control::refresh(int32_t current_value_x, int32_t current_value_y)
 {
-    uint32_t now;
-    if (TIMER)
-        now = vex::timer::system();
-    else
-        now = TIMER->time();
+    uint32_t now = get_time_ms();
     if (now - 2 >= value[value_p].time)
     {
         value_p = (value_p + 1) % 8;

@@ -1,20 +1,19 @@
 #include "key_set.h"
-#include "timer.h"
 
 vex::controller Remote_Controller = vex::controller(vex::primary); // 生成遥控 类
 
-Remote_Control right_axis(&TimerA);
-Remote_Control left_axis(&TimerA);
+Remote_Control right_axis;
+Remote_Control left_axis;
 
-Control_key key_enter(&TimerA);
-Control_key key_up(&TimerA);
-Control_key key_down(&TimerA);
-Control_key key_left(&TimerA);
-Control_key key_right(&TimerA);
-Control_key key_add(&TimerA);
-Control_key key_reduce(&TimerA);
-Control_key key_back(&TimerA);
-Control_key key_shift(&TimerA);
+Control_key key_enter;
+Control_key key_up;
+Control_key key_down;
+Control_key key_left;
+Control_key key_right;
+Control_key key_add;
+Control_key key_reduce;
+Control_key key_back;
+Control_key key_shift;
 
 Screen_Button button1(nullptr); // 暂不关联逻辑键，且不可用
 Screen_Button button2(nullptr);

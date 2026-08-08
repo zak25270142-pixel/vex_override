@@ -7,6 +7,10 @@ vex::motor motorD(vex::PORT14, vex::ratio6_1, false);
 vex::motor motorE(vex::PORT15, vex::ratio6_1, false);
 vex::motor motorF(vex::PORT16, vex::ratio6_1, false);
 
+// 电机组必须在六台电机之后创建，因为 motor_group 保存的是电机对象的引用。
+vex::motor_group left_motors(motorA, motorB, motorC);
+vex::motor_group right_motors(motorD, motorE, motorF);
+
 // pid常量
 struct Motor_kpid
 {
@@ -46,7 +50,6 @@ class MotorCtrl
 {
 private:
     Motor_kpid pid;              // pid常量
-    vex::timer *TIMER = nullptr; // 时间定时器指针
 
 public:
     Motor_pid_midvalue pid_midvalue;                              // pid中间变量
@@ -57,8 +60,8 @@ public:
     vex::motor *motors[4] = {nullptr, nullptr, nullptr, nullptr}; // 电机(组)指针
 
     MotorCtrl(Motor_kpid kpid, float (*get_value)(vex::motor *), float (*pid_output)(Motor_pid_midvalue, Motor_kpid),
-              vex::motor *m1, vex::motor *m2 = nullptr, vex::motor *m3 = nullptr, vex::motor *m4 = nullptr, vex::timer *t = nullptr)
-        : pid(kpid), TIMER(t)
+              vex::motor *m1, vex::motor *m2 = nullptr, vex::motor *m3 = nullptr, vex::motor *m4 = nullptr)
+        : pid(kpid)
     {
         motors[0] = m1;
         motors[1] = m2;
@@ -68,7 +71,7 @@ public:
     void refresh()
     { // 数据更新
         // 时间相关
-        uint32_t now_time = get_time_ms(TIMER);
+        uint32_t now_time = get_time_ms();
         pid_midvalue.gap_time = now_time - pid_midvalue.prev_time;
         pid_midvalue.prev_time = now_time;
         // 目标值与误差

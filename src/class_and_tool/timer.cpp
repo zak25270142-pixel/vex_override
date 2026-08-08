@@ -1,15 +1,9 @@
 #include "timer.h"
 
-vex::timer TimerA;
-uint32_t get_time_ms(vex::timer *tmr = nullptr);
+uint32_t get_time_ms();
 
 void Timer_init()
 {
-}
-
-void Timer_event()
-{
-    TimerA.event(Timer_init, 114); // 未知用法，114ms后运行Timer_init()
 }
 
 void Delay(double time)
@@ -17,43 +11,40 @@ void Delay(double time)
     vex::wait(time, vex::msec);
 }
 
-void wait_to(uint32_t time, vex::timer *tmr)
+void wait_to(uint32_t time)
 { // 延时到整点time ms
 
-    double need_wait = time - get_time_ms(tmr);
+    double need_wait = time - get_time_ms();
     if (need_wait <= 0)
         return;
     else
         vex::wait(need_wait, vex::msec);
 }
 
-uint32_t get_time_ms(vex::timer *tmr)
+uint32_t get_time_ms()
 {
-    if (tmr)
-        return tmr->system();
     return vex::timer::system();
 }
 
 // CycleTimer类
-CycleTimer::CycleTimer(uint8_t time_ms, vex::timer *Timer) : TIMER(Timer), period(time_ms) {}
+CycleTimer::CycleTimer(uint8_t time_ms) : period(time_ms) {}
 
 void CycleTimer::cycle()
 { // 周期循环 规范每周期时间
-    if (need_time > TIMER->time())
-        wait_to(need_time, TIMER);
+    if (need_time > vex::timer::system())
+        wait_to(need_time);
     if (Monitor)
     {
         last_start = next_start;
-        next_start = TIMER->systemHighResolution();
+        next_start = vex::timer::systemHighResolution();
     }
-    need_time = get_time_ms(TIMER) + period;
+    need_time = get_time_ms() + period;
 }
 
 uint64_t CycleTimer::get_real_period() { return (next_start - last_start); }
 
-void CycleTimer::cycletimer_reset(uint8_t t_period, vex::timer *Timer)
+void CycleTimer::cycletimer_reset(uint8_t t_period)
 {
-    TIMER = Timer;
     period = t_period;
     need_time = 0;
 }
@@ -61,9 +52,9 @@ void CycleTimer::cycletimer_reset(uint8_t t_period, vex::timer *Timer)
 void CycleTimer::monitor(bool enable)
 {
     Monitor = enable;
-    if (enable && TIMER)
+    if (enable)
     {
-        last_start = TIMER->systemHighResolution();
+        last_start = vex::timer::systemHighResolution();
         next_start = last_start;
     }
     else

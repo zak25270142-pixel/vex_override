@@ -6,7 +6,6 @@
 class Control_key // 处理按键信号
 {
 private:
-    vex::timer *TIMER;         // 指定参照定时器
     uint32_t first_press_time; // 最初按下时刻
     uint32_t end_press_time;   // 最后按下时刻
     uint32_t last_press_time;  // 上次输出时刻
@@ -27,7 +26,7 @@ public:
     uint16_t flag_clear_gap;  // 按键信息长时间未处理清零阈值
     KEY_MODE mode;            // 按键模式
     int8_t state;             // 按键实际情况
-    Control_key(vex::timer *t = nullptr, uint16_t press_gap = 100, uint16_t first_press_gap = 500,
+    Control_key(uint16_t press_gap = 100, uint16_t first_press_gap = 500,
                 uint16_t flag_clear_gap = 2000, KEY_MODE mode = disable);
     void refresh();
     bool read(bool get_long_press = false, bool only_read = false);
@@ -94,7 +93,6 @@ private:
         int32_t value_x; // 时间
         int32_t value_y;
     };
-    vex::timer *TIMER; // 指定参照定时器
 
 public:
     enum STATE
@@ -110,7 +108,7 @@ public:
     Control_key *down_state = nullptr;
     Control_key *left_state = nullptr;
     Control_key *right_state = nullptr;
-    Remote_Control(vex::timer *timer = nullptr) : TIMER(timer) {}
+    Remote_Control() {}
     t_v_list value[8] = {0};
     uint8_t value_p = 0;
     STATE state;
