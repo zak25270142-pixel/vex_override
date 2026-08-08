@@ -3,20 +3,7 @@
 
 #include "vex.h"
 
-/*
- * 通用位置式 PID 控制器。
- *
- * 这个类只负责数学计算，不直接读取传感器，也不直接控制电机。
- * 使用者在外部计算“目标值 - 当前值”，再把误差传给 update()。
- * 因此同一个类可以用于底盘距离、底盘转角、云台角度、升降位置和飞轮速度。
- *
- * 不需要为 P、PI、PD 和 PID 分别设计类：
- *
- *   PositionPID p_controller (1.0f);               // 只有 P
- *   PositionPID pi_controller(1.0f, 0.1f);         // P + I
- *   PositionPID pd_controller(1.0f, 0.0f, 0.2f);   // P + D
- *   PositionPID pid_controller(1.0f, 0.1f, 0.2f);  // P + I + D
- */
+// 通用位置式 PID 控制器。
 class PositionPID
 {
 private:
@@ -38,34 +25,31 @@ public:
 
     // 构造函数：I、D 和输出上限均可省略。
     PositionPID(float p,
-        float i = 0.0f,
-        float d = 0.0f,
-        float output_limit = 100.0f);
+                float i = 0.0f,
+                float d = 0.0f,
+                float output_limit = 100.0f);
 
-    /*
-     * 开始一个新动作时调用 reset(error)。
-     * reset() 同时也是这个动作的第一次 PID 计算：它会清除旧状态，
-     * 保存第一份误差和时间，并返回只含 P 项的第一轮输出。
-     * 因为第一轮没有上一份测量，所以不计算 I 和 D。
-     */
-    float reset(float error,
-                uint32_t current_time_ms = vex::timer::system());
+    // 开始设置一个目标并返回第一轮输出。
+    float reset(float error, uint32_t current_time_ms = vex::timer::system());
 
-    /*
-     * 根据本轮误差计算输出。
-     *
-     * error           = 目标值 - 当前值
-     * current_time_ms = 当前系统毫秒时间戳；省略时自动读取 VEX 系统时间
-     *
-     * 内部时间单位全部为 ms：
-     *   integral   += error * gap_time_ms
-     *   derivative  = error_change / gap_time_ms
-     *
-     * 返回值范围由公开成员 max_output 决定。
-     * reset() 与第一次 update() 之间必须经过至少 1 ms。
-     */
-    float update(float error,
-                 uint32_t current_time_ms = vex::timer::system());
+    // 根据本轮误差计算输出。
+    // 内部时间单位全部为 ms：i += error * gap_time_ms;d = error_change / gap_time_ms
+    // 返回值范围由公开成员 max_output 决定。
+    float update(float error, uint32_t current_time_ms = vex::timer::system());
+};
+
+// 判断一个条件是否连续保持了指定时间。
+class StableJudge
+{
+private:
+    uint32_t stable_start_time;
+
+public:
+    uint16_t stable_time; // 单位 ms
+
+    StableJudge(uint16_t time = 180);
+
+    bool update(bool condition, uint32_t current_time = vex::timer::system());
 };
 
 #endif
