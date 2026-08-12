@@ -98,7 +98,8 @@ void pre_menu_key()
 {
     key_up.mode = Control_key::disable;
     key_down.mode = Control_key::disable;
-    key_shift.mode = Control_key::disable;
+    key_shift.mode = Control_key::lpress;
+    key_shift.first_press_gap = 65535;
     key_enter.mode = Control_key::lpress;
     key_enter.first_press_gap = 65535;
     key_back.mode = Control_key::disable;
@@ -114,10 +115,43 @@ void pre_menu_key()
     button1.can_use = true;
     button1.draw_button(Screen_Button::draw_released);
 
-    button2.can_use = false;
+    button2.reset_size(20, 55, 400, 40);
+    button2.reset_button_name("AI vision", 14, 16);
+    button2.reset_button_color(vex::blue, vex::color(0x000077));
+    button2.set_key(&key_shift);
+    button2.can_use = true;
+    button2.draw_button(Screen_Button::draw_released);
+
     button3.can_use = false;
     button4.can_use = false;
     button5.can_use = false;
+}
+
+void ai_vision_menu_key()
+{
+    key_up.mode = Control_key::disable;
+    key_down.mode = Control_key::disable;
+    key_shift.mode = Control_key::disable;
+    key_enter.mode = Control_key::disable;
+    key_add.mode = Control_key::disable;
+    key_reduce.mode = Control_key::disable;
+    key_left.mode = Control_key::disable;
+    key_right.mode = Control_key::disable;
+    key_back.mode = Control_key::lpress;
+    key_back.first_press_gap = 65535;
+
+    button1.can_use = false;
+    button2.can_use = false;
+    button3.can_use = false;
+    button4.can_use = false;
+
+    // 沿用原菜单第五行按钮边界：右侧按钮列 x=427~472，不侵入内容区。
+    button5.reset_size(427, 185, 45, 40);
+    button5.reset_button_name("back", 6, 16);
+    button5.reset_button_color(vex::yellow, vex::color(0x82620e));
+    button5.set_key(&key_back);
+    button5.can_use = true;
+    button5.draw_button(Screen_Button::draw_released);
 }
 
 void menu_key_reset()

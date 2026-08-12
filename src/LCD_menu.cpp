@@ -2,8 +2,16 @@
 #include "menu_func.h"
 #include "key_set.h"
 #include "LCD_menu.h"
+#include "ai_vision.h"
 
-bool in_pre_menu = true;
+enum MENU_state : uint8_t
+{
+    pre = 0,
+    main,
+    ai_vision,
+};
+
+static MENU_state menu_state = pre;
 
 uint32_t Lucky_num = 114514;
 uint32_t Lucky_num2 = 1919810;
@@ -32,6 +40,7 @@ const struct MENU_ITEM menu_item[] =
         {"this is an int64_t num", type_int64_t, &int64tnum},
         {"small num", type_uint8_t, &small_num},
 };
+
 static const struct MENU_ITEM monitor_menu_item[] =
     {
         {"axis_left_x", type_int32_t, &left_axis.value[left_axis.value_p].value_x},
@@ -55,19 +64,58 @@ MENU menu(menu_item,
           monitor_menu_item,
           sizeof(monitor_menu_item) / sizeof(monitor_menu_item[0]));
 
+// 颜色名称、显示颜色和检测结果在应用层逐项对应，菜单类不猜测颜色含义。
+static const AI_VISION_MENU_OBJECT ai_vision_objects[] = {
+    {"RED", 0xFF0000, &ai_colors[0].visible, &ai_colors[0].center_x,
+     &ai_colors[0].center_y, &ai_colors[0].width, &ai_colors[0].height},
+    {"YELLOW", 0xFFFF00, &ai_colors[1].visible, &ai_colors[1].center_x,
+     &ai_colors[1].center_y, &ai_colors[1].width, &ai_colors[1].height},
+    {"BLUE", 0x0000FF, &ai_colors[2].visible, &ai_colors[2].center_x,
+     &ai_colors[2].center_y, &ai_colors[2].width, &ai_colors[2].height},
+    {"GRAY", 0xAAAAAA, &ai_colors[3].visible, &ai_colors[3].center_x,
+     &ai_colors[3].center_y, &ai_colors[3].width, &ai_colors[3].height},
+    {"TAG", 0xFFFFFF, &ai_tag.visible, &ai_tag.center_x,
+     &ai_tag.center_y, &ai_tag.width, &ai_tag.height},
+};
+
+static const uint8_t AI_VISION_TAG_INDEX = 4;
+
+static bool ai_vision_connected()
+{
+    return ai_sensor.installed();
+}
+
+static AI_VISION_MENU ai_vision_menu(
+    ai_vision_connected,
+    ai_vision_objects,
+    sizeof(ai_vision_objects) / sizeof(ai_vision_objects[0]),
+    AI_VISION_TAG_INDEX,
+    &ai_tag.id,
+    &ai_tag.angle_deg,
+    ai_object_count,
+    ai_vision_menu_key,
+    menu.table_color,
+    menu.bg_color);
+
 void refresh_menu()
 {
-    if (in_pre_menu)
+    switch (menu_state)
     {
+    case pre:
         if (key_enter.read())
         {
-            in_pre_menu = false;
+            menu_state = main;
             menu_key_reset();
             menu.refresh();
         }
-    }
-    else
-    {
+        else if (key_shift.read())
+        {
+            menu_state = ai_vision;
+            ai_vision_menu.init();
+        }
+        break;
+
+    case main:
         if (key_up.read())
             menu.up();
         else if (key_down.read())
@@ -78,7 +126,7 @@ void refresh_menu()
         {
             if (menu.inner_menu)
                 menu.back();
-            else // 进入前菜单
+            else
                 pre_menu_init();
         }
         else if (key_shift.read())
@@ -88,15 +136,22 @@ void refresh_menu()
         else if (key_reduce.read())
             menu.reduce();
         else if (menu.is_monitor_menu)
-        { // 每次都刷新
             menu.refresh_value();
-        }
+        break;
+
+    case ai_vision:
+        if (key_back.read())
+            pre_menu_init();
+        else
+            ai_vision_menu.refresh();
+        break;
     }
-};
+}
 
 void pre_menu_init()
 {
+    reset_origin();
     Brain.Screen.drawRectangle(0, 0, 480, 272, vex::black);
     pre_menu_key();
-    in_pre_menu = true;
+    menu_state = pre;
 }
