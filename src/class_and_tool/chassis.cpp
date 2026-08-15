@@ -1,11 +1,18 @@
 #include "chassis.h"
-#include "motor_func.h"
 #include "timer.h"
 
 static const float math_pi = 3.14159f;
 
-Chassis::Chassis()
-    : inertial_sensor(vex::PORT17, vex::turnType::right)
+Chassis::Chassis(vex::motor_group &left,
+                 vex::motor_group &right,
+                 vex::rotation &forward_tracking,
+                 vex::rotation &left_tracking,
+                 vex::inertial &inertial)
+    : left_motors(left),
+      right_motors(right),
+      forward_tracking_sensor(forward_tracking),
+      left_tracking_sensor(left_tracking),
+      inertial_sensor(inertial)
 {
 }
 
@@ -16,15 +23,24 @@ void Chassis::init()
     stop();
     // 惯性传感器校准期间车体必须保持静止，否则零偏会不准确。
     inertial_sensor.calibrate();
-    while (inertial_sensor.isCalibrating())
-        Delay(20);
 
-    // 初始化时把电机编码器和惯性传感器都归零，建立统一的里程计原点。
+    // 电机编码器不需要校准，可以在等待其他传感器时先清零。
     left_motors.resetPosition();
     right_motors.resetPosition();
-    inertial_sensor.resetRotation();
+    forward_tracking_sensor.resetPosition();
+    left_tracking_sensor.resetPosition();
     left_is_moving = false;
     right_is_moving = false;
+}
+
+bool Chassis::is_ready()
+{
+    return !inertial_sensor.isCalibrating();
+}
+
+void Chassis::finish_init()
+{
+    inertial_sensor.resetRotation();
     previous_time = get_time_ms();
     reset();
 }
@@ -225,5 +241,3 @@ void Chassis::stop()
     left_motors.stop();
     right_motors.stop();
 }
-
-Chassis chassis;

@@ -1,8 +1,29 @@
 #include "chassis_pid_demo.h"
 #include "pid.h"
-#include "timer.h"
 
-static const uint8_t control_period = 10; // 单位 ms
+// 本车硬件只在 demo 中声明，Chassis 工具类不绑定端口。
+static vex::motor left_chassis_1(vex::PORT6, vex::ratio6_1, false);
+static vex::motor left_chassis_2(vex::PORT7, vex::ratio6_1, false);
+static vex::motor left_chassis_3(vex::PORT8, vex::ratio6_1, true);
+static vex::motor left_chassis_4(vex::PORT9, vex::ratio6_1, true);
+static vex::motor right_chassis_1(vex::PORT17, vex::ratio6_1, true);
+static vex::motor right_chassis_2(vex::PORT18, vex::ratio6_1, false);
+static vex::motor right_chassis_3(vex::PORT19, vex::ratio6_1, false);
+static vex::motor right_chassis_4(vex::PORT20, vex::ratio6_1, true);
+
+static vex::motor_group left_motors(
+    left_chassis_1, left_chassis_2, left_chassis_3, left_chassis_4);
+static vex::motor_group right_motors(
+    right_chassis_1, right_chassis_2, right_chassis_3, right_chassis_4);
+
+// 定位轮尺寸未知，暂时只完成端口归属和初始化，不参与里程计算。
+static vex::rotation forward_tracking_sensor(vex::PORT1, false);
+static vex::rotation left_tracking_sensor(vex::PORT2, false);
+static vex::inertial inertial_sensor(vex::PORT11, vex::turnType::right);
+
+Chassis chassis(left_motors, right_motors,
+                forward_tracking_sensor, left_tracking_sensor,
+                inertial_sensor);
 
 // 以下参数属于具体自动动作，不属于底盘硬件本身，因此不放进 Chassis。
 static const float distance_tolerance = 0.008f;     // m
@@ -11,127 +32,176 @@ static const float heading_tolerance = 1.0f;        // deg
 static const float angle_tolerance = 0.8f;          // deg
 static const float angular_speed_tolerance = 5.0f;  // deg/s
 
-void chassis_demo_init()
+// 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
+static PositionPID distance_pid(130.0f, 0.035f, 18000.0f);
+static PositionPID heading_pid(1.10f, 0.00010f, 40.0f, 25.0f);
+static PositionPID turn_pid(0.75f, 0.00010f, 60.0f);
+// 误差与实际速度连续满足条件 180 ms 后才结束当前步骤，避免刚经过目标就切换。
+static StableJudge stable_judge(180);
+
+TASK_STATE chassis_demo_state = task_finish;
+
+// x、y 在发布时转换为距离和方向，避免在 10 ms 刷新中重复 sqrtf、atan2f。
+struct GOTO_LOCAL_TARGET
 {
-    chassis.init();
+    float distance;  // 起点到目标点的直线距离，单位 m。
+    float direction; // 目标点相对起始车头的方向，单位 deg。
+    float heading;   // 目标最终朝向；发布时相对起点，运行时按阶段转换。
+};
+
+static GOTO_LOCAL_TARGET goto_target;
+// 0：朝向目标点；1：直线到目标点；2：纠正最终朝向。
+static uint8_t goto_step = 0;
+
+// 根据已经确定的 goto_step 建立本段坐标原点、重置 PID 并输出第一轮结果。
+// 无需转向或移动的空步骤会直接跳过，因此外层不需要额外的初始化状态。
+static void start_goto_step(uint32_t now)
+{
+    if (goto_step == 0)
+    {
+        // 第一步原地转到目标点方向；左右轮输出相反，所以车体中心不前移。
+        if (fabsf(goto_target.direction) > angle_tolerance)
+        {
+            chassis.reset();
+            float output = turn_pid.reset(goto_target.direction, now);
+            chassis.output(output, -output);
+            return;
+        }
+        // 目标就在当前朝向上，直接进入直线段。
+        goto_step = 1;
+    }
+
+    if (goto_step == 1)
+    {
+        // 第二步以当前车头为直线段基准；heading_pid 后续负责保持该方向。
+        if (goto_target.distance > distance_tolerance)
+        {
+            chassis.reset();
+            float output = distance_pid.reset(goto_target.distance, now);
+            heading_pid.reset(0.0f, now);
+            chassis.output(output, output);
+            return;
+        }
+        // 目标点就在起点附近，不存在可靠的目标点方向，只处理最终朝向。
+        goto_step = 2;
+    }
+
+    // 此前 heading 已转为绝对目标角；第三步开始时再换算成当前需要转过的角度。
+    goto_target.heading -= chassis.heading;
+    if (fabsf(goto_target.heading) <= angle_tolerance)
+    {
+        chassis.stop();
+        chassis_demo_state = task_finish;
+        return;
+    }
+
+    chassis.reset();
+    float output = turn_pid.reset(goto_target.heading, now);
+    chassis.output(output, -output);
 }
 
-void chassis_demo_drive(float distance, float max_speed)
-// distance 正数表示前进、负数表示后退；max_speed 是 PID 有效输出上限。
+void chassis_demo_refresh()
 {
-    if (fabsf(distance) <= distance_tolerance)
+    // 每轮首先更新里程、速度和航向；步骤初始化时 reset() 会再读取并建立本段原点。
+    chassis.update();
+
+    if (chassis_demo_state == task_finish)
         return;
 
-    /*
-     * 直行使用两个并行控制器：
-     * 1. 距离 PID 根据剩余距离产生共同的前进输出；
-     * 2. 航向 PID 根据惯性传感器角度产生左右差速纠偏。
-     *
-     * PID 内部时间单位统一为 ms，因此 Ki 已按每毫秒积分设置，Kd 按每毫秒微分设置。
-     */
-    PositionPID distance_pid(130.0f, 0.035f, 18000.0f, max_speed);
-    PositionPID heading_pid(1.10f, 0.00010f, 40.0f, 25.0f);
-    StableJudge stable_judge(180);
+    uint32_t now = get_time_ms();
 
-    // Chassis::reset() 读取最新状态，并在底盘对象内部保存本次动作起点。
-    chassis.reset();
-
-    uint32_t now = get_time_ms(); // 当前系统时间戳，单位 ms
-    float base_output = distance_pid.reset(distance, now);
-    heading_pid.reset(0.0f, now);
-
-    // 第一轮还没有产生航向误差，因此左右两侧使用相同的距离 PID 输出。
-    chassis.output(base_output, base_output);
-    Delay(control_period);
-
-    while (true)
+    if (chassis_demo_state == task_start)
     {
-        now = get_time_ms();
+        // 发布接口给的是相对朝向；加上任务起点航向后得到固定的绝对目标朝向。
+        goto_target.heading += chassis.heading;
+        chassis_demo_state = task_run;
 
-        /*
-         * 本轮只读取一次全部底盘传感器。下面的距离、速度、航向、角速度
-         * 都来自同一个 Chassis 快照，避免同一轮多次调用 VEX API 得到不同时间点的数据。
-         */
-        chassis.update();
+        // 距离过小时跳过“朝向目标点”和“直行”，避免使用无意义的 atan2 方向。
+        if (goto_target.distance <= distance_tolerance)
+            goto_step = 2;
+        else
+            goto_step = 0;
 
-        float distance_error = distance - chassis.distance_from_initial;
+        start_goto_step(now);
+        return;
+    }
 
-        // 目标是保持动作开始时的车头方向，因此目标相对航向始终为 0°。
+    bool finished;
+
+    if (goto_step == 0)
+    {
+        // 原地转向：目标方向减去本段已经转过的角度，得到本轮剩余误差。
+        float error = goto_target.direction - chassis.heading_from_initial;
+        float output = turn_pid.update(error, now);
+        chassis.output(output, -output);
+
+        finished = stable_judge.update(
+            fabsf(error) <= angle_tolerance &&
+                fabsf(chassis.angular_speed) <= angular_speed_tolerance,
+            now);
+    }
+    else if (goto_step == 1)
+    {
+        // 距离 PID 决定共同前进量，航向 PID 产生左右差值以保持直线。
+        float distance_error =
+            goto_target.distance - chassis.distance_from_initial;
         float heading_error = -chassis.heading_from_initial;
-
-        // 两个 PID 使用同一个系统时间戳，保证本轮的时间基准一致。
-        base_output = distance_pid.update(distance_error, now);
+        float output = distance_pid.update(distance_error, now);
         float correction = heading_pid.update(heading_error, now);
+        chassis.output(output + correction, output - correction);
 
-        /*
-         * 差速合成：共同部分控制前后移动，差值控制左右转向。
-         * Chassis::output() 统一完成等比例限幅、左右死区补偿和电机组输出。
-         */
-        chassis.output(
-            base_output + correction,
-            base_output - correction);
-
-        /*
-         * 仅仅经过目标点不能算完成。距离、实际直线速度、航向误差和实际角速度
-         * 必须同时足够小，并连续保持 180 ms，才认为小车已经稳定停在目标附近。
-         */
-        bool drive_ok =
+        finished = stable_judge.update(
             fabsf(distance_error) <= distance_tolerance &&
-            fabsf(chassis.linear_speed) <= linear_speed_tolerance &&
-            fabsf(heading_error) <= heading_tolerance &&
-            fabsf(chassis.angular_speed) <= angular_speed_tolerance;
+                fabsf(chassis.linear_speed) <= linear_speed_tolerance &&
+                fabsf(heading_error) <= heading_tolerance &&
+                fabsf(chassis.angular_speed) <= angular_speed_tolerance,
+            now);
+    }
+    else
+    {
+        // 到达目标点后原地转到调用者要求的最终朝向。
+        float error = goto_target.heading - chassis.heading_from_initial;
+        float output = turn_pid.update(error, now);
+        chassis.output(output, -output);
 
-        if (stable_judge.update(drive_ok, now))
-        {
-            chassis.stop();
-            return;
-        }
+        finished = stable_judge.update(
+            fabsf(error) <= angle_tolerance &&
+                fabsf(chassis.angular_speed) <= angular_speed_tolerance,
+            now);
+    }
 
-        Delay(control_period);
+    if (finished)
+    {
+        // 先停止上一段，再确定下一步并初始化；最后一步完成后保持 finish。
+        chassis.stop();
+        goto_step++;
+        if (goto_step >= 3)
+            chassis_demo_state = task_finish;
+        else
+            start_goto_step(now);
     }
 }
 
-void chassis_demo_turn(float angle, float max_speed)
-// angle 单位 deg，正数表示向右转，负数表示向左转。
+void chassis_demo_goto_local(float x, float y, float heading,
+                             float max_speed)
 {
-    if (fabsf(angle) <= angle_tolerance)
-        return;
+    // 这里只整理任务输入；电机输出由下一轮 chassis_demo_refresh() 开始。
+    goto_target.distance = sqrtf(x * x + y * y);
+    goto_target.heading = heading;
 
-    PositionPID turn_pid(0.75f, 0.00010f, 60.0f, max_speed);
-    StableJudge stable_judge(180);
+    // 接近原点时方向没有物理意义，不计算 atan2f(0, 0)。
+    if (goto_target.distance > distance_tolerance)
+        goto_target.direction = atan2f(y, x) * 180.0f / 3.14159f;
 
-    chassis.reset();
-    uint32_t now = get_time_ms(); // 当前系统时间戳，单位 ms
+    // 同一上限同时约束直线和转向 PID，具体左右轮限幅由 Chassis::output() 完成。
+    distance_pid.max_output = max_speed;
+    turn_pid.max_output = max_speed;
+    chassis_demo_state = task_start;
+}
 
-    /*
-     * reset() 返回第一轮纯 P 输出。左右两侧使用大小相同、方向相反的命令，
-     * 因而小车中心基本不平移，车体绕自身中心原地旋转。
-     */
-    float turn_output = turn_pid.reset(angle, now);
-    chassis.output(turn_output, -turn_output);
-    Delay(control_period);
-
-    while (true)
-    {
-        now = get_time_ms();
-        chassis.update();
-
-        float angle_error = angle - chassis.heading_from_initial;
-
-        turn_output = turn_pid.update(angle_error, now);
-        chassis.output(turn_output, -turn_output);
-
-        // 角度误差和真实角速度同时足够小并保持 180 ms，才算稳定转到目标。
-        bool turn_ok =
-            fabsf(angle_error) <= angle_tolerance &&
-            fabsf(chassis.angular_speed) <= angular_speed_tolerance;
-
-        if (stable_judge.update(turn_ok, now))
-        {
-            chassis.stop();
-            return;
-        }
-
-        Delay(control_period);
-    }
+void chassis_demo_stop()
+{
+    // main 处理暂停或超时时调用；finish 会阻止 refresh 继续产生电机输出。
+    chassis.stop();
+    chassis_demo_state = task_finish;
 }

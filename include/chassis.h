@@ -6,7 +6,12 @@
 class Chassis
 {
 private:
-    vex::inertial inertial_sensor; // 测量车体累计航向角和绕竖直轴角速度。
+    // 硬件由具体车辆创建，Chassis 只保存实际使用的电机组和惯性传感器。
+    vex::motor_group &left_motors;
+    vex::motor_group &right_motors;
+    vex::rotation &forward_tracking_sensor;
+    vex::rotation &left_tracking_sensor;
+    vex::inertial &inertial_sensor;
 
     // 是否运动
     bool left_is_moving = false;
@@ -76,10 +81,19 @@ public:
     float distance_from_initial = 0.0f; // 当前坐标沿起始车头方向相对起点的有符号距离，单位 m。
     float heading_from_initial = 0.0f;  // 当前航向相对起始航向的角度变化，向右为正，单位 deg。
 
-    Chassis();
+    Chassis(vex::motor_group &left,
+            vex::motor_group &right,
+            vex::rotation &forward_tracking,
+            vex::rotation &left_tracking,
+            vex::inertial &inertial);
 
-    // 设置停车方式并校准惯性传感器，只需在程序初始化时调用一次。
+    // 设置停车方式并启动惯性传感器校准，不在这里等待。
     void init();
+
+    bool is_ready();
+
+    // 所有传感器就绪后建立底盘里程计原点。
+    void finish_init();
 
     // 更新传感器读数，并更新运动状态。
     void update();
@@ -93,7 +107,5 @@ public:
     // 按 init() 设置的停车方式停止左右电机组。
     void stop();
 };
-
-extern Chassis chassis;
 
 #endif

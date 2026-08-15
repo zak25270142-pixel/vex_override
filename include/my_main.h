@@ -41,6 +41,14 @@ typedef enum
     type_other,
 } VALUE_TYPE;
 
+// 所有周期任务共用的生命周期；每个模块分别保存自己的状态变量。
+typedef enum
+{
+    task_start,
+    task_run,
+    task_finish,
+} TASK_STATE;
+
 void my_Init();
 void my_while();
 

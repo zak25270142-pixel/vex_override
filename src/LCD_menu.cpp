@@ -44,7 +44,6 @@ const struct MENU_ITEM menu_item[] =
 static const struct MENU_ITEM monitor_menu_item[] =
     {
         {"axis_left_x", type_int32_t, &left_axis.value[left_axis.value_p].value_x},
-        {"imu_pitch", type_double, &imu_att.pitch, "ms"},
         {"Lucky_num2", type_uint32_t, &Lucky_num2},
         {"LED PC13", type_bool, &LED_PC13_state},
         {"LED5 PWM", type_uint16_t, &LED5_pwm_num},

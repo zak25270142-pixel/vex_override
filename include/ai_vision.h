@@ -39,6 +39,9 @@ extern int32_t ai_object_count; // 本帧颜色框和 AprilTag 的总数量，�
 // 开机调用一次：开启颜色、AprilTag，并执行一次自动白平衡。
 void ai_vision_init();
 
+// AI Vision 没有白平衡完成标志，启动 2200 ms 后视为就绪。
+bool ai_vision_is_ready();
+
 // 周期调用：拍摄一帧，同时更新 ai_colors 和 ai_tag。
 void ai_vision_refresh();
 

@@ -16,6 +16,7 @@ vex::aivision ai_sensor(AI_SENSOR_PORT,
 AI_COLOR_RESULT ai_colors[AI_COLOR_COUNT] = {};
 AI_TAG_RESULT ai_tag = {};
 int32_t ai_object_count = 0;
+static uint16_t awb_start_time = 0;
 
 void ai_vision_init()
 {
@@ -26,7 +27,12 @@ void ai_vision_init()
 
     // 自动白平衡只在开机时执行，避免比赛中颜色参数不断变化。
     ai_sensor.startAwb();
-    vex::wait(2200, vex::msec);
+    awb_start_time = vex::timer::system();
+}
+
+bool ai_vision_is_ready()
+{
+    return vex::timer::system() - awb_start_time > 2300;
 }
 
 void ai_vision_refresh()
