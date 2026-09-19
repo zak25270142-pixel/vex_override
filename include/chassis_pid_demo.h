@@ -7,17 +7,22 @@
 extern Chassis chassis;
 
 // 主循环每 10 ms 调用一次；函数不等待，每次只推进一轮当前动作。
-void chassis_demo_refresh();
+void refresh();
 
 // main 只读取该状态来协调后续任务和处理超时；finish 会保持到新任务发布。
-extern TASK_STATE chassis_demo_state;
+extern TASK_STATE chassis_state;
 
 // 发布局部位姿任务，不在调用处直接运行。
 // 坐标以任务起点为原点：x 向前、y 向右，heading 单位 deg、向右为正。
-void chassis_demo_goto_local(float x, float y, float heading,
-                             float max_speed = 80.0f);
+void goto_local(float x, float y, float heading,
+                float max_speed = 80.0f);
+
+// 基础边走边转版本：距离 PID 控制共同输出，方向 PID 控制左右差速。
+// 与 goto_local() 使用相同的局部坐标定义，但保留为独立入口便于对比实验。
+void goto_local_slim_base(float x, float y, float heading,
+                          float max_speed = 80.0f);
 
 // 主循环暂停动作时停止底盘输出。
-void chassis_demo_stop();
+void stop();
 
 #endif

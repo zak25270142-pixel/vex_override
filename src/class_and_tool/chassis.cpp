@@ -3,8 +3,8 @@
 
 static const float math_pi = 3.14159f;
 
-Chassis::Chassis(vex::motor_group &left,
-                 vex::motor_group &right,
+Chassis::Chassis(MyMotorGroup &left,
+                 MyMotorGroup &right,
                  vex::rotation &forward_tracking,
                  vex::rotation &left_tracking,
                  vex::inertial &inertial)
@@ -51,30 +51,25 @@ void Chassis::update()
     update_gap = static_cast<uint16_t>(current_time - previous_time);
     previous_time = current_time;
 
-    /*
-     * 电机内置编码器测得的是电机轴转数。经过外部齿轮组后：
-     *   车轮转数 = 电机转数 / 电机每车轮一圈所需转数
-     *   行驶距离 = 车轮转数 * 2*pi*车轮半径
-     */
-    float left_motor_turns = static_cast<float>(
-        left_motors.position(vex::rotationUnits::rev));
-    float right_motor_turns = static_cast<float>(
-        right_motors.position(vex::rotationUnits::rev));
-    float wheel_circumference = 2.0f * math_pi * wheel_r; // 车轮周长，单位 m。
+    // 电机内置编码器测得的是电机轴转数。经过外部齿轮组后：
+    //  车轮转数 = 电机转数 / 电机每车轮一圈所需转数,当前值为1故后续式子中没写(motor_wheel_ratio)
+    //  行驶距离 = 车轮转数 * 2*pi*车轮半径
+    float left_wheel_turns = static_cast<float>(left_motors.position());
+    float right_wheel_turns = static_cast<float>(right_motors.position());
+    float wheel_c = 2.0f * math_pi * wheel_r; // 车轮周长，单位 m。
 
-    float new_left_distance = left_motor_turns /
-                              motor_wheel_ratio * wheel_circumference;
-    float new_right_distance = right_motor_turns /
-                               motor_wheel_ratio * wheel_circumference;
+    // float new_left_distance = left_motor_turns / motor_wheel_ratio * wheel_c;
+    // float new_right_distance = right_motor_turns / motor_wheel_ratio * wheel_c;
+
+    float new_left_distance = left_wheel_turns * wheel_c;
+    float new_right_distance = right_wheel_turns * wheel_c;
 
     left_distance_change = new_left_distance - left_distance;
     right_distance_change = new_right_distance - right_distance;
 
-    // VEX API 返回 double；读取后立即转换为项目统一使用的 float。
-    left_speed = static_cast<float>(
-        left_motors.velocity(vex::velocityUnits::rpm));
-    right_speed = static_cast<float>(
-        right_motors.velocity(vex::velocityUnits::rpm));
+    // API 返回 double；读取后转换为 float。
+    left_speed = static_cast<float>(left_motors.velocity());
+    right_speed = static_cast<float>(right_motors.velocity());
 
     float new_heading = static_cast<float>(
         inertial_sensor.rotation(vex::rotationUnits::deg));
@@ -143,6 +138,9 @@ void Chassis::update()
     distance_from_initial =
         x_from_initial * cosf(initial_direction) +
         y_from_initial * sinf(initial_direction);
+    side_distance_from_initial =
+        -x_from_initial * sinf(initial_direction) +
+        y_from_initial * cosf(initial_direction);
     heading_from_initial = heading - heading_start;
 
     float left_absolute_speed = fabsf(left_speed);
@@ -180,6 +178,7 @@ void Chassis::reset()
     y_start = y;
 
     distance_from_initial = 0.0f;
+    side_distance_from_initial = 0.0f;
     heading_from_initial = 0.0f;
 
     update_gap = 0;

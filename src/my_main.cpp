@@ -56,5 +56,5 @@ void my_Init()
 void my_while()
 { // main.cpp while 区
     main_timer.cycle();
-    chassis_demo_refresh();
+    refresh();
 }
