@@ -18,9 +18,10 @@ static MyMotorGroup left_motors(
 static MyMotorGroup right_motors(
     right_chassis_2, right_chassis_3, right_chassis_1, right_chassis_4);
 
-// 定位轮尺寸未知，暂时只完成端口归属和初始化，不参与里程计算。
+// 两个定位轮均已接入底盘里程计；reverse 标志若与实际滚动方向不符，试车时在此翻转。
 static vex::rotation forward_tracking_sensor(vex::PORT1, false);
 static vex::rotation left_tracking_sensor(vex::PORT2, false);
+
 static vex::inertial inertial_sensor(vex::PORT11, vex::turnType::right);
 
 Chassis chassis(left_motors, right_motors,

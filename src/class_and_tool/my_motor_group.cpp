@@ -15,16 +15,17 @@ void MyMotorGroup::setStopping(vex::brakeType brake)
         motors[i]->setStopping(brake);
 }
 
-void MyMotorGroup::resetPosition()
-{
-    for (uint8_t i = 0; i < 4; i++)
-        motors[i]->resetPosition();
-}
+// 在有定位轮后可舍弃
+// void MyMotorGroup::resetPosition()
+// {
+//     for (uint8_t i = 0; i < 4; i++)
+//         motors[i]->resetPosition();
+// }
 
-double MyMotorGroup::position()
-{
-    return motors[0]->position(vex::rotationUnits::rev);
-}
+// double MyMotorGroup::position()
+// {
+//     return motors[0]->position(vex::rotationUnits::rev);
+// }
 
 double MyMotorGroup::velocity()
 {

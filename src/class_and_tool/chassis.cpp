@@ -24,9 +24,10 @@ void Chassis::init()
     // 惯性传感器校准期间车体必须保持静止，否则零偏会不准确。
     inertial_sensor.calibrate();
 
-    // 电机编码器不需要校准，可以在等待其他传感器时先清零。
-    left_motors.resetPosition();
-    right_motors.resetPosition();
+    // 电机编码器清零，在有定位轮后可舍弃
+    // left_motors.resetPosition();
+    // right_motors.resetPosition();
+
     forward_tracking_sensor.resetPosition();
     left_tracking_sensor.resetPosition();
     left_is_moving = false;
@@ -51,21 +52,22 @@ void Chassis::update()
     update_gap = static_cast<uint16_t>(current_time - previous_time);
     previous_time = current_time;
 
-    // 电机内置编码器测得的是电机轴转数。经过外部齿轮组后：
-    //  车轮转数 = 电机转数 / 电机每车轮一圈所需转数,当前值为1故后续式子中没写(motor_wheel_ratio)
-    //  行驶距离 = 车轮转数 * 2*pi*车轮半径
-    float left_wheel_turns = static_cast<float>(left_motors.position());
-    float right_wheel_turns = static_cast<float>(right_motors.position());
-    float wheel_c = 2.0f * math_pi * wheel_r; // 车轮周长，单位 m。
+    // 在有定位轮后可舍弃 编码器里程相关计算
+    // // 电机内置编码器测得的是电机轴转数。经过外部齿轮组后：
+    // //  车轮转数 = 电机转数 / 电机每车轮一圈所需转数,当前值为1故后续式子中没写(motor_wheel_ratio)
+    // //  行驶距离 = 车轮转数 * 2*pi*车轮半径
+    // float left_wheel_turns = static_cast<float>(left_motors.position());
+    // float right_wheel_turns = static_cast<float>(right_motors.position());
+    // float wheel_c = 2.0f * math_pi * wheel_r; // 车轮周长，单位 m。
 
-    // float new_left_distance = left_motor_turns / motor_wheel_ratio * wheel_c;
-    // float new_right_distance = right_motor_turns / motor_wheel_ratio * wheel_c;
+    // // float new_left_distance = left_motor_turns / motor_wheel_ratio * wheel_c;
+    // // float new_right_distance = right_motor_turns / motor_wheel_ratio * wheel_c;
 
-    float new_left_distance = left_wheel_turns * wheel_c;
-    float new_right_distance = right_wheel_turns * wheel_c;
+    // float new_left_distance = left_wheel_turns * wheel_c;
+    // float new_right_distance = right_wheel_turns * wheel_c;
 
-    left_distance_change = new_left_distance - left_distance;
-    right_distance_change = new_right_distance - right_distance;
+    // left_distance_change = new_left_distance - left_distance;
+    // right_distance_change = new_right_distance - right_distance;
 
     // API 返回 double；读取后转换为 float。
     left_speed = static_cast<float>(left_motors.velocity());
@@ -82,12 +84,18 @@ void Chassis::update()
     float rotation_change = heading_change * math_pi / 180.0f; // 单位 rad
 
     // 里程计传感器输入接口：
-    // 当前没有独立定位轮，所以用左右驱动轮平均距离临时代替前向定位轮，
-    // 并令侧向定位轮读数为 0。以后安装定位轮，只替换下面两个新读数的来源；
-    // 后面的旋转补偿、坐标变换和累计位置不需要修改。
+    // 直接读取两个定位轮的累计转数，乘定位轮周长换算为累计路程。
+    // 读数正负取决于传感器实际安装方向；若试车发现前进/右移读数为负，
+    // 修改 chassis_pid_demo.cpp 中对应 vex::rotation 构造的 reverse 标志。
+    float tracking_wheel_c = 2.0f * math_pi * wheel_r; // 定位轮周长，单位 m。
     float new_forward_tracking_distance =
-        (new_left_distance + new_right_distance) * 0.5f;
-    float new_side_tracking_distance = 0.0f;
+        static_cast<float>(forward_tracking_sensor.position(
+            vex::rotationUnits::rev)) *
+        tracking_wheel_c;
+    float new_side_tracking_distance =
+        static_cast<float>(left_tracking_sensor.position(
+            vex::rotationUnits::rev)) *
+        tracking_wheel_c;
 
     float raw_forward_change =
         new_forward_tracking_distance - forward_tracking_distance;
@@ -96,7 +104,10 @@ void Chassis::update()
 
     // 定位轮不在车体旋转中心时，原地转向也会带动定位轮滚动。
     // 根据定位轮到中心的有符号偏移量，先减去这部分由旋转造成的假平移。
-    // 当前两个偏移量都是 0，因此暂时不会改变驱动轮估算结果。
+
+    // 刚体上点(前向 a, 右向 b)在右转 Δθ 时：前向附加速度为 -b·ω、侧向附加速度为 +a·ω，
+    // 故前向读数加回 b·Δθ（forward_tracking_offset 即 b），
+    // 侧向读数减去 a·Δθ（side_tracking_offset 即 a，偏后为负值）。
     local_forward_change =
         raw_forward_change + forward_tracking_offset * rotation_change;
     local_side_change =
@@ -116,8 +127,9 @@ void Chassis::update()
     x += x_change;
     y += y_change;
 
-    left_distance = new_left_distance;
-    right_distance = new_right_distance;
+    // 编码器里程回写已废弃（恢复点：打滑检测）：
+    // left_distance = new_left_distance;
+    // right_distance = new_right_distance;
     forward_tracking_distance = new_forward_tracking_distance;
     side_tracking_distance = new_side_tracking_distance;
     heading = new_heading;
@@ -171,8 +183,9 @@ void Chassis::reset()
     // x、y 是全局连续里程计，不能在每次动作开始时清零。
     update();
 
-    left_distance_start = left_distance;
-    right_distance_start = right_distance;
+    // 编码器里程起点已废弃（恢复点：打滑检测）：
+    // left_distance_start = left_distance;
+    // right_distance_start = right_distance;
     heading_start = heading;
     x_start = x;
     y_start = y;
@@ -182,13 +195,14 @@ void Chassis::reset()
     heading_from_initial = 0.0f;
 
     update_gap = 0;
-    left_distance_change = 0.0f;
-    right_distance_change = 0.0f;
     local_forward_change = 0.0f;
     local_side_change = 0.0f;
     heading_change = 0.0f;
     x_change = 0.0f;
     y_change = 0.0f;
+    // // 编码器里程已废弃
+    // left_distance_change = 0.0f;
+    // right_distance_change = 0.0f;
 }
 
 void Chassis::output(float left_output, float right_output)
