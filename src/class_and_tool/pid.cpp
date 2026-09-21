@@ -2,17 +2,11 @@
 #include <cmath>
 
 PositionPID::PositionPID(float p, float i, float d, float output_limit)
-{
-    kp = p;
-    ki = i;
-    kd = d;
-
-    max_output = output_limit;
-
-    integral = 0.0f;
-    previous_error = 0.0f;
-    last_time_ms = 0;
-}
+    : kp(p),
+      ki(i / 1000.0f),
+      kd(d * 1000.0f),
+      integral(0.0f), previous_error(0.0f),
+      last_time_ms(0), max_output(output_limit) {}
 
 float PositionPID::reset(float error, uint32_t current_time_ms)
 {
@@ -20,6 +14,7 @@ float PositionPID::reset(float error, uint32_t current_time_ms)
     integral = 0.0f;
 
     previous_error = error;
+    pre_sign = 0; // pre_sign初始未知，不参与积分清空
     last_time_ms = current_time_ms;
 
     // 第一轮没有历史数据，只计算并限幅 P 项。
@@ -34,18 +29,16 @@ float PositionPID::reset(float error, uint32_t current_time_ms)
 float PositionPID::update(float error, uint32_t current_time_ms)
 {
     // uint32_t 时间戳相减得到两次计算之间经过的毫秒数。
-    // PID 正常会在远短于 65 s 的周期内更新，因此间隔用 uint16_t 即可。
+    // PID 远短于 65 s 的周期内更新，不可能溢出
     uint16_t gap_time_ms = static_cast<uint16_t>(current_time_ms - last_time_ms);
 
-    /*
-     * 如果误差一正一负，说明系统刚越过目标值。
-     * 清除旧方向积分，减少越过目标后的持续推力。
-     */
-    if ((error > 0.0f && previous_error < 0.0f) ||
-        (error < 0.0f && previous_error > 0.0f))
-    {
+    // pre_error为0时pre_sign保持不变，引入该项主要解决err正好是0时的后续处理
+    if (previous_error != 0.0f)
+        pre_sign = previous_error > 0.0f ? 1 : -1;
+    // 误差从正侧（>0）跨到负侧（<0），或反过来，说明系统越过了目标值。
+    // 清除旧方向积分，减少越过目标后的持续推力。
+    if ((error > 0.0f && pre_sign == -1) || (error < 0.0f && pre_sign == 1))
         integral = 0.0f;
-    }
 
     // 统一使用 ms：I 项是“误差×ms”，D 项是“误差/ms”。
     float candidate_i = integral + error * gap_time_ms;
@@ -80,10 +73,7 @@ float PositionPID::update(float error, uint32_t current_time_ms)
 }
 
 StableJudge::StableJudge(uint16_t time)
-{
-    stable_start_time = 0;
-    stable_time = time;
-}
+    : stable_start_time(0), stable_time(time) {}
 
 bool StableJudge::update(bool condition, uint32_t current_time)
 {

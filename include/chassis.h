@@ -53,6 +53,10 @@ private:
     // 上一次 update() 的系统时间戳，单位 ms。
     uint32_t previous_time = 0;
 
+    // reset() 时起始航向 heading_start 的正余弦，update() 用它把全局坐标投影回起点方向
+    float cos_i = 1.0f; // 起始航向的余弦，用于计算从起点开始的位移
+    float sin_i = 0.0f; // 起始航向的正弦，用于计算从起点开始的位移
+
 public:
     /* 以下调参区间 */
 
@@ -102,9 +106,9 @@ public:
     float heading = 0.0f;       // IMU 测得的累计航向角，向右转为正，单位 deg。
     float angular_speed = 0.0f; // IMU 测得的车体转动角速度，单位 deg/s。
 
-    // 定位轮累计滚动路程，单位 m。
-    float forward_tracking_distance = 0.0f; // 前向定位轮的累计滚动路程，单位 m。
-    float side_tracking_distance = 0.0f;    // 侧向定位轮的累计滚动路程，单位 m。
+    // 传感器角位置乘以周长得到的一维有符号坐标 沿轮的测量方向，前进为正、后退为负 算出的定位轮滚动距离
+    float forward_tracking_distance = 0.0f; // 前向定位轮的累计滚动距离，单位 m，有符号。
+    float side_tracking_distance = 0.0f;    // 侧向定位轮的累计滚动距离，单位 m，有符号。
 
     // 二维里程计当前坐标。
     // 初始化时车头方向为 x 正方向，车体右侧为 y 正方向；向右转角度为正。
@@ -120,14 +124,15 @@ public:
     float heading_change = 0.0f;       // 本轮 update() 中的航向角变化，单位 deg。
     float x_change = 0.0f;             // 本轮在全局坐标系中的 x 位移，单位 m。
     float y_change = 0.0f;             // 本轮在全局坐标系中的 y 位移，单位 m。
+
     // 编码器里程已废弃（恢复点：打滑检测）。
     // float left_distance_change = 0.0f;
     // float right_distance_change = 0.0f;
 
     // 3.2 最近一次 reset() 保存的 start 到本次 update() 的变化量。
-    float distance_from_initial = 0.0f;      // 当前坐标沿起始车头方向相对起点的有符号距离，单位 m。
-    float side_distance_from_initial = 0.0f; // 当前坐标沿起始车体右方相对起点的有符号距离，单位 m。
-    float heading_from_initial = 0.0f;       // 当前航向相对起始航向的角度变化，向右为正，单位 deg。
+    float distance_from_reset = 0.0f;      // 当前坐标沿起始车头方向相对起点的有符号距离，单位 m。
+    float side_distance_from_reset = 0.0f; // 当前坐标沿起始车体右方相对起点的有符号距离，单位 m。
+    float heading_from_reset = 0.0f;       // 当前航向相对起始航向的角度变化，向右为正，单位 deg。
 
     Chassis(MyMotorGroup &left,
             MyMotorGroup &right,
@@ -138,9 +143,10 @@ public:
     // 设置停车方式并启动惯性传感器校准，不在这里等待。
     void init();
 
+    // 是否校准完成(init的等待环)
     bool is_ready();
 
-    // 所有传感器就绪后建立底盘里程计原点。
+    // 所有传感器就绪后建立底盘里程计原点(init的结尾)
     void finish_init();
 
     // 更新传感器读数，并更新运动状态。
@@ -149,7 +155,7 @@ public:
     // 读取一次最新状态，并把它保存为后续动作计算使用的初始值。
     void reset();
 
-    // 使用最近一次 update() 保存的运动状态处理死区并输出给电机。
+    // 使用最近一次 update() 保存的运动状态处理死区并输出给电机
     void output(float left_output, float right_output);
 
     // 按 init() 设置的停车方式停止左右电机组。

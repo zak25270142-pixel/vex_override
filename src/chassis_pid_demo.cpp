@@ -36,9 +36,10 @@ static const float angle_tolerance = 0.8f;          // deg
 static const float angular_speed_tolerance = 5.0f;  // deg/s
 
 // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
-static PositionPID distance_pid(130.0f, 0.035f, 18000.0f);
-static PositionPID heading_pid(1.10f, 0.00010f, 40.0f, 25.0f);
-static PositionPID turn_pid(0.75f, 0.00010f, 60.0f);
+// ki、kd 按秒计（kp 无量纲）：(kp, ki, kd[, output_limit])
+static PositionPID distance_pid(130.0f, 35.0f, 18.0f);
+static PositionPID heading_pid(1.10f, 0.1f, 0.04f, 25.0f);
+static PositionPID turn_pid(0.75f, 0.1f, 0.06f);
 // 误差与实际速度连续满足条件 180 ms 后才结束当前步骤，避免刚经过目标就切换。
 static StableJudge stable_judge(180);
 
@@ -126,17 +127,13 @@ static void refresh_goto_local_slim_base(uint32_t now)
     }
 
     // demo 只消费 Chassis 已经换算好的任务起点坐标，不自行积分测量量。
-    float x_error =
-        slim_base_target.x - chassis.distance_from_initial;
-    float y_error =
-        slim_base_target.y - chassis.side_distance_from_initial;
-    float distance_error = sqrtf(
-        x_error * x_error + y_error * y_error);
-    float heading_error = remainderf(
-        slim_base_target.heading - chassis.heading_from_initial, 360.0f);
+    float x_error = slim_base_target.x - chassis.distance_from_reset;
+    float y_error = slim_base_target.y - chassis.side_distance_from_reset;
+    float distance_error = sqrtf(x_error * x_error + y_error * y_error);
+    float heading_error = remainderf(slim_base_target.heading - chassis.heading_from_reset, 360.0f);
 
     // 将目标向量旋转到当前车体坐标；距离 PID 使用有方向的前后误差。
-    float heading_rad = chassis.heading_from_initial * 3.14159f / 180.0f;
+    float heading_rad = chassis.heading_from_reset * deg_to_rad;
     float forward_error =
         x_error * cosf(heading_rad) + y_error * sinf(heading_rad);
     float side_error =
@@ -145,8 +142,7 @@ static void refresh_goto_local_slim_base(uint32_t now)
     // 未到目标点时追踪目标点方向；进入距离容差后改为纠正最终朝向。
     float angle_error = heading_error;
     if (distance_error > distance_tolerance)
-        angle_error = atan2f(side_error, forward_error) *
-                      180.0f / 3.14159f;
+        angle_error = atan2f(side_error, forward_error) * rad_to_deg;
 
     float forward;
     float turn;
@@ -222,7 +218,7 @@ void refresh()
     if (goto_step == 0)
     {
         // 原地转向：目标方向减去本段已经转过的角度，得到本轮剩余误差。
-        float error = goto_target.direction - chassis.heading_from_initial;
+        float error = goto_target.direction - chassis.heading_from_reset;
         float output = turn_pid.update(error, now);
         chassis.output(output, -output);
 
@@ -235,8 +231,8 @@ void refresh()
     {
         // 距离 PID 决定共同前进量，航向 PID 产生左右差值以保持直线。
         float distance_error =
-            goto_target.distance - chassis.distance_from_initial;
-        float heading_error = -chassis.heading_from_initial;
+            goto_target.distance - chassis.distance_from_reset;
+        float heading_error = -chassis.heading_from_reset;
         float output = distance_pid.update(distance_error, now);
         float correction = heading_pid.update(heading_error, now);
         chassis.output(output + correction, output - correction);
@@ -251,7 +247,7 @@ void refresh()
     else
     {
         // 到达目标点后原地转到调用者要求的最终朝向。
-        float error = goto_target.heading - chassis.heading_from_initial;
+        float error = goto_target.heading - chassis.heading_from_reset;
         float output = turn_pid.update(error, now);
         chassis.output(output, -output);
 
@@ -282,7 +278,7 @@ void goto_local(float x, float y, float heading,
 
     // 接近原点时方向没有物理意义，不计算 atan2f(0, 0)。
     if (goto_target.distance > distance_tolerance)
-        goto_target.direction = atan2f(y, x) * 180.0f / 3.14159f;
+        goto_target.direction = atan2f(y, x) * rad_to_deg;
 
     // 同一上限同时约束直线和转向 PID，具体左右轮限幅由 Chassis::output() 完成。
     distance_pid.max_output = max_speed;

@@ -6,6 +6,11 @@
 
 #define elif else if
 
+// 几何常量与角度换算
+constexpr float math_pi = 3.1415927f;
+constexpr float deg_to_rad = math_pi / 180.0f;
+constexpr float rad_to_deg = 180.0f / math_pi;
+
 struct position16t
 {
     int16_t x;
