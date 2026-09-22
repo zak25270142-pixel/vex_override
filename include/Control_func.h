@@ -90,8 +90,8 @@ private:
     struct t_v_list
     {
         uint32_t time;   // ms级时间
-        int32_t value_x; // 时间
-        int32_t value_y;
+        int32_t value_x; // 按杆x轴值
+        int32_t value_y; // 按杆y轴值
     };
 
 public:
@@ -102,7 +102,8 @@ public:
         left,
         right,
         middle,
-        other
+        other,
+        only_value
     };
     Control_key *up_state = nullptr;
     Control_key *down_state = nullptr;
@@ -110,10 +111,9 @@ public:
     Control_key *right_state = nullptr;
     Remote_Control() {}
     t_v_list value[8] = {0};
-    uint8_t value_p = 0;
-    STATE state;
-    bool changed = false;
-    bool set_key = false;
+    uint8_t value_p = 0;         // t_v_list[p]返回最新一次记录的摇杆x与y
+    STATE state = middle;        // only_value时，不触发按键，仅存储value用于底盘控制
+    void (*changed)() = nullptr; // 数据更新回调，refresh 写入新值后若非空则调用
     void refresh(int32_t current_value, int32_t current_value_y);
     void set_state();
 };

@@ -15,13 +15,9 @@ void Screen_Button::trigger_press(bool is_pressed)
     if (key_set != nullptr)
     {
         if (is_pressed)
-        {
             key_set->pressed();
-        }
         else
-        {
             key_set->released();
-        }
     }
 }
 
@@ -269,7 +265,9 @@ void Remote_Control::refresh(int32_t current_value_x, int32_t current_value_y)
         value[value_p].time = now;
         value[value_p].value_x = current_value_x;
         value[value_p].value_y = current_value_y;
-        changed = true;
-        set_state();
+        if (changed != nullptr)
+            changed();
+        if (state != only_value)
+            set_state();
     }
 }

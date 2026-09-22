@@ -46,16 +46,16 @@ bool Chassis::is_ready()
 void Chassis::finish_init()
 {
     inertial_sensor.resetRotation();
-    previous_time = get_time_ms();
-    reset();
+    uint32_t now = get_time_ms();
+    previous_time = now;
+    reset(now);
 }
 
 // 更新里程、速度和航向
-void Chassis::update()
+void Chassis::update(uint32_t now)
 {
-    uint32_t current_time = get_time_ms();
-    update_gap = static_cast<uint16_t>(current_time - previous_time);
-    previous_time = current_time;
+    update_gap = static_cast<uint16_t>(now - previous_time);
+    previous_time = now;
 
     // 在有定位轮后可舍弃 编码器里程相关计算
     // // 电机内置编码器测得的是电机轴转数。经过外部齿轮组后：
@@ -165,16 +165,10 @@ void Chassis::update()
         right_is_moving = true;
 }
 
-void Chassis::reset()
+// 开启新的一段动作：以当前状态为段起点快照，清零段内相对量与变化量缓存。
+// 前置条件：本周期已调用过 update()，快照数据才是新鲜的；周期内请勿再调 update。
+void Chassis::begin_segment()
 {
-    // reset() 自己先读取一次最新状态，调用者不需要在它前面额外 update()。
-    // x、y 是全局连续里程计，不能在每次动作开始时清零。
-    update();
-
-    // 编码器里程起点已废弃：
-    // left_distance_start = left_distance;
-    // right_distance_start = right_distance;
-
     heading_start = heading;
     x_start = x;
     y_start = y;
@@ -198,6 +192,14 @@ void Chassis::reset()
     // // 编码器里程已废弃
     // left_distance_change = 0.0f;
     // right_distance_change = 0.0f;
+}
+
+// 周期外独立使用的组合入口（如 finish_init）：自己先读一次最新状态再开新段。
+// 周期内（refresh 已 update）不要用本函数，避免同周期二次 update；改用 begin_segment()。
+void Chassis::reset(uint32_t now)
+{
+    update(now);
+    begin_segment();
 }
 
 void Chassis::output(float left_output, float right_output)

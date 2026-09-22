@@ -146,14 +146,21 @@ public:
     // 是否校准完成(init的等待环)
     bool is_ready();
 
-    // 所有传感器就绪后建立底盘里程计原点(init的结尾)
+    // 所有传感器就绪后设定底盘里程计起点(init的结尾)
     void finish_init();
 
     // 更新传感器读数，并更新运动状态。
-    void update();
+    // now 由调用方传入（与本周期 PID 共用同一时间戳），内部不再自行取时间。
+    void update(uint32_t now);
 
-    // 读取一次最新状态，并把它保存为后续动作计算使用的初始值。
-    void reset();
+    // 开启新的一段动作：以当前状态为段起点快照（x_start/y_start/heading_start 等），
+    // 并清零段内相对量（*_from_reset）与变化量缓存（*_change）。
+    // 前置条件：本周期已调用过 update()，快照数据才是新鲜的。
+    void begin_segment();
+
+    // 周期外独立使用的组合入口：update(now) + begin_segment()。
+    // 仅供没有周期 update 的场景（如 finish_init）使用，周期内禁止调用（会二次 update）。
+    void reset(uint32_t now);
 
     // 使用最近一次 update() 保存的运动状态处理死区并输出给电机
     void output(float left_output, float right_output);

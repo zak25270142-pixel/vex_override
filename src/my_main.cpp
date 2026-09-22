@@ -3,7 +3,7 @@
 #include "LCD_menu.h"
 #include "key_set.h"
 #include "ai_vision.h"
-#include "chassis_pid_demo.h"
+#include "robot_and_control.h"
 
 vex::brain Brain;
 
@@ -35,19 +35,19 @@ static vex::event ai_vision_event(ai_vision_task);
 
 void my_Init()
 { // main.cpp while 前
-    chassis.init();
+    robot_action.init();
     ai_vision_init();
 
     Brain.Screen.setPenWidth(1);
     key_init1();
     pre_menu_init();
 
-    while (!chassis.is_ready())
+    while (!robot_action.is_ready())
         Delay(20);
     while (!ai_vision_is_ready())
         Delay(20);
 
-    chassis.finish_init();
+    robot_action.finish_init();
 
     ai_vision_event.broadcast();
     screen_refresh_event.broadcast();
@@ -56,5 +56,5 @@ void my_Init()
 void my_while()
 { // main.cpp while 区
     main_timer.cycle();
-    refresh();
+    robot_action.refresh();
 }
