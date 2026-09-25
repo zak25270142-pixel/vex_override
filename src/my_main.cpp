@@ -14,13 +14,8 @@ CycleTimer main_timer(10); // 暂定10ms  生成主循环周期 类
 //  rx任务阻塞在/dev/serial1的read()上等USB来字节，收到命令立刻回（如目录请求）；
 //  tx任务每10ms一拍，按订阅档位推送监控值。
 // 两件事一个阻塞、一个周期，不能放同一个任务里——阻塞读会把10ms推送饿死。
-// 注意：两个event的broadcast必须放在my_Init末尾，VEX线程调度器就绪后才生效，
-// 放开头会静默失败（线程根本不起）。
-static void comm_rx_task()
-{
-    comm.rx_task(); // 内部死循环，不会返回
-}
-static vex::event comm_rx_event(comm_rx_task);
+static vex::event comm_rx_event([]
+                                { comm.rx_task(); }); // 内部死循环，不会返回
 
 static void comm_tx_task()
 {
@@ -59,17 +54,13 @@ static vex::event ai_vision_event(ai_vision_task);
 
 void my_Init()
 { // main.cpp while 前
-    // 通信init最早做（只打开serial1，不依赖硬件）；
-    // 但收/发任务的启动(broadcast)必须放到本函数末尾——VEX线程调度器要等
-    // Brain/SDK初始化完成后才能响应broadcast，放在开头会静默失败（任务线程根本不起）。
-    comm.init();
-
     robot_action.init();
     ai_vision_init();
 
     Brain.Screen.setPenWidth(1);
     key_init1();
     pre_menu_init();
+    comm.init();
 
     while (!robot_action.is_ready())
         Delay(20);

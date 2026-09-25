@@ -28,7 +28,9 @@ USB_Comm::USB_Comm(const MENU_ITEM *tunable, uint8_t tunable_len,
       monitor_items(monitor), monitor_count(monitor_len)
 {
 
-    slow_phase = 0;
+    tick = 0;
+    dir_tun = 0; // 没有待发目录
+    dir_mon = 0;
     monitor_active = false; // 默认不推送，等上位机显式请求监控目录后才开始
     rx_len = 0;
     rx_expect = 0;
@@ -108,8 +110,7 @@ uint8_t USB_Comm::append_value(uint8_t *out, const MENU_ITEM &item)
 }
 
 // 封帧发出：调用方已把payload直接拼在成员缓冲tx_frame[2]开始的位置，
-// 这里只补帧头、命令字和校验，再整帧write到stdout（USB User Port）。
-// 两处发送（目录、监控推送）共用；调用方必须已持有tx_lock，保证不与另一路互插字节。
+// 这里只补帧头、命令字和校验，再整帧write到/dev/serial1（USB User Port）。
 void USB_Comm::send_frame(uint8_t cmd, uint8_t len)
 {
     tx_frame[0] = FRAME_HEAD;
@@ -117,21 +118,30 @@ void USB_Comm::send_frame(uint8_t cmd, uint8_t len)
     uint8_t xor_sum = cmd; // 校验从命令字开始算，帧头A5不参与
     for (uint8_t i = 0; i < len; i++)
         xor_sum ^= tx_frame[2 + i]; // 每来一个数据字节就异或进去
-    tx_frame[2 + len] = xor_sum; // payload后面紧跟校验
+    tx_frame[2 + len] = xor_sum;    // payload后面紧跟校验
     if (usb_fd >= 0)
         write(usb_fd, tx_frame, len + 3); // /dev/serial1原始通道直出，无CRLF翻译
 }
 
-// 响应目录请求：把一张参数表逐项发给上位机，一项一帧。
+// 发目录的一批：只发原数组下标 [batch*DIR_BATCH, +DIR_BATCH) 这连续几项，一项一帧。
+// 目录由tx_tick分多个10ms拍发完，避免一次性write几百项时长时间占用发送任务。
 // 参数cmd决定这些帧标成"可调目录"还是"监控目录"，复用同一套拼帧逻辑。
 // 直接在成员tx_frame里拼帧，不再用临时payload数组中转，省一次栈空间和拷贝：
 //   [A5][Cmd]由send_frame补，[index][类型][tag][名字长度][名字][当前值]在这里写
-void USB_Comm::send_directory(const MENU_ITEM *items, uint8_t count, uint8_t cmd)
+void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, uint8_t batch)
 {
-    // 整批目录帧加锁一次发完，防止10ms推送任务在中间插进别的帧
-    tx_lock.lock();
-    for (uint8_t i = 0; i < count; i++)
+    uint8_t start = batch * DIR_BATCH;
+    if (start >= count)
+        return; // 批次超界（正常不会发生，倒计时保证batch取0~总批数-1），容错直接返回
+    // 本批实际发几项：剩余不足一批时发完为止。用"剩余数"限幅而不用start+8，
+    // 因为255项满载最后一批start=248，start+8=256会撑爆uint8回0
+    uint8_t n = count - start;
+    if (n > DIR_BATCH)
+        n = DIR_BATCH;
+
+    for (uint8_t k = 0; k < n; k++)
     {
+        uint8_t i = start + k; // start+k最大255，不会溢出
         const MENU_ITEM &item = items[i];
 
         if (item.data_type == type_str || item.data_type == type_other)
@@ -151,7 +161,6 @@ void USB_Comm::send_directory(const MENU_ITEM *items, uint8_t count, uint8_t cmd
         append_value(&tx_frame[6 + name_len], item);
         send_frame(cmd, 4 + name_len + vlen);
     }
-    tx_lock.unlock();
 }
 
 // 接收状态机收齐一帧、且校验通过后调用。
@@ -161,13 +170,14 @@ void USB_Comm::handle_command()
     switch (rx_cmd)
     {
     case Request_Tunable:
-        // 上位机要可调参数目录，逐项回发即可，不改变推送状态
-        send_directory(tunable_items, tunable_count, Post_Tunable_Directory);
+        // 上位机要可调参数目录。不在接收任务里直接发（一次性发几百项会阻塞read），
+        // 只置"还剩几批"的倒计时，真正的发送由后续tx_tick每拍一批完成。
+        dir_tun = (tunable_count + DIR_BATCH - 1) / DIR_BATCH;
         break;
     case Request_Monitor:
-        // 上位机要监控目录：先发目录，随后打开推送开关。
-        // 推送是按refresh节拍走的，下一个refresh自然就开始发，不用特殊触发。
-        send_directory(monitor_items, monitor_count, Post_Monitor_Directory);
+        // 上位机要监控目录：同样置倒计时分批发送，随后打开推送开关。
+        // 推送是按tx_tick节拍走的，下一拍自然就开始发，不用特殊触发。
+        dir_mon = (monitor_count + DIR_BATCH - 1) / DIR_BATCH;
         monitor_active = true;
         break;
     case Subscribe:
@@ -197,18 +207,16 @@ void USB_Comm::handle_command()
     }
 }
 
-// 分区推送，每次refresh调用一次：
+// 分区推送，每次tx_tick调用一次：
 //   tag>=2（高速/x/y/yaw语义量）：每轮都发，约100Hz
-//   tag==1（低速）：按index%8分到8个轮转号，每轮只发本号的项，单项约80ms
+//   tag==1（低速）：按index%8分到8个轮转相，每轮只发本相的项，单项约80ms
 //   tag==0：不发
 // 用index%8取模代替位图轮转，不用任何额外订阅存储。
+// 本函数只按当前tick的值发，不推进tick——推进由tx_tick末尾统一做。
 void USB_Comm::monitor_tick()
 {
     if (!monitor_active)
         return;
-
-    // 本轮要发的所有帧加锁一次发完，避免接收任务回目录时把推送帧切断
-    tx_lock.lock();
 
     // 发一个监控项的完整链路：直接在tx_frame里写[index][当前值]，再封帧发出。
     // 不带类型——上位机从目录里已知index→类型对应。
@@ -222,23 +230,39 @@ void USB_Comm::monitor_tick()
         send_frame(Monitor_Post, 1 + vlen);
     };
 
+    uint8_t phase = tick & (SLOW_PHASES - 1); // SLOW_PHASES是2的幂，用掩码代替取模
     for (uint8_t i = 0; i < monitor_count; i++)
     {
         uint8_t tag = (uint8_t)monitor_items[i].tag;
         if (tag >= monitor_tag_fast)
             post_item(i); // 高速项每轮直发
-        else if (tag == monitor_tag_slow && (i & 0x07) == slow_phase)
+        else if (tag == monitor_tag_slow && (i & (SLOW_PHASES - 1)) == phase)
             post_item(i); // 低速项轮到自己所在的相才发
     }
-    slow_phase = (slow_phase + 1) & 0x07; // 0~7循环，8次refresh把低速项轮完一遍
-
-    tx_lock.unlock();
 }
 
-// 发送节拍入口：由10ms周期任务调用，只负责按档位推送监控值。
+// 10ms发送节拍：先发目录倒计时的当前批，再推送监控值，最后推进tick。
+// 这是全程序唯一write串口的地方（接收任务只置标志），所以各帧天然不会互相穿插。
 void USB_Comm::tx_tick()
 {
+    // 有待发目录时这一拍先发一批。两个倒计时同时非零（理论上几乎不会，
+    // 两类目录请求是人工低频操作）则tunable优先，下一拍再发monitor，串行不并行。
+    // 当前批次号 = 总批数 - 剩余批数：倒计时从总批数减到0，批次号正好从0走到总批数-1。
+    if (dir_tun > 0)
+    {
+        uint8_t total = (tunable_count + DIR_BATCH - 1) / DIR_BATCH;
+        send_dir_batch(tunable_items, tunable_count, Post_Tunable_Directory, total - dir_tun);
+        dir_tun--;
+    }
+    else if (dir_mon > 0)
+    {
+        uint8_t total = (monitor_count + DIR_BATCH - 1) / DIR_BATCH;
+        send_dir_batch(monitor_items, monitor_count, Post_Monitor_Directory, total - dir_mon);
+        dir_mon--;
+    }
+
     monitor_tick();
+    tick++; // uint8自然溢出回0，掩码轮转无缝衔接，无需回绕判断
 }
 
 // 接收入口：独立任务，阻塞在/dev/serial1的read()上等字节，读到一个喂一次状态机。

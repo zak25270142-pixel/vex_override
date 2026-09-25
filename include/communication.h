@@ -52,11 +52,6 @@ private:
         // 其他命令不扩展
         Pong = 0xFF,
     };
-
-    static constexpr uint8_t FRAME_HEAD = 0xA5;
-    static constexpr uint8_t MAX_PAYLOAD = 128; // 单帧Payload上限；整帧最长131B(A5+Cmd+128+XOR)，
-                                                // 小于USB单包512B，一帧不会被USB拆开
-
     // 接收状态机的四个阶段。
     // 串口给上来的是一串连续字节，一次读取可能只拿到半帧，也可能两帧粘在一起，
     // 所以必须逐字节推进状态，而不能假设读一次就是一条完整消息。
@@ -67,6 +62,15 @@ private:
         RX_DATA,   // 正在按命令字规定的长度收Payload
         RX_XOR,    // Payload收够了，等最后一个校验字节，对上了就执行命令
     };
+
+    static constexpr uint8_t FRAME_HEAD = 0xA5;
+    // 单帧Payload上限。实际最长的目录帧也只有 4+名字(≤30)+值(≤8)≈42B，128余量充足。
+    // 整帧最长131B(A5+Cmd+128+XOR)，小于USB单包512B，一帧不会被USB拆开。
+    // 注意常量类型别用uint8_t去放256——256%256会静默归零，数组会缩成3字节。
+    static constexpr uint16_t MAX_PAYLOAD = 128;
+    static constexpr uint8_t SLOW_PHASES = 8; // 低速项轮转相数：单项刷新周期=8×10ms=80ms
+    static constexpr uint8_t DIR_BATCH = 8;   // 目录分批：每个10ms拍最多连续发8项，
+
     RxState rx_state = WAIT_HEAD;    // 当前处在接收的哪个阶段
     uint8_t rx_cmd;                  // 本帧收到的命令字，执行命令时用它判断要做什么
     uint8_t rx_payload[MAX_PAYLOAD]; // 本帧已收到的Payload
@@ -81,33 +85,27 @@ private:
     MENU_ITEM *monitor_items;
     uint8_t monitor_count;
 
-    uint8_t slow_phase; // 低速项轮转号0~7，每次tx_tick推进一格，8次一循环
-    // 是否正在周期推送。只有上位机主动要过监控目录后才置true开始推送，
-    // 避免没人看的时候也在串口上白白发数据。
-    bool monitor_active;
+    uint8_t tick;    // 节拍计数，每拍+1，uint8自然溢出回0，只用于低速项按 tick%8 轮转。
+    uint8_t dir_tun; // 目录发送倒计时：收到目录请求时置"还剩几批"，每发一批-1，到0结束。
+    uint8_t dir_mon; // 两张表各一个；同一拍内只发一个表的一批（tunable优先），保证两类目录不并行。
+
+    bool monitor_active;               // 是否正在周期推送。只有上位机主动要过监控目录后才置true开始推送，
     int usb_fd = -1;                   // /dev/serial1的POSIX描述符，init里打开，收发共用
-    uint8_t tx_frame[3 + MAX_PAYLOAD]; // 发送组帧缓冲，拼好后一次性write给USB
-    // 收命令的任务和10ms推送任务都会发帧，必须用锁把"一整批帧"的发送包起来，
-    // 否则目录帧的字节流可能和监控推送帧的字节互相穿插，两边都解析出废帧。
-    vex::mutex tx_lock;
+    uint8_t tx_frame[3 + MAX_PAYLOAD]; // 发送组帧缓冲
 
-    // 查一个下发命令的Payload应该有几字节。
-    // 返回0xFF表示不认识的命令——此时无法知道校验位在哪，只能放弃这帧重新找帧头。
+
     static uint8_t cmd_payload_len(uint8_t cmd);
-    // 一个类型的值在帧里占几个字节：1/2/4/8，color固定3B；str和other返回0。
     static uint8_t value_size(VALUE_TYPE type);
+    
     // 把一个参数项的当前值按协议写进out指向的缓冲，返回写了几个字节。
-    // color拆成红绿蓝三个字节，bool/on_off写成0/1，其余类型按内存原样拷贝。
     uint8_t append_value(uint8_t *out, const MENU_ITEM &item);
-
-    // Subscribe(index=0xFF)时把全部可发项的tag统一设为指定档位（语义标记会被覆盖）
-    void set_all_tag(uint8_t tag);
 
     // payload已直接拼在tx_frame[2]起时调用：补帧头、命令、校验后整帧发出，len是payload字节数
     void send_frame(uint8_t cmd, uint8_t len);
-    void send_directory(const MENU_ITEM *items, uint8_t count, uint8_t cmd); // 把一张表逐项发成目录帧
-    void handle_command();                                                   // 一帧接收完整且校验通过后，按命令字执行
-    void monitor_tick();                                                     // 高速项直发+低速项按轮转号发，然后推进轮转
+    // 发目录的第batch批（下标连续的DIR_BATCH项），一项一帧，str/other跳过
+    void send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, uint8_t batch);
+    void handle_command(); // 一帧接收完整且校验通过后，按命令字只置请求标志，真正的发送留给tx_tick
+    void monitor_tick();   // 高速项直发+低速项按tick轮转相发（本拍不推进tick）
 
 public:
     // tunable/tunable_len：可调参数表及其项数；monitor/monitor_len：监控参数表及其项数。
@@ -119,7 +117,8 @@ public:
     // 接收任务：阻塞在read()上等字节（O_NONBLOCK实测无效），字节一到就喂拼帧状态机，
     // 收齐完整帧立即执行。函数内部死循环，必须由独立vex任务调用，不要在主周期里轮询。
     void rx_task();
-    // 发送节拍：每10ms调用一次，按各项tag推送监控值（高速直发、低速轮转）。
+    // 发送节拍：每10ms调用一次。先发目录倒计时当前批（每拍≤DIR_BATCH项），
+    // 再按各项tag推送监控值（高速直发、低速轮转），最后推进tick。
     void tx_tick();
 };
 
