@@ -1,5 +1,4 @@
 #include "communication.h"
-#include "timer.h" // Delay，收数轮询空转时让出CPU
 #include <string.h>
 #include <fcntl.h>  // open/O_RDWR
 #include <unistd.h> // read/write：POSIX层直连raw FIFO，绕开stdio的CRLF加工
@@ -13,29 +12,46 @@ uint8_t USB_Comm::cmd_payload_len(uint8_t cmd)
     {
     case Request_Tunable: // 目录请求都只是"我要"一个信号，不带数据
     case Request_Monitor:
-    case Pong:
+    case Request_Command:
+    case Ping:
         return 0;
     case Subscribe:
         return 2; // [index][tag]，档位由第二字节给出，tag=0即退订
-    default:
-        return 0xFF; // 未知命令，无法定位校验位
+    case Set_Tunable:
+        return 9; // [index][value×8B]，定长，实际宽度由下位机按表里类型取
     }
+
+    // 动作命令：payload长度=各字段类型宽度之和（紧凑排列，无填充）
+    const CMD_ITEM *item = find_cmd(cmd);
+    if (item == nullptr)
+        return 0xFF; // 既不是内建命令表里也没有：无法定位校验位，整帧放弃
+    uint8_t len = 0;
+    for (uint8_t i = 0; i < item->input_num; i++)
+        len += value_size(item->data_type[i]);
+    return len;
 }
 
-USB_Comm::USB_Comm(const MENU_ITEM *tunable, uint8_t tunable_len,
-                   MENU_ITEM *monitor, uint8_t monitor_len)
-    : tunable_items(tunable), tunable_count(tunable_len),
-      monitor_items(monitor), monitor_count(monitor_len)
+// 命令字必须整段落进0x80~0x9F（不能只看低5位，否则0x00也会误命中），
+// 再在外部传入的命令表里线性找同index项。表最多32条，每帧只查一次，遍历成本可忽略。
+const CMD_ITEM *USB_Comm::find_cmd(uint8_t cmd) const
 {
+    if (cmd < CMD_BASE || cmd >= CMD_BASE + CMD_SLOT_MAX)
+        return nullptr;
+    for (uint8_t i = 0; i < cmd_count; i++)
+        if (cmd_items[i].index == cmd)
+            return &cmd_items[i];
+    return nullptr;
+}
 
-    tick = 0;
-    dir_tun = 0; // 没有待发目录
-    dir_mon = 0;
-    monitor_active = false; // 默认不推送，等上位机显式请求监控目录后才开始
-    rx_len = 0;
-    rx_expect = 0;
-    rx_xor = 0;
-    rx_cmd = 0;
+// 其余成员都在头文件声明处用类内初始化给了初值，构造函数只剩三张表的指针/项数
+// 必须由外部传入，没别的活可干。
+USB_Comm::USB_Comm(const MENU_ITEM *tunable, uint8_t tunable_len,
+                   MENU_ITEM *monitor, uint8_t monitor_len,
+                   const CMD_ITEM *cmds, uint8_t cmd_len)
+    : tunable_items(tunable), tunable_count(tunable_len),
+      monitor_items(monitor), monitor_count(monitor_len),
+      cmd_items(cmds), cmd_count(cmd_len)
+{
 }
 
 void USB_Comm::init()
@@ -94,17 +110,45 @@ uint8_t USB_Comm::append_value(uint8_t *out, const MENU_ITEM &item)
     }
     case type_bool:
     case type_on_off:
-        // bool在C++里宽度不保证是1（虽然V5上就是1），显式转成0/1发，避免歧义
+        // bool显式转成0/1
         out[0] = *(const bool *)item.data_ptr ? 1 : 0;
         return 1;
     default:
     {
-        // 数值类型：直接把变量内存里的字节拷进帧里。
-        // 依赖通信双方都是小端，这一点在头文件协议说明里已写明。
+        // 直接把变量内存里的字节拷进帧里。依赖通信双方都是小端
         uint8_t n = value_size(item.data_type);
         if (n > 0)
             memcpy(out, item.data_ptr, n);
         return n;
+    }
+    }
+}
+
+// 把帧里的值写回参数变量，是append_value的逆过程。
+// in指向帧payload中value的起点（定长8B区域），实际只按类型读需要的字节数。
+void USB_Comm::write_value(const uint8_t *in, const MENU_ITEM &item)
+{
+    switch (item.data_type)
+    {
+    case type_color:
+    {
+        // 三字节RGB合回菜单使用的0xRRGGBB整数（与append_value拆解顺序严格对应）
+        uint32_t rgb = ((uint32_t)in[0] << 16) | ((uint32_t)in[1] << 8) | in[2];
+        *(uint32_t *)item.data_ptr = rgb;
+        break;
+    }
+    case type_bool:
+    case type_on_off:
+        // 只认0/非0，避免把任意整数值直接写进bool
+        *(bool *)item.data_ptr = (in[0] != 0);
+        break;
+    default:
+    {
+        // 数值类型：按真实宽度原样拷进变量，高位补的零自然落在被忽略区域
+        uint8_t n = value_size(item.data_type);
+        if (n > 0)
+            memcpy(item.data_ptr, in, n);
+        break;
     }
     }
 }
@@ -163,6 +207,47 @@ void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd
     }
 }
 
+// 发动作命令目录的一批：直接取外部表下标 [batch*CMD_DIR_BATCH, +CMD_DIR_BATCH)
+// 这连续几条，一条拼一帧。
+// 帧payload: [命令字][命令名长][命令名][参数量]([字段类型][字段名长][字段名])×N
+void USB_Comm::send_cmd_dir_batch(uint8_t batch)
+{
+    uint8_t start = batch * CMD_DIR_BATCH;
+    if (start >= cmd_count)
+        return; // 批次超界（正常不会发生，倒计时保证batch取0~总批数-1），容错直接返回
+    uint8_t n = cmd_count - start;
+    if (n > CMD_DIR_BATCH)
+        n = CMD_DIR_BATCH; // 最后一批不足4条时发完为止
+
+    for (uint8_t k = 0; k < n; k++)
+    {
+        const CMD_ITEM *item = &cmd_items[start + k];
+
+        uint8_t pos = 2; // payload从tx_frame[2]起拼，最后pos-2就是payload总长
+        tx_frame[pos++] = item->index;
+
+        uint8_t name_len = (uint8_t)strlen(item->name);
+        if (name_len > CMD_NAME_MAX)
+            name_len = CMD_NAME_MAX;
+        tx_frame[pos++] = name_len;
+        memcpy(&tx_frame[pos], item->name, name_len);
+        pos += name_len;
+
+        tx_frame[pos++] = item->input_num;
+        for (uint8_t f = 0; f < item->input_num; f++)
+        {
+            tx_frame[pos++] = (uint8_t)item->data_type[f];
+            uint8_t flen = (uint8_t)strlen(item->field_name[f]);
+            if (flen > CMD_FIELD_MAX)
+                flen = CMD_FIELD_MAX;
+            tx_frame[pos++] = flen;
+            memcpy(&tx_frame[pos], item->field_name[f], flen);
+            pos += flen;
+        }
+        send_frame(Post_CMD_Directory, pos - 2);
+    }
+}
+
 // 接收状态机收齐一帧、且校验通过后调用。
 // 此时rx_cmd是命令字，rx_payload前rx_len字节是数据。
 void USB_Comm::handle_command()
@@ -179,6 +264,11 @@ void USB_Comm::handle_command()
         // 推送是按tx_tick节拍走的，下一拍自然就开始发，不用特殊触发。
         dir_mon = (monitor_count + DIR_BATCH - 1) / DIR_BATCH;
         monitor_active = true;
+        break;
+    case Request_Command:
+        // 上位机要动作命令目录：按外部表条数分批，每拍CMD_DIR_BATCH条
+        if (cmd_count > 0)
+            dir_cmd = (cmd_count + CMD_DIR_BATCH - 1) / CMD_DIR_BATCH;
         break;
     case Subscribe:
     {
@@ -200,11 +290,41 @@ void USB_Comm::handle_command()
             monitor_items[index].tag = (MONITOR_TAG)tag;
         break;
     }
-    case Pong:
-        break; // 上位机的心跳回应，收到即说明连接正常，暂时不需要额外动作
-    default:
-        break; // 能走到这里的命令长度已知但没实现，先忽略，方便以后扩展
+    case Set_Tunable:
+    {
+        // Payload: [index][value×8B]。写参发生在机器人静止时、目标是对齐标量，
+        // 所以rx线程直接写即可，无需转交主线程。安全只靠下面三道校验保证。
+        uint8_t index = rx_payload[0];
+        if (index >= tunable_count)
+            break; // 下标超表，静默丢弃（上位机拿不到回显会自己超时判失败）
+        const MENU_ITEM &item = tunable_items[index];
+        // 类型以下位机自己的表为准：str/other不可写，也防止上位机发错宽度写穿相邻内存
+        if (item.data_type == type_str || item.data_type == type_other)
+            break;
+        write_value(&rx_payload[1], item);
+        // 不直接回帧（rx不能write），登记回显槽，tx下一拍从内存重读真实值回发
+        echo_index = index;
+        // 置脏标志就算通知完，谁关心谁自己来取（如LCD菜单刷新界面）
+        tunable_dirty = true;
+        break;
     }
+    case Ping:
+        // 上位机心跳（每1s）：标记本周期见过心跳并立刻认可链路（掉线后再收到Ping
+        // 可即时恢复推送，不必等巡视点）；Pong不在这里发——rx任务不能写串口，
+        // 只置pending标志，由下一拍tx_tick统一发，延迟最多10ms。
+        ping_seen = true;
+        link_ok = true;
+        pong_pending = true;
+        break;
+
+        // 内建命令未实现的分支；动作命令不靠switch，在下面统一分发
+    }
+
+    // 动作命令分发：内建switch处理完后，凡是命令表里有的命令字都在这里直接执行。
+    // payload长度已由cmd_payload_len按表收齐，handler按自己的字段表解读即可。
+    const CMD_ITEM *action = find_cmd(rx_cmd);
+    if (action != nullptr)
+        action->func(rx_payload);
 }
 
 // 分区推送，每次tx_tick调用一次：
@@ -215,7 +335,9 @@ void USB_Comm::handle_command()
 // 本函数只按当前tick的值发，不推进tick——推进由tx_tick末尾统一做。
 void USB_Comm::monitor_tick()
 {
-    if (!monitor_active)
+    // monitor_active：上位机要过监控目录；link_ok：心跳看门狗认可链路。
+    // 掉线（2.56s没见Ping）时只停监控值推送，订阅档位和表里数据都保留，Ping恢复即续传。
+    if (!monitor_active || !link_ok)
         return;
 
     // 发一个监控项的完整链路：直接在tx_frame里写[index][当前值]，再封帧发出。
@@ -241,10 +363,30 @@ void USB_Comm::monitor_tick()
     }
 }
 
-// 10ms发送节拍：先发目录倒计时的当前批，再推送监控值，最后推进tick。
+// 10ms发送节拍：先回心跳Pong和调参回显，再发目录倒计时的当前批，然后推送监控值，
+// tick走到255时做一次心跳巡视，最后推进tick。
 // 这是全程序唯一write串口的地方（接收任务只置标志），所以各帧天然不会互相穿插。
 void USB_Comm::tx_tick()
 {
+    // Pong最高优先：3字节小帧，收到Ping后最迟下一拍就回，上位机拿它算往返/在线
+    if (pong_pending)
+    {
+        send_frame(Pong, 0);
+        pong_pending = false;
+    }
+
+    // 调参回显：从data_ptr重读内存里的真实值（而非回响收到值），
+    // 这样上位机看到的是裁剪/换算后实际生效的结果。先取index再清槽。
+    if (echo_index != 0xFF)
+    {
+        uint8_t index = echo_index;
+        echo_index = 0xFF;
+        const MENU_ITEM &item = tunable_items[index];
+        tx_frame[2] = index;
+        uint8_t vlen = append_value(&tx_frame[3], item);
+        send_frame(Tunable_Echo, 1 + vlen);
+    }
+
     // 有待发目录时这一拍先发一批。两个倒计时同时非零（理论上几乎不会，
     // 两类目录请求是人工低频操作）则tunable优先，下一拍再发monitor，串行不并行。
     // 当前批次号 = 总批数 - 剩余批数：倒计时从总批数减到0，批次号正好从0走到总批数-1。
@@ -260,8 +402,23 @@ void USB_Comm::tx_tick()
         send_dir_batch(monitor_items, monitor_count, Post_Monitor_Directory, total - dir_mon);
         dir_mon--;
     }
+    else if (dir_cmd > 0)
+    {
+        // 命令目录排最后，批次号算法同上
+        uint8_t total = (cmd_count + CMD_DIR_BATCH - 1) / CMD_DIR_BATCH;
+        send_cmd_dir_batch(total - dir_cmd);
+        dir_cmd--;
+    }
 
     monitor_tick();
+
+    // 心跳巡视：每256拍（256×10ms=2.56s，上位机1s一个Ping，周期内必见2~3个）
+    // 在tick即将从255溢出回0前检查一次：本周期见过Ping就保持/恢复认可，没见过则断链停推。
+    if (tick == 255)
+    {
+        link_ok = ping_seen;
+        ping_seen = false; // 清零，开始统计下一个周期
+    }
     tick++; // uint8自然溢出回0，掩码轮转无缝衔接，无需回绕判断
 }
 
@@ -274,7 +431,7 @@ void USB_Comm::rx_task()
     {
         if (usb_fd < 0)
         {
-            Delay(10); // 通道没打开，空等（正常不会发生，init在任务启动前完成）
+            vex::wait(10, vex::msec); // 通道没打开，空等（正常不会发生，init在任务启动前完成）
             continue;
         }
         if (read(usb_fd, &ch, 1) != 1)
@@ -323,14 +480,10 @@ void USB_Comm::rx_task()
             break;
 
         case RX_XOR:
-            // 无论校验对错，一帧到此结束，先回等帧头状态准备下一帧
             rx_state = WAIT_HEAD;
             // 校验原理：rx_xor是Cmd和全部Payload的异或，再异或收到的校验字节，
-            // 传输无误时结果为0。同时检查长度没溢出缓冲才执行，双重保险。
             if ((rx_xor ^ ch) == 0 && rx_len <= MAX_PAYLOAD)
                 handle_command();
-            // 校验失败就静默丢弃这帧，不回错误、不重发——上位机会靠目录和
-            // 下一周期的推送自然拿到新数据，简单可靠。
             break;
         }
     }

@@ -1,5 +1,7 @@
 #include "robot_and_control.h"
-#include "key_set.h" // 手柄摇杆对象在本层注入，工具类不直接引用全局
+#include "key_set.h"       // 手柄摇杆对象在本层注入，工具类不直接引用全局
+#include "communication.h" // CMD_ITEM
+#include <string.h>        // memcpy：从payload取float参数
 
 // 本车硬件只在本文件声明，Chassis、RobotAction 等工具类不绑定端口。
 static vex::motor left_chassis_1(vex::PORT6, vex::ratio6_1, false);
@@ -31,3 +33,59 @@ Chassis chassis(left_motors, right_motors,
 // 整机动作实例：main 与自动流程通过它发布任务并周期推进。
 // 手柄摇杆在此绑定，手动控制由 RobotAction 经这两个指针操作。
 RobotAction robot_action(chassis, &left_axis, &right_axis);
+
+// ===== USB上位机动作命令（0x80~0x83）的薄封装 =====
+// 这些函数在通信rx线程里被直接调用：只做一次memcpy取参+发起动作（动作本体
+// 只是置目标/接力指针），不阻塞。运动类命令在已有动作未结束时直接忽略，
+// 避免新目标覆盖正在执行的动作；停止不设守卫，任何时候都能停。
+
+static void cmd_stop(const uint8_t *p)
+{
+    (void)p; // 无参
+    robot_action.stop_move();
+}
+
+static void cmd_turn(const uint8_t *p)
+{
+    if (robot_action.is_busy())
+        return;
+    float angle;
+    memcpy(&angle, p, sizeof(angle));
+    robot_action.turn(angle);
+}
+
+static void cmd_move(const uint8_t *p)
+{
+    if (robot_action.is_busy())
+        return;
+    float distance;
+    memcpy(&distance, p, sizeof(distance));
+    robot_action.move(distance);
+}
+
+static void cmd_goto(const uint8_t *p)
+{
+    if (robot_action.is_busy())
+        return;
+    float arg[3]; // x前(米)、y右(米)、heading最终朝向(度)，紧凑小端排列
+    memcpy(arg, p, sizeof(arg));
+    robot_action.goto_local(arg[0], arg[1], arg[2]);
+}
+
+// 字段类型与中文名表：上位机据此渲染下发框；顺序必须和handler里memcpy的顺序一致
+static const VALUE_TYPE one_float_type[] = {type_float};
+static const char *const turn_fields[] = {"角度(度)"};
+static const char *const move_fields[] = {"距离(米)"};
+
+static const VALUE_TYPE goto_types[] = {type_float, type_float, type_float};
+static const char *const goto_fields[] = {"x前(米)", "y右(米)", "航向(度)"};
+
+// 本车的动作命令总表：非static供外部链接，LCD_menu.cpp构造comm时整张传入，
+// 与tunable/monitor两张MENU表的注入方式保持一致。
+const CMD_ITEM robot_cmds[] = {
+    {cmd_stop, 0x80, nullptr, nullptr, 0, "停止运动"},
+    {cmd_turn, 0x81, one_float_type, turn_fields, 1, "原地转向"},
+    {cmd_move, 0x82, one_float_type, move_fields, 1, "直行"},
+    {cmd_goto, 0x83, goto_types, goto_fields, 3, "局部移动"},
+};
+const uint8_t robot_cmd_count = sizeof(robot_cmds) / sizeof(robot_cmds[0]);

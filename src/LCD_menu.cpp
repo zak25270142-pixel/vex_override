@@ -69,11 +69,15 @@ MENU menu(menu_item,
           monitor_menu_item,
           sizeof(monitor_menu_item) / sizeof(monitor_menu_item[0]));
 
-// USB上位机通信，复用同一套可调参数与监控参数表
+// USB上位机通信，三张表（调参/监控/动作命令）都在构造时整张传入。
+// robot_cmds是另一编译单元里的纯const字面量表（常量初始化先于动态初始化完成），
+// 此处引用不存在全局对象构造顺序问题。
 USB_Comm comm(menu_item,
               sizeof(menu_item) / sizeof(menu_item[0]),
               monitor_menu_item,
-              sizeof(monitor_menu_item) / sizeof(monitor_menu_item[0]));
+              sizeof(monitor_menu_item) / sizeof(monitor_menu_item[0]),
+              robot_cmds,
+              robot_cmd_count);
 
 // 颜色名称、显示颜色和检测结果在应用层逐项对应，菜单类不猜测颜色含义。
 static const AI_VISION_MENU_OBJECT ai_vision_objects[] = {
@@ -148,6 +152,15 @@ void refresh_menu()
             menu.reduce();
         else if (menu.is_monitor_menu)
             menu.refresh_value();
+
+        // 上位机改过调参的脏标志：菜单轮询自取自清并刷一帧；
+        // 监控界面本来每轮都在刷，只在调参界面需要补刷。没有菜单时标志挂着无害。
+        if (comm.tunable_dirty)
+        {
+            comm.tunable_dirty = false;
+            if (!menu.is_monitor_menu)
+                menu.refresh_value();
+        }
         break;
 
     case ai_vision:
