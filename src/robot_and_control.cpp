@@ -1,4 +1,5 @@
 #include "robot_and_control.h"
+#include "key_set.h" // 手柄摇杆对象在本层注入，工具类不直接引用全局
 
 // 本车硬件只在本文件声明，Chassis、RobotAction 等工具类不绑定端口。
 static vex::motor left_chassis_1(vex::PORT6, vex::ratio6_1, false);
@@ -23,9 +24,10 @@ static vex::rotation left_tracking_sensor(vex::PORT2, false);
 
 static vex::inertial inertial_sensor(vex::PORT11, vex::turnType::right);
 
-static Chassis chassis(left_motors, right_motors,
-                       forward_tracking_sensor, left_tracking_sensor,
-                       inertial_sensor);
+Chassis chassis(left_motors, right_motors,
+                forward_tracking_sensor, left_tracking_sensor,
+                inertial_sensor);
 
 // 整机动作实例：main 与自动流程通过它发布任务并周期推进。
-RobotAction robot_action(chassis);
+// 手柄摇杆在此绑定，手动控制由 RobotAction 经这两个指针操作。
+RobotAction robot_action(chassis, &left_axis, &right_axis);

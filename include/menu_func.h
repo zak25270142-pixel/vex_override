@@ -3,30 +3,6 @@
 
 #include "my_main.h"
 
-struct VALUE_HISTORY
-{                           // 存储的历史记录
-    uint16_t history_depth; // 历史数据存储深度
-    void *history_buffer;   // 历史数据缓冲区指针
-    uint16_t write_index;   // 循环缓冲区的写入位置
-};
-
-struct SHOW_VALUE_HISTORY
-{ // 绘图(历史记录)参数
-    struct VALUE_HISTORY value_history;
-    uint8_t x_gap; //
-};
-
-struct MENU_ITEM
-{
-    const char *item_name;
-    VALUE_TYPE data_type;
-    void *data_ptr;
-    const char *unit;
-    struct SHOW_VALUE_HISTORY *history_p;
-    MENU_ITEM(const char *name, VALUE_TYPE type, void *ptr, const char *u = nullptr, SHOW_VALUE_HISTORY *hist = nullptr)
-        : item_name(name), data_type(type), data_ptr(ptr), unit(u), history_p(hist) {}
-};
-
 class MENU
 {
 private:

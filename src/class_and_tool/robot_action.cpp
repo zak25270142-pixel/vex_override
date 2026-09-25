@@ -1,7 +1,12 @@
 #include "robot_action.h"
+#include "Control_func.h" // 仅本文件需要访问 Remote_Control 成员，头文件不暴露此依赖
 
-RobotAction::RobotAction(Chassis &chassis_ref)
-    : chassis(chassis_ref),
+RobotAction::RobotAction(Chassis &chassis_ref,
+                         Remote_Control *left_axis,
+                         Remote_Control *right_axis)
+    : manual_left_axis(left_axis),
+      manual_right_axis(right_axis),
+      chassis(chassis_ref),
       // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
       // ki、kd 按秒计（kp 无量纲）：(kp, ki, kd[, output_limit])
       distance_pid(130.0f, 35.0f, 18.0f),
@@ -165,6 +170,49 @@ void RobotAction::update_goto(uint32_t now)
         action_finished();
 }
 
+// ---- 手动控制（驾驶员开环）----
+
+float RobotAction::square_map_axis(int v)
+{
+    // 保留符号的平方：把摇杆小值压低、大值保留，低速更可控。
+    // 输入 -127~127，输出 -100~100。
+    // 输入绝对值小于 manual_deadzone 时输出 0；
+    // 否则把 [deadzone^2, 127^2] 线性映射到 [0, 100]，再加符号。
+    // 平方后的有效范围即 [-(127*127)+deadzone^2, 127*127-deadzone^2]。
+    constexpr int input_max = 127;
+    constexpr int output_max = 100;
+    int abs_v = v < 0 ? -v : v;
+    if (abs_v < manual_deadzone)
+        return 0.0f;
+    int sign = v < 0 ? -1 : 1;
+    int squared = abs_v * abs_v;
+    int squared_dz = manual_deadzone * manual_deadzone;
+    int max_squared = input_max * input_max;
+    float out = (float)(squared - squared_dz) / (max_squared - squared_dz) * output_max;
+    return sign * out;
+}
+
+void RobotAction::update_manual(uint32_t now)
+{
+    // 手动开环控制不需要 now（PID 时间戳），仅为统一接力指针签名保留。
+    // 摇杆未注入则无法手动，直接停车回到空闲。
+    if (manual_left_axis == nullptr)
+    {
+        stop_move();
+        return;
+    }
+
+    // Arcade：只用左手摇杆。value_y 为前后、value_x 为左右（见 key_init1 的轴绑定）。
+    int forward_raw = manual_left_axis->value[manual_left_axis->value_p].value_y;
+    int turn_raw = manual_left_axis->value[manual_left_axis->value_p].value_x;
+
+    float forward = square_map_axis(forward_raw);
+    float turn = square_map_axis(turn_raw);
+
+    // 前进 ± 转向 = 左右轮输出
+    chassis.output(forward + turn, forward - turn);
+}
+
 void RobotAction::refresh()
 {
     // 周期统一时间戳
@@ -178,7 +226,7 @@ void RobotAction::refresh()
         (this->*chassis_task_ptr)(now);
 }
 
-void RobotAction::turn(float angle, float max_speed)
+void RobotAction::turn(float angle)
 {
     // 已在容差内：不起步，按“瞬间完成”走正常收尾（触发回调）。
     if (fabsf(angle) <= angle_tolerance)
@@ -188,11 +236,10 @@ void RobotAction::turn(float angle, float max_speed)
     }
 
     turn_target = angle;
-    turn_pid.max_output = max_speed;
     chassis_task_ptr = &RobotAction::start_turn;
 }
 
-void RobotAction::move(float distance, float max_speed)
+void RobotAction::move(float distance)
 {
     // 已在容差内：不起步，按“瞬间完成”走正常收尾（触发回调）。
     if (fabsf(distance) <= distance_tolerance)
@@ -202,12 +249,10 @@ void RobotAction::move(float distance, float max_speed)
     }
 
     move_target = distance;
-    distance_pid.max_output = max_speed;
     chassis_task_ptr = &RobotAction::start_move;
 }
 
-void RobotAction::goto_local(float x, float y, float heading,
-                             float max_speed)
+void RobotAction::goto_local(float x, float y, float heading)
 {
     // 点与最终朝向均已达标：不起步，按“瞬间完成”走正常收尾（触发回调）。
     float distance_error = sqrtf(x * x + y * y);
@@ -220,10 +265,6 @@ void RobotAction::goto_local(float x, float y, float heading,
 
     // 目标以发布时刻位姿为起点保存，运行中不再改写，随时可查原始目标。
     goto_target = {x, y, heading};
-
-    // 同一上限同时约束直线和转向 PID，具体左右轮限幅由 Chassis::output() 完成。
-    distance_pid.max_output = max_speed;
-    turn_pid.max_output = max_speed;
     chassis_task_ptr = &RobotAction::start_goto;
 }
 
@@ -241,4 +282,19 @@ void RobotAction::stop_move()
     // 外部主动打断：只停车、清指针，不触发回调。
     chassis.stop();
     chassis_task_ptr = nullptr;
+}
+
+void RobotAction::manual()
+{
+    // 摇杆未注入则无法手动，保持空闲。
+    if (manual_left_axis == nullptr)
+        return;
+
+    // 进入手动模式：把手柄轴设为 only_value（不触发方向键），
+    // 接力指针指向 update_manual，refresh() 每轮自动执行手动控制。
+    // is_busy() 此后为真，调用方可据此挡住自动动作。
+    manual_left_axis->state = Remote_Control::only_value;
+    if (manual_right_axis != nullptr)
+        manual_right_axis->state = Remote_Control::only_value;
+    chassis_task_ptr = &RobotAction::update_manual;
 }

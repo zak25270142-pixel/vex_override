@@ -46,6 +46,35 @@ typedef enum
     type_other,
 } VALUE_TYPE;
 
+// 监控项标签：同时承担两个职责——
+//   1. 连接后的默认订阅档位（上位机请求监控目录后按此推送，也可再用命令改档）
+//   2. 语义标记：x/y/yaw供上位机场地图页自动识别，不用按名字猜
+// 档位规则：0不订阅；1低速(8相轮转约80ms)；>=2高速(每10ms)，
+// 所以语义量x/y/yaw天然按高速推送。
+enum MONITOR_TAG : uint8_t
+{
+    monitor_tag_none = 0,
+    monitor_tag_slow = 1,
+    monitor_tag_fast = 2,
+    monitor_tag_pos_x = 3,
+    monitor_tag_pos_y = 4,
+    monitor_tag_yaw = 5,
+};
+
+// 菜单与通信共用的条目描述：名字、数据类型、数据指针、中文名、单位、监控标签
+struct MENU_ITEM
+{
+    const char *item_name;
+    VALUE_TYPE data_type;
+    void *data_ptr;
+    const char *Chinese_name;
+    const char *unit;
+    MONITOR_TAG tag; // 仅监控表使用；调参表默认none即可
+    MENU_ITEM(const char *name, VALUE_TYPE type, void *ptr, const char *c,
+              const char *u = nullptr, MONITOR_TAG t = monitor_tag_none)
+        : item_name(name), data_type(type), data_ptr(ptr), Chinese_name(c), unit(u), tag(t) {}
+};
+
 // 所有周期任务共用的生命周期；每个模块分别保存自己的状态变量。
 typedef enum
 {

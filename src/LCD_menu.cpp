@@ -3,6 +3,7 @@
 #include "key_set.h"
 #include "LCD_menu.h"
 #include "ai_vision.h"
+#include "robot_and_control.h"
 
 enum MENU_state : uint8_t
 {
@@ -28,32 +29,37 @@ int64_t int64tnum = -1145141909810114514;
 
 const struct MENU_ITEM menu_item[] =
     {
-        {"Lucky_num", type_uint32_t, &Lucky_num, "ms"},
-        {"Lucky_num2", type_uint32_t, &Lucky_num2},
-        {"LED PC13", type_bool, &LED_PC13_state},
-        {"LED5 PWM", type_uint16_t, &LED5_pwm_num},
-        {"ANGLE(float)", type_float, &ANGLE},
-        {"this is a so long num", type_uint64_t, &so_long_num},
-        {"this is an int8_t num", type_int8_t, &int8tnum},
-        {"this is an int16_t num", type_int16_t, &int16tnum},
-        {"this is an int32_t num", type_int32_t, &int32tnum},
-        {"this is an int64_t num", type_int64_t, &int64tnum},
-        {"small num", type_uint8_t, &small_num},
+        {"Lucky_num", type_uint32_t, &Lucky_num, "幸运数", "ms"},
+        {"Lucky_num2", type_uint32_t, &Lucky_num2, "幸运数2"},
+        {"LED PC13", type_bool, &LED_PC13_state, "LED PC13"},
+        {"LED5 PWM", type_uint16_t, &LED5_pwm_num, "LED5 PWM"},
+        {"ANGLE(float)", type_float, &ANGLE, "角度"},
+        {"this is a so long num", type_uint64_t, &so_long_num, "这是一个很长的数"},
+        {"this is an int8_t num", type_int8_t, &int8tnum, "这是一个8位整数"},
+        {"this is an int16_t num", type_int16_t, &int16tnum, "这是一个16位整数"},
+        {"this is an int32_t num", type_int32_t, &int32tnum, "这是一个32位整数"},
+        {"this is an int64_t num", type_int64_t, &int64tnum, "这是一个64位整数"},
+        {"small num", type_uint8_t, &small_num, "很小的数"},
 };
 
-static const struct MENU_ITEM monitor_menu_item[] =
+// 监控表要在运行时被通信模块改订阅档位（改tag字段），不能加const。
+// tag决定上位机连接后的默认推送档位；x/y/yaw还兼作场地图的语义标记。
+static struct MENU_ITEM monitor_menu_item[] =
     {
-        {"axis_left_x", type_int32_t, &left_axis.value[left_axis.value_p].value_x},
-        {"Lucky_num2", type_uint32_t, &Lucky_num2},
-        {"LED PC13", type_bool, &LED_PC13_state},
-        {"LED5 PWM", type_uint16_t, &LED5_pwm_num},
-        {"ANGLE(float)", type_float, &ANGLE},
-        {"this is a so long num", type_uint64_t, &so_long_num},
-        {"this is an int8_t num", type_int8_t, &int8tnum},
-        {"this is an int16_t num", type_int16_t, &int16tnum},
-        {"this is an int32_t num", type_int32_t, &int32tnum},
-        {"this is an int64_t num", type_int64_t, &int64tnum},
-        {"small num", type_uint8_t, &small_num},
+        {"chassis_x", type_float, &chassis.x, "全局坐标X", "m", monitor_tag_pos_x},
+        {"chassis_y", type_float, &chassis.y, "全局坐标Y", "m", monitor_tag_pos_y},
+        {"chassis_heading", type_float, &chassis.heading, "航向角", "deg", monitor_tag_yaw},
+        {"axis_left_x", type_int32_t, &left_axis.value[left_axis.value_p].value_x, "轴左坐标", nullptr, monitor_tag_slow},
+        {"Lucky_num2", type_uint32_t, &Lucky_num2, "幸运数2", nullptr, monitor_tag_slow},
+        {"LED PC13", type_bool, &LED_PC13_state, "LED PC13", nullptr, monitor_tag_slow},
+        {"LED5 PWM", type_uint16_t, &LED5_pwm_num, "LED5 PWM", nullptr, monitor_tag_slow},
+        {"ANGLE(float)", type_float, &ANGLE, "角度", nullptr, monitor_tag_slow},
+        {"this is a so long num", type_uint64_t, &so_long_num, "这是一个很长的数", nullptr, monitor_tag_slow},
+        {"this is an int8_t num", type_int8_t, &int8tnum, "这是一个8位整数", nullptr, monitor_tag_slow},
+        {"this is an int16_t num", type_int16_t, &int16tnum, "这是一个16位整数", nullptr, monitor_tag_slow},
+        {"this is an int32_t num", type_int32_t, &int32tnum, "这是一个32位整数", nullptr, monitor_tag_slow},
+        {"this is an int64_t num", type_int64_t, &int64tnum, "这是一个64位整数", nullptr, monitor_tag_none},
+        {"small num", type_uint8_t, &small_num, "很小的数", nullptr, monitor_tag_slow},
 };
 
 MENU menu(menu_item,
@@ -62,6 +68,12 @@ MENU menu(menu_item,
           menu_tc_key_reset,
           monitor_menu_item,
           sizeof(monitor_menu_item) / sizeof(monitor_menu_item[0]));
+
+// USB上位机通信，复用同一套可调参数与监控参数表
+USB_Comm comm(menu_item,
+              sizeof(menu_item) / sizeof(menu_item[0]),
+              monitor_menu_item,
+              sizeof(monitor_menu_item) / sizeof(monitor_menu_item[0]));
 
 // 颜色名称、显示颜色和检测结果在应用层逐项对应，菜单类不猜测颜色含义。
 static const AI_VISION_MENU_OBJECT ai_vision_objects[] = {

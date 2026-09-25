@@ -34,6 +34,10 @@ public:
     // output 为带符号百分比；保持与原 motor_group 一致：dir 固定传 fwd，方向由 output 符号决定。
     void spin(vex::directionType dir, double output,
               vex::velocityUnits units);
+
+    // 自定义 spin 方法，用自定义pid控制转速，输入为pct
+    void my_spin(double output);
+
     void stop();
 };
 
@@ -162,7 +166,7 @@ public:
     // 仅供没有周期 update 的场景（如 finish_init）使用，周期内禁止调用（会二次 update）。
     void reset(uint32_t now);
 
-    // 使用最近一次 update() 保存的运动状态处理死区并输出给电机
+    // 使用最近一次 update() 保存的运动状态处理死区并输出给电机，允许输入超过100的值，内部会按比例缩放归一
     void output(float left_output, float right_output);
 
     // 按 init() 设置的停车方式停止左右电机组。
