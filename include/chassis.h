@@ -140,7 +140,7 @@ public:
     // 3. gap：update() 根据 start、now 或上一轮 now 计算出的可选差值。
 
     // 3.1 上一次 update() 到本次 update() 之间的变化量。
-    uint16_t update_gap = 0;           // 相邻两次 update() 的时间间隔，单位 ms。
+    uint32_t update_gap = 0;           // 相邻两次 update() 的时间间隔，单位 us。
     float local_forward_change = 0.0f; // 本轮车体中心沿自身前方的位移，单位 m。
     float local_side_change = 0.0f;    // 本轮车体中心沿自身右方的位移，单位 m。
     float heading_change = 0.0f;       // 本轮 update() 中的航向角变化，单位 deg。

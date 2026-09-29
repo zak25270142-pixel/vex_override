@@ -3,19 +3,19 @@
 
 PositionPID::PositionPID(float p, float i, float d, float output_limit)
     : kp(p),
-      ki(i / 1000.0f),
-      kd(d * 1000.0f),
+      ki(i / 1000000.0f),
+      kd(d * 1000000.0f),
       integral(0.0f), previous_error(0.0f),
-      last_time_ms(0), max_output(output_limit) {}
+      last_time_us(0), max_output(output_limit) {}
 
-float PositionPID::reset(float error, uint32_t current_time_ms)
+float PositionPID::reset(float error, uint32_t current_time_us)
 {
     // 清除积分项
     integral = 0.0f;
 
     previous_error = error;
     pre_sign = 0; // pre_sign初始未知，不参与积分清空
-    last_time_ms = current_time_ms;
+    last_time_us = current_time_us;
 
     // 第一轮没有历史数据，只计算并限幅 P 项。
     float output = kp * error;
@@ -26,11 +26,10 @@ float PositionPID::reset(float error, uint32_t current_time_ms)
     return output;
 }
 
-float PositionPID::update(float error, uint32_t current_time_ms)
+float PositionPID::update(float error, uint32_t current_time_us)
 {
-    // uint32_t 时间戳相减得到两次计算之间经过的毫秒数。
-    // PID 远短于 65 s 的周期内更新，不可能溢出
-    uint16_t gap_time_ms = static_cast<uint16_t>(current_time_ms - last_time_ms);
+    // uint32_t 时间戳相减得到两次计算之间经过的微秒数。
+    uint32_t gap_time_us = current_time_us - last_time_us;
 
     // pre_error为0时pre_sign保持不变，引入该项主要解出err正好是0时的后续处理
     if (previous_error != 0.0f)
@@ -40,9 +39,9 @@ float PositionPID::update(float error, uint32_t current_time_ms)
     if ((error > 0.0f && pre_sign == -1) || (error < 0.0f && pre_sign == 1))
         integral = 0.0f;
 
-    // 统一使用 ms：I 项是“误差×ms”，D 项是“误差/ms”。
-    float candidate_i = integral + error * gap_time_ms;
-    float p_add_d = kp * error + kd * (error - previous_error) / gap_time_ms;
+    // 统一使用 us：I 项是“误差×us”，D 项是“误差/us”。
+    float candidate_i = integral + error * gap_time_us;
+    float p_add_d = kp * error + kd * (error - previous_error) / gap_time_us;
     // 用候选积分计算一次未经限幅的输出，判断电机是否已经达到输出极限。
     float candidate_output = p_add_d + ki * candidate_i;
     /*
@@ -67,7 +66,7 @@ float PositionPID::update(float error, uint32_t current_time_ms)
         output = -max_output;
 
     previous_error = error;
-    last_time_ms = current_time_ms;
+    last_time_us = current_time_us;
 
     return output;
 }
@@ -91,8 +90,6 @@ bool StableJudge::update(bool condition, uint32_t current_time)
     }
     return false;
 }
-
-// ---------- 一维卡尔曼（自 VEX_chassis_drive 移植，暂未接入） ----------
 
 KalmanFilter::KalmanFilter(float process_noise, float measure_noise, float init_value)
     : Q(process_noise),

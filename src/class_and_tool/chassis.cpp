@@ -46,7 +46,7 @@ bool Chassis::is_ready()
 void Chassis::finish_init()
 {
     inertial_sensor.resetRotation();
-    uint32_t now = get_time_ms();
+    uint32_t now = get_time_us();
     previous_time = now;
     reset(now);
 }
@@ -54,7 +54,7 @@ void Chassis::finish_init()
 // 更新里程、速度和航向
 void Chassis::update(uint32_t now)
 {
-    update_gap = static_cast<uint16_t>(now - previous_time);
+    update_gap = now - previous_time;
     previous_time = now;
 
     // 在有定位轮后可舍弃 编码器里程相关计算
@@ -128,9 +128,9 @@ void Chassis::update(uint32_t now)
     // 定位轮可以宣告到此结束
 
     // 里程计速度使用本轮前向位移除以实际更新时间。
-    // 两次调用落在同一毫秒时 update_gap 可能为 0，此时不能进行除法。
+    // 两次调用落在同一微秒时 update_gap 可能为 0，此时不能进行除法。
     if (update_gap > 0)
-        linear_speed = local_forward_change * 1000.0f / update_gap;
+        linear_speed = local_forward_change * 1000000.0f / update_gap;
     // else 时保持不变(gap=0,无新值)
     // linear_speed 主要用于是否停车的判断
 
@@ -184,11 +184,11 @@ void Chassis::reset(uint32_t now)
 
 void Chassis::output(float left_output, float right_output)
 {
-    // 入参即自编速度环的目标速度（pct，±100）：位置环 PID 与手柄映射都从这里喂入，
+    // 位置环 PID 与手柄映射都从这里喂入，
     // 真正的闭环计算在 speed_tick() 常驻任务里执行，本函数只写目标。
     // 左右配重不同则可达满速不同：任一指令超出本侧上限时，按超出比例最大的一侧
     // 把两侧同步缩回，保留差速关系（直行时整车被慢侧拖住，但方向不偏）。
-    float scale = fmaxf(fmaxf(fabsf(left_output) / left_max_speed,fabsf(right_output) / right_max_speed),1.0f);
+    float scale = fmaxf(fmaxf(fabsf(left_output) / left_max_speed, fabsf(right_output) / right_max_speed), 1.0f);
 
     // 摩擦补偿由速度环内部电压域统一处理，这里不做任何死区映射，缩回后原样下发。
     left_motors.drive(left_output / scale);

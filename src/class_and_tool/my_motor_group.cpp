@@ -52,9 +52,9 @@ void MyMotorGroup::my_spin()
 {
     if (is_stoped)
         return;
-    uint32_t current_time_us = get_time_us();
-    uint32_t dt_us = current_time_us - last_time_us;
-    last_time_us = current_time_us;
+    uint32_t now_us = get_time_us();
+    uint32_t dt_us = now_us - last_time_us;
+    last_time_us = now_us;
 
     // 目标速度接近0：输出0V惰行且保留积分，专供目标连续过零的场景。
     // 注意整车“停车”统一走 stop()（brake 制动，再次 drive 时 my_respin 清积分），
@@ -90,79 +90,53 @@ void MyMotorGroup::my_spin()
 
     const float error = target - speed;
     const float derivative = (error - previous_error) / static_cast<float>(dt_us);
-    const float feedforward = kf * target;
     const float p_output = kp * error;
     const float d_output = kd * derivative;
-    const float i_output = ki * integral;
+    const float feedforward = kf * target;
 
-    // ---------- 条件积分（anti-windup）----------
-    // 先算"如果不加本次误差积分"的输出，判断当前是否已饱和
-    const float output_before_clip = feedforward + p_output + i_output + d_output;
-    const float clipped_preview = (output_before_clip > 1.0f) ? 1.0f : (output_before_clip < -1.0f) ? -1.0f
-                                                                                                    : output_before_clip;
-    const bool is_saturated = (fabsf(output_before_clip) >= 1.0f);
+    // 组内归一输出上限：电压映射为 基础电压 + |output|·可控电压·volt_factor，
+    // 不超过 volt_max 要求 |output| ≤ 1/volt_factor；volt_factor 最大的电机最先到顶，
+    // 由它决定整组上限（当前为 1/1.2≈0.83，不是 1）。
+    float max_volt_factor = volt_factor[0];
+    for (uint8_t i = 1; i < 4; i++)
+        if (volt_factor[i] > max_volt_factor)
+            max_volt_factor = volt_factor[i];
+    const float output_limit = 1.0f / max_volt_factor;
 
-    // 积分条件：未饱和 或 误差与输出反向（积分已在减小，无需抑制）
-    // 误差变号时积分自然衰减，不干预
-    if (!is_saturated || (error * clipped_preview < 0.0f))
+    // ---------- 条件积分抗饱和 ----------
+    // 先把本轮误差计入候选积分并算出候选输出，饱和判据直接用上面的真实电压饱和点，
+    // 与最终输出限幅完全一致，不会出现“电压已被削、积分还在堆”的脱节。
+    // 已饱和但误差方向能帮助退出饱和时，仍允许积分（与位置环 PositionPID 同一套规则）。
+    const float candidate_integral = integral + error * static_cast<float>(dt_us);
+    const float candidate_output = feedforward + p_output + ki * candidate_integral + d_output;
+    if (fabsf(candidate_output) <= output_limit ||
+        (candidate_output > output_limit && error < 0.0f) ||
+        (candidate_output < -output_limit && error > 0.0f))
     {
-        integral += error * static_cast<float>(dt_us);
+        integral = candidate_integral;
     }
-
-    // 如需更积极的积分限幅，可在这里加绝对值上限，例如：
-    // const float max_integral = 1.0f / (ki + 1e-6f); // 保证i_output不超过1.0
+    // 如需更积极的积分限幅，可在这里加绝对值上限（保证 i 项不超过输出上限），例如：
+    // const float max_integral = output_limit / (ki + 1e-6f);
     // integral = fmaxf(-max_integral, fminf(max_integral, integral));
 
-    const float final_i_output = ki * integral;
-    float output = feedforward + p_output + final_i_output + d_output;
-    if (output > 1.0f)
-        output = 1.0f;
-    else if (output < -1.0f)
-        output = -1.0f;
+    float output = feedforward + p_output + ki * integral + d_output;
+    if (output > output_limit)
+        output = output_limit;
+    else if (output < -output_limit)
+        output = -output_limit;
 
+    // ---------- 归一输出映射到四路电压 ----------
+    // output 已限在组内上限内，代入映射后每一路都不会超过各自 volt_max，
+    // 无需再做事后等比缩回；volt_output 保留供监控比对。
     const float abs_output = fabsf(output);
-    const float sign = output > 0.0f ? 1.0f : -1.0f;
-
-    // ---------- 堵转保护：任一路电流超限则整体降输出 ----------
-    // motors[i]->current(vex::currentUnits::amp) 获取实时电流
-    float current_max = 0.0f;
+    const float sign = output >= 0.0f ? 1.0f : -1.0f;
     for (uint8_t i = 0; i < 4; i++)
     {
-        const float c = motors[i]->current(vex::currentUnits::amp);
-        if (c > current_max)
-            current_max = c;
-    }
-    const float current_limit = 2.5f; // 堵流阈值，单位A，需实测标定
-    float current_scale = 1.0f;
-    if (current_max > current_limit)
-    {
-        // 线性衰减，越超限压得越狠
-        current_scale = fmaxf(0.3f, current_limit / current_max);
-    }
-
-    float largest_output_ratio = 0.0f;
-    for (uint8_t i = 0; i < 4; i++)
-    {
-        // PID真正可以调节的电压范围
         const float controllable_voltage = volt_max[i] - friction - volt_min[i];
         volt_output[i] = sign * (friction + volt_min[i] +
                                  abs_output * controllable_voltage * volt_factor[i]);
-        // 应用堵转缩放
-        volt_output[i] *= current_scale;
-
-        const float output_ratio = fabsf(volt_output[i]) / volt_max[i];
-        if (output_ratio > largest_output_ratio)
-            largest_output_ratio = output_ratio;
-    }
-    // 超过任意电机上限后，四路整体等比例限幅
-    if (largest_output_ratio > 1.0f)
-    {
-        const float scale = 1.0f / largest_output_ratio;
-        for (uint8_t i = 0; i < 4; i++)
-            volt_output[i] *= scale;
-    }
-    for (uint8_t i = 0; i < 4; i++)
         motors[i]->spin(vex::directionType::fwd, volt_output[i], vex::voltageUnits::volt);
+    }
 
     previous_error = error;
 }

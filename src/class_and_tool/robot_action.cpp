@@ -226,8 +226,8 @@ void RobotAction::update_manual(uint32_t now)
 
 void RobotAction::refresh()
 {
-    // 周期统一时间戳
-    uint32_t now = get_time_ms();
+    // 周期统一时间戳（us）
+    uint32_t now = get_time_us();
 
     // 每轮首先更新里程、速度和航向。
     chassis.update(now);
@@ -297,10 +297,6 @@ void RobotAction::stop_move()
 
 void RobotAction::manual()
 {
-    // 摇杆未注入则无法手动，保持空闲。
-    if (manual_left_axis == nullptr)
-        return;
-
     // 进入手动模式：把手柄轴设为 only_value（不触发方向键），
     // 接力指针指向 update_manual，refresh() 每轮自动执行手动控制。
     // is_busy() 此后为真，调用方可据此挡住自动动作。
