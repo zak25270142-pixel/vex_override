@@ -4,25 +4,53 @@
 #include "my_main.h"
 
 // motor1/2 与轮轴同轴直连（60 齿），motor3/4 经齿轮传动（48 齿），
-// speed_scale 使得各电机期望的转速保持一致(乘上这个系数后，电机转一圈，轮胎转一圈)
 // 里程计读数只取直连轮轴、无啮合背隙的 motor1；后期改用定位轮后该读数可废弃。
-// 电机编码器的位置读取已随定位轮启用而注释保留（恢复点：打滑检测），
-// 速度读取仍用于 output() 的静/动摩擦死区状态机，不可移除。
 class MyMotorGroup
 {
 private:
     // 绑定构造传入的四台电机
     vex::motor *motors[4];
+    bool is_stoped = true;
 
 public:
-    // speed_scale为各电机转速指令相对轮轴统一指令的折算系数。
-    // 我们假定输入为 0-1的pct
-    // 显然需要映射后使得speed_scale数组中最大的值为1
-    // 不反映转速比，即使现在的值恰好与转速比一致
-    float speed_scale[4] = {1.0f, 1.0f, 0.8f, 0.8f};
+    // 电压缩放因子
+    float volt_factor[4] = {1.0f, 1.0f, 1.2f, 1.2f};
+
+    // 判断“要求电压”和“实际电压”是否明显不一致的容差
+    float voltage_tolerance = 0.2f;
+
+    // 关于速度环与电压控制，将在本类完成
+
+    //-----pid速度环------------------------------------
+    // 速度环全程使用 pct（±100，100 即满速）：目标来自外部指令，反馈直接读电机
+    // 电压限幅与映射
+    float volt_max[4] = {12.0f, 12.0f, 12.0f, 12.0f}; // 最大电压(实测，空载时)
+    float volt_min[4] = {1.0f, 1.0f, 1.0f, 1.0f};     // 最小电压(实测，空载时)
+    float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
+    float static_deadzone = 2.0f;                     // 克服静摩擦所需电压(整车下,单位V)
+    float dynamic_deadzone = 1.0f;                    // 克服动摩擦所需电压(整车下,单位V)
+    float output_deadzone = 0.1f;                     // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
+
+    // 编码器运动状态确认阈值，直接对原生 rpm 读数判定：
+    bool is_moving = false;
+    float moving_confirm_speed = 0.15f;  // 静止到运动以转速大于该值确认为运动状态，单位 rpm。
+    float stopped_confirm_speed = 0.03f; // 运动到静止以转速小于该值确认为静止状态，单位 rpm。
+
+    float target = 0.0f; // 目标速度，单位 pct（±100）
+
+    float kf;                    // 阻力前馈，单位：归一输出 / pct
+    float kp;                    // 比例项，单位：归一输出 / pct
+    float ki;                    // 积分项，内部单位：归一输出 / (pct·us)
+    float kd;                    // 微分项，内部单位：归一输出·us / pct
+    float integral = 0.0f;       // integral 保存误差累计；本类所有时间量统一使用 us。
+    float previous_error = 0.0f; // previous_error 保存上一轮误差，用于计算 D 项和判断误差是否越过零点。
+    uint32_t last_time_us = 0;   // 上一轮 update() 使用的 VEX 系统微秒时间戳。
+    // 其他参数待补充
+    //--------------------------------------------------------
 
     MyMotorGroup(vex::motor &m1, vex::motor &m2,
-                 vex::motor &m3, vex::motor &m4);
+                 vex::motor &m3, vex::motor &m4,
+                 float f, float p, float ki, float kd);
 
     void setStopping(vex::brakeType brake); // 设置电机刹车类型
 
@@ -31,14 +59,17 @@ public:
     //  double position();                      // 读取当前编码器位置，单位 rev (取motors[0]的值)
 
     double velocity(); // 读取当前转速，单位 rpm (取motors[0]的值)
-    // output 为带符号百分比；保持与原 motor_group 一致：dir 固定传 fwd，方向由 output 符号决定。
-    void spin(vex::directionType dir, double output,
-              vex::velocityUnits units);
 
-    // 自定义 spin 方法，用自定义pid控制转速，输入为pct
-    void my_spin(double output);
+    // 速度环本体：追踪 target（pct），直接用电压控制电机，外界无需做摩擦补偿。
+    void my_spin();
+
+    // 给定目标速度（pct，±100）并确保速度环开始追踪。
+    // 停车后首次调用会自动 my_respin() 清积分起步；持续运行期间只更新目标。
+    void drive(float target);
 
     void stop();
+
+    void my_respin();
 };
 
 class Chassis
@@ -51,9 +82,6 @@ private:
     vex::rotation &left_tracking_sensor;
     vex::inertial &inertial_sensor;
 
-    // 是否运动
-    bool left_is_moving = false;
-    bool right_is_moving = false;
     // 上一次 update() 的系统时间戳，单位 ms。
     uint32_t previous_time = 0;
 
@@ -75,20 +103,10 @@ public:
     // 侧向轮读数只受其前向偏移影响：偏前为正、偏后为负（其左右居中，无侧向偏移）。
     float side_tracking_offset = -0.021262f; // 侧向定位轮偏后 21.262mm。
 
-    // 克服摩擦所需的最小输出百分比(死区)。
-    float left_static_deadzone = 10.0f;
-    float left_dynamic_deadzone = 5.0f;
-    float right_static_deadzone = 10.0f;
-    float right_dynamic_deadzone = 5.0f;
-    // PID 有效输出绝对值不超过该值时视为 0，单位百分比。
-    // 用于避免因微小输出而启动电机。
-    float output_deadzone = 0.1f;
-
-    // 编码器运动状态确认阈值，单位 rpm。
-    // 静止到运动以转速大于该值确认为运动状态。
-    float moving_confirm_speed = 0.15f;
-    // 运动到静止以转速小于该值确认为静止状态。
-    float stopped_confirm_speed = 0.03f;
+    // 左右两侧各自的可达满速，单位 pct，取值 (0,100]，随整车配重分布不同而不同，实测标定。
+    // output() 等比限幅以此为基准；位置环 max_output 不应超过两侧较小值。
+    float left_max_speed = 100.0f;
+    float right_max_speed = 100.0f;
 
     /* 以上调参区间 */
 
@@ -166,8 +184,12 @@ public:
     // 仅供没有周期 update 的场景（如 finish_init）使用，周期内禁止调用（会二次 update）。
     void reset(uint32_t now);
 
-    // 使用最近一次 update() 保存的运动状态处理死区并输出给电机，允许输入超过100的值，内部会按比例缩放归一
+    // 速度环唯一目标入口：位置环 PID 与手柄映射都走这里，入参是左右轮目标速度（pct，±100）。
+    // 允许输入超过 100 的叠加值，内部按比例缩回；本函数只写目标，闭环由 speed_tick() 常驻任务执行。
     void output(float left_output, float right_output);
+
+    // 速度环每轮推进：由独立常驻任务短周期调用。停车状态下各组内部直接返回。
+    void speed_tick();
 
     // 按 init() 设置的停车方式停止左右电机组。
     void stop();

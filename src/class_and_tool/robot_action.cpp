@@ -194,7 +194,7 @@ float RobotAction::square_map_axis(int v)
 
 void RobotAction::update_manual(uint32_t now)
 {
-    // 手动开环控制不需要 now（PID 时间戳），仅为统一接力指针签名保留。
+    // 手动模式不使用动作 PID，now 仅为统一接力指针签名保留。
     // 摇杆未注入则无法手动，直接停车回到空闲。
     if (manual_left_axis == nullptr)
     {
@@ -209,8 +209,19 @@ void RobotAction::update_manual(uint32_t now)
     float forward = square_map_axis(forward_raw);
     float turn = square_map_axis(turn_raw);
 
-    // 前进 ± 转向 = 左右轮输出
-    chassis.output(forward + turn, forward - turn);
+    // Arcade 合成左右轮指令，square_map_axis 的输出范围为 ±100。
+    float left_cmd = forward + turn;
+    float right_cmd = forward - turn;
+
+    // 两杆回中：松杆即刹车。stop() 制动并停掉速度环，下次推杆时 drive 自动清积分起步。
+    if (left_cmd == 0.0f && right_cmd == 0.0f)
+    {
+        chassis.stop();
+        return;
+    }
+
+    // output 入参即速度环目标，超满速叠加的等比缩回也在其中处理。
+    chassis.output(left_cmd, right_cmd);
 }
 
 void RobotAction::refresh()

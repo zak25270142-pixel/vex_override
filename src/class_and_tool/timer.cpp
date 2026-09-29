@@ -26,6 +26,12 @@ uint32_t get_time_ms()
     return vex::timer::system();
 }
 
+// 有截断的us级时间戳
+uint32_t get_time_us()
+{
+    return static_cast<uint32_t>(vex::timer::systemHighResolution());
+}
+
 // CycleTimer类
 CycleTimer::CycleTimer(uint8_t time_ms) : period(time_ms) {}
 

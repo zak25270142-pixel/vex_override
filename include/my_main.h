@@ -93,5 +93,6 @@ void reset_origin(int16_t x = 0, int16_t y = 0, uint16_t width = 480, uint16_t h
 
 // timer.cpp
 uint32_t get_time_ms();
+uint32_t get_time_us();
 
 #endif

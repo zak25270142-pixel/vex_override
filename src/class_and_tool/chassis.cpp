@@ -32,8 +32,8 @@ void Chassis::init()
     forward_tracking_sensor.resetPosition();
     left_tracking_sensor.resetPosition();
     // 是否运动标识位
-    left_is_moving = false;
-    right_is_moving = false;
+    left_motors.is_moving = false;
+    right_motors.is_moving = false;
 }
 
 // 是否校准完成(init的等待环)
@@ -141,28 +141,8 @@ void Chassis::update(uint32_t now)
     side_distance_from_reset = -x_from_reset * sin_i + y_from_reset * cos_i;
     heading_from_reset = heading - heading_start;
 
-    // 记录当前速度，用于判断电机是否处于转动状态
-    left_speed = static_cast<float>(left_motors.velocity());
-    right_speed = static_cast<float>(right_motors.velocity());
-    float left_absolute_speed = fabsf(left_speed);
-    float right_absolute_speed = fabsf(right_speed);
-
-    // 通过电机编码器speed判断采用的阻力补偿
-    // 静止状态必须达到较高阈值才确认启动；运动状态必须降到较低阈值才确认停止。避免编码器波动导致两种补偿反复切换。
-    if (left_is_moving)
-    {
-        if (left_absolute_speed <= stopped_confirm_speed)
-            left_is_moving = false;
-    }
-    else if (left_absolute_speed >= moving_confirm_speed)
-        left_is_moving = true;
-    if (right_is_moving)
-    {
-        if (right_absolute_speed <= stopped_confirm_speed)
-            right_is_moving = false;
-    }
-    else if (right_absolute_speed >= moving_confirm_speed)
-        right_is_moving = true;
+    // left_speed = static_cast<float>(left_motors.velocity());
+    // right_speed = static_cast<float>(right_motors.velocity());
 }
 
 // 开启新的一段动作：以当前状态为段起点快照，清零段内相对量与变化量缓存。
@@ -204,39 +184,23 @@ void Chassis::reset(uint32_t now)
 
 void Chassis::output(float left_output, float right_output)
 {
-    // 等比例限幅保留差速关系。例如 200、100 会缩小为 100、50。
-    float largest_output = fmaxf(fabsf(left_output), fabsf(right_output));
-    if (largest_output > 100.0f)
-    {
-        float scale = 100.0f / largest_output;
-        left_output *= scale;
-        right_output *= scale;
-    }
+    // 入参即自编速度环的目标速度（pct，±100）：位置环 PID 与手柄映射都从这里喂入，
+    // 真正的闭环计算在 speed_tick() 常驻任务里执行，本函数只写目标。
+    // 左右配重不同则可达满速不同：任一指令超出本侧上限时，按超出比例最大的一侧
+    // 把两侧同步缩回，保留差速关系（直行时整车被慢侧拖住，但方向不偏）。
+    float scale = fmaxf(fmaxf(fabsf(left_output) / left_max_speed,fabsf(right_output) / right_max_speed),1.0f);
 
-    float left_deadzone = left_is_moving ? left_dynamic_deadzone : left_static_deadzone;
-    float right_deadzone = right_is_moving ? right_dynamic_deadzone : right_static_deadzone;
+    // 摩擦补偿由速度环内部电压域统一处理，这里不做任何死区映射，缩回后原样下发。
+    left_motors.drive(left_output / scale);
+    right_motors.drive(right_output / scale);
+}
 
-    // 绝对值不超过 output_deadzone 的微小 PID 输出直接归零，避免被摩擦补偿突然放大。
-    // 超出零输出区后，再将有效输出从 deadzone～100 线性映射到电机命令。
-    float left_extra_output = left_output * (100.0f - left_deadzone) / 100.0f;
-    if (left_output > output_deadzone)
-        left_output = left_deadzone + left_extra_output;
-    else if (left_output < -output_deadzone)
-        left_output = -left_deadzone + left_extra_output;
-    else
-        left_output = 0.0f;
-
-    float right_extra_output = right_output * (100.0f - right_deadzone) / 100.0f;
-    if (right_output > output_deadzone)
-        right_output = right_deadzone + right_extra_output;
-    else if (right_output < -output_deadzone)
-        right_output = -right_deadzone + right_extra_output;
-    else
-        right_output = 0.0f;
-
-    // 用电机组输出给电机
-    left_motors.spin(vex::directionType::fwd, left_output, vex::velocityUnits::pct);
-    right_motors.spin(vex::directionType::fwd, right_output, vex::velocityUnits::pct);
+void Chassis::speed_tick()
+{
+    // 速度环唯一执行点：由 5ms 常驻任务短周期调用。
+    // 停车后 is_stoped 为真，my_spin 立即返回；下次 output() 下目标时 drive 自动清积分起步。
+    left_motors.my_spin();
+    right_motors.my_spin();
 }
 
 void Chassis::stop()

@@ -42,7 +42,7 @@ private:
     void update_turn(uint32_t now);
     void update_move(uint32_t now);
     void update_goto(uint32_t now);
-    
+
     void update_manual(uint32_t now); // 手动控制每轮执行
 
     // 手动控制引用的手柄摇杆，由装配层（robot_and_control.cpp）在构造时注入。
