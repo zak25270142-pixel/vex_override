@@ -1,0 +1,78 @@
+:root {
+  /* ===== 表面色阶（深色仪表盘，由深到浅） ===== */
+  --surface-page: #04101f;
+  --surface-panel: #07192d;
+  --surface-floating: #0a2138;
+  --surface-input: #061a2c;
+  --surface-hover: rgba(79, 224, 255, 0.1);
+
+  /* ===== 文本 ===== */
+  --text-primary: #d9edf6;
+  --text-secondary: #8ebbd5;
+  --text-muted: #5f91ad;
+  --text-bright: #d9f5ff;
+  --text-on-accent: #051d31;
+
+  /* ===== 主题强调（航空蓝青） ===== */
+  --accent: #4fe0ff;
+  --accent-muted: #39b7d6;
+  --accent-soft: rgba(79, 224, 255, 0.14);
+  --accent-border: rgba(79, 224, 255, 0.46);
+
+  /* ===== 描边 ===== */
+  --border-panel: 1px solid rgba(89, 177, 236, 0.29);
+  --border-subtle: 1px solid rgba(89, 179, 235, 0.18);
+  --border-input: 1px solid #527894;
+  --border-focus: 1px solid #39d7ff;
+
+  /* ===== 阴影 / 发光 ===== */
+  --shadow-panel: 0 12px 30px rgba(0, 0, 0, 0.35);
+  --shadow-focus: 0 0 12px rgba(57, 215, 255, 0.25);
+  --glow-accent: 0 0 10px rgba(79, 224, 255, 0.45);
+
+  /* ===== 状态色（非灰色均带发光） ===== */
+  --status-success: #55e598;
+  --status-waiting: #f9c75e;
+  --status-danger: #ff533d;
+  --status-offline: #657d91;
+  --glow-success: 0 0 8px var(--status-success);
+  --glow-waiting: 0 0 8px var(--status-waiting);
+  --glow-danger: 0 0 8px var(--status-danger);
+
+  /* 成功/危险按钮软底 */
+  --success-soft: rgba(85, 229, 152, 0.14);
+  --success-border: rgba(85, 229, 152, 0.5);
+  --danger-soft: rgba(255, 83, 61, 0.14);
+  --danger-border: rgba(255, 111, 90, 0.5);
+
+  /* ===== 数据通道色（与 1.py 一致：红/青/蓝/绿） ===== */
+  --channel-1: #ff6b6b;
+  --channel-2: #4ecdc4;
+  --channel-3: #45b7d1;
+  --channel-4: #96ceb4;
+
+  /* ===== 示波器（ECharts 画布读变量解析） ===== */
+  --chart-grid-line: rgba(120, 160, 190, 0.15);
+  --chart-surface: #0d1f33;
+
+  /* ===== 场地地图（固定业务配色） ===== */
+  --map-cell-a: #3c3c4c;
+  --map-cell-b: #2d2d41;
+  --map-grid-line: rgba(120, 120, 150, 0.55);
+  --map-border: #9696b4;
+  --map-label: #c8c8dc;
+  --map-robot: #ff5050;
+  --map-robot-edge: #ffc8c8;
+  --map-reference: rgba(140, 140, 190, 0.8);
+
+  /* ===== 布局 ===== */
+  --app-header-height: 52px;
+  --workspace-gap: 12px;
+  --workspace-padding: 14px;
+  --right-rail-width: clamp(340px, 27vw, 420px);
+  --radius: 4px;
+
+  /* ===== 字体 ===== */
+  --font-base: 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
+  --font-mono: 'Cascadia Code', Consolas, 'Courier New', monospace;
+}
