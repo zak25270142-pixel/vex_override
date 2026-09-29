@@ -32,7 +32,7 @@ float PositionPID::update(float error, uint32_t current_time_ms)
     // PID 远短于 65 s 的周期内更新，不可能溢出
     uint16_t gap_time_ms = static_cast<uint16_t>(current_time_ms - last_time_ms);
 
-    // pre_error为0时pre_sign保持不变，引入该项主要解决err正好是0时的后续处理
+    // pre_error为0时pre_sign保持不变，引入该项主要解出err正好是0时的后续处理
     if (previous_error != 0.0f)
         pre_sign = previous_error > 0.0f ? 1 : -1;
     // 误差从正侧（>0）跨到负侧（<0），或反过来，说明系统越过了目标值。
@@ -90,4 +90,46 @@ bool StableJudge::update(bool condition, uint32_t current_time)
             stable_start_time = 0;
     }
     return false;
+}
+
+// ---------- 一维卡尔曼（自 VEX_chassis_drive 移植，暂未接入） ----------
+
+KalmanFilter::KalmanFilter(float process_noise, float measure_noise, float init_value)
+    : Q(process_noise),
+      R(measure_noise),
+      x(init_value),
+      P(1.0f),
+      K(0.0f),
+      initialized(true)
+{
+}
+
+void KalmanFilter::init(float process_noise, float measure_noise, float init_value)
+{
+    Q = process_noise;
+    R = measure_noise;
+    x = init_value;
+    P = 1.0f; // 初始不确定度取较大，让首次测量权重更高
+    K = 0.0f;
+    initialized = true;
+}
+
+float KalmanFilter::update(float measurement)
+{
+    if (!initialized)
+        init(0.001f, 0.1f, measurement);
+
+    // 预测：状态不变，不确定度增加 Q
+    P = P + Q;
+
+    // 更新增益：P 越大越信任测量
+    K = P / (P + R);
+
+    // 状态更新
+    x = x + K * (measurement - x);
+
+    // 协方差更新
+    P = (1.0f - K) * P;
+
+    return x;
 }
