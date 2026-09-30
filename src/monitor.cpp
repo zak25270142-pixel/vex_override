@@ -4,9 +4,9 @@
 
 // vex::rotation rotationA(vex::PORT2, false); // 角度，已有见chassis
 
-vex::optical optical(vex::PORT3, false); // 光学
+vex::optical optical(vex::PORT13, false); // 光学
 
-vex::distance distance(vex::PORT4); // 距离
+vex::distance distance(vex::PORT14); // 距离
 
 // vex::electromagnet electromagnet(vex::PORT5);//电磁铁(非传感器)
 

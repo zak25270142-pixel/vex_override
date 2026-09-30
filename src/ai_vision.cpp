@@ -1,15 +1,12 @@
 #include "ai_vision.h"
 
-// AI Vision 接在智能端口 10；更换接线后只修改这里。
-static const int32_t AI_SENSOR_PORT = vex::PORT10;
-
 // 颜色参数来自 AI Vision Utility；以后重新标定时替换对应 RGB 和范围。
 static vex::aivision::colordesc AI_RED(1, 225, 24, 35, 20.0f, 0.30f);
 static vex::aivision::colordesc AI_YELLOW(2, 224, 190, 34, 20.0f, 0.30f);
 static vex::aivision::colordesc AI_BLUE(3, 35, 55, 205, 20.0f, 0.30f);
 static vex::aivision::colordesc AI_GRAY(4, 92, 94, 96, 12.0f, 0.16f);
 
-vex::aivision ai_sensor(AI_SENSOR_PORT,
+vex::aivision ai_sensor(vex::PORT12,
                         AI_RED, AI_YELLOW, AI_BLUE, AI_GRAY,
                         vex::aivision::ALL_TAGS);
 

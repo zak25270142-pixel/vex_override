@@ -65,35 +65,4 @@ public:
     bool update(bool condition, uint32_t current_time = vex::timer::system());
 };
 
-// 一维卡尔曼滤波器（自 summer070214/VEX_chassis_drive 移植，暂未接入任何传感器）。
-// 假设状态近似不变（无运动模型），仅用过程噪声 Q 与测量噪声 R 做平滑。
-// 典型用途：旋转传感器角度等单通道测量的低通滤波。
-class KalmanFilter
-{
-private:
-    float Q; // 过程噪声协方差
-    float R; // 测量噪声协方差
-    float x; // 状态估计值
-    float P; // 估计误差协方差
-    float K; // 卡尔曼增益
-    bool initialized;
-
-public:
-    // Q：过程噪声（状态变化较慢时取小，如 0.001）
-    // R：测量噪声（依传感器精度，如 0.05~0.1）
-    // init_value：初始估计；若未调用 init 直接 update，会用首次测量自动初始化
-    KalmanFilter(float process_noise = 0.001f,
-                 float measure_noise = 0.1f,
-                 float init_value = 0.0f);
-
-    // 重新设定 Q/R 与初值，并清零增益与不确定度
-    void init(float process_noise, float measure_noise, float init_value);
-
-    // 用本次测量更新估计，返回滤波后的状态值
-    float update(float measurement);
-
-    // 当前估计值（不触发更新）
-    float value() const { return x; }
-};
-
 #endif
