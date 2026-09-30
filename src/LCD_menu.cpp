@@ -29,37 +29,80 @@ int64_t int64tnum = -1145141909810114514;
 
 const struct MENU_ITEM menu_item[] =
     {
-        {"Lucky_num", type_uint32_t, &Lucky_num, "幸运数", "ms"},
-        {"Lucky_num2", type_uint32_t, &Lucky_num2, "幸运数2"},
-        {"LED PC13", type_bool, &LED_PC13_state, "LED PC13"},
-        {"LED5 PWM", type_uint16_t, &LED5_pwm_num, "LED5 PWM"},
-        {"ANGLE(float)", type_float, &ANGLE, "角度"},
-        {"this is a so long num", type_uint64_t, &so_long_num, "这是一个很长的数"},
-        {"this is an int8_t num", type_int8_t, &int8tnum, "这是一个8位整数"},
-        {"this is an int16_t num", type_int16_t, &int16tnum, "这是一个16位整数"},
-        {"this is an int32_t num", type_int32_t, &int32tnum, "这是一个32位整数"},
-        {"this is an int64_t num", type_int64_t, &int64tnum, "这是一个64位整数"},
-        {"small num", type_uint8_t, &small_num, "很小的数"},
+        // ========== 速度环（左右）==========
+        {"L_kf", type_float, &left_motors.kf, "左速度前馈kf", ""},
+        {"L_kp", type_float, &left_motors.kp, "左速度kp", ""},
+        {"L_ki", type_float, &left_motors.ki, "左速度ki(内部)", ""},
+        {"L_kd", type_float, &left_motors.kd, "左速度kd(内部)", ""},
+        {"R_kf", type_float, &right_motors.kf, "右速度前馈kf", ""},
+        {"R_kp", type_float, &right_motors.kp, "右速度kp", ""},
+        {"R_ki", type_float, &right_motors.ki, "右速度ki(内部)", ""},
+        {"R_kd", type_float, &right_motors.kd, "右速度kd(内部)", ""},
+
+        {"L_st_dz", type_float, &left_motors.static_deadzone, "左静摩擦", "V"},
+        {"L_dy_dz", type_float, &left_motors.dynamic_deadzone, "左动摩擦", "V"},
+        {"R_st_dz", type_float, &right_motors.static_deadzone, "右静摩擦", "V"},
+        {"R_dy_dz", type_float, &right_motors.dynamic_deadzone, "右动摩擦", "V"},
+
+        // ========== 位置环 ==========
+        {"d_kp", type_float, &robot_action.distance_pid.kp, "距离环kp", ""},
+        {"d_ki", type_float, &robot_action.distance_pid.ki, "距离环ki(内部)", ""},
+        {"d_kd", type_float, &robot_action.distance_pid.kd, "距离环kd(内部)", ""},
+        {"d_max", type_float, &robot_action.distance_pid.max_output, "距离环限速", "pct"},
+
+        {"h_kp", type_float, &robot_action.heading_pid.kp, "纠偏kp", ""},
+        {"h_ki", type_float, &robot_action.heading_pid.ki, "纠偏ki(内部)", ""},
+        {"h_kd", type_float, &robot_action.heading_pid.kd, "纠偏kd(内部)", ""},
+        {"h_max", type_float, &robot_action.heading_pid.max_output, "纠偏限速", "pct"},
+
+        {"t_kp", type_float, &robot_action.turn_pid.kp, "转向kp", ""},
+        {"t_ki", type_float, &robot_action.turn_pid.ki, "转向ki(内部)", ""},
+        {"t_kd", type_float, &robot_action.turn_pid.kd, "转向kd(内部)", ""},
+        {"t_max", type_float, &robot_action.turn_pid.max_output, "转向限速", "pct"},
+
+        // ========== 几何 / 满速 / 容差 ==========
+        {"wheel_r", type_float, &chassis.wheel_r, "轮半径", "m"},
+        {"track_w", type_float, &chassis.track_width, "轮距", "m"},
+        {"fwd_off", type_float, &chassis.forward_tracking_offset, "前向轮偏右", "m"},
+        {"side_off", type_float, &chassis.side_tracking_offset, "侧向轮偏后", "m"},
+        {"L_max", type_float, &chassis.left_max_speed, "左满速", "pct"},
+        {"R_max", type_float, &chassis.right_max_speed, "右满速", "pct"},
+
+        {"dist_tol", type_float, &robot_action.distance_tolerance, "距离容差", "m"},
+        {"v_tol", type_float, &robot_action.linear_speed_tolerance, "线速度容差", "m/s"},
+        {"head_tol", type_float, &robot_action.heading_tolerance, "直线航向容差", "deg"},
+        {"ang_tol", type_float, &robot_action.angle_tolerance, "转角容差", "deg"},
+        {"w_tol", type_float, &robot_action.angular_speed_tolerance, "角速度容差", "deg/s"},
+        {"man_dz", type_int32_t, &robot_action.manual_deadzone, "摇杆死区", ""},
 };
 
 // 监控表要在运行时被通信模块改订阅档位（改tag字段），不能加const。
 // tag决定上位机连接后的默认推送档位；x/y/yaw还兼作场地图的语义标记。
 static struct MENU_ITEM monitor_menu_item[] =
     {
-        {"chassis_x", type_float, &chassis.x, "全局坐标X", "m", monitor_tag_pos_x},
-        {"chassis_y", type_float, &chassis.y, "全局坐标Y", "m", monitor_tag_pos_y},
-        {"chassis_heading", type_float, &chassis.heading, "航向角", "deg", monitor_tag_yaw},
-        {"axis_left_x", type_int32_t, &left_axis.value[left_axis.value_p].value_x, "轴左坐标", nullptr, monitor_tag_slow},
-        {"Lucky_num2", type_uint32_t, &Lucky_num2, "幸运数2", nullptr, monitor_tag_slow},
-        {"LED PC13", type_bool, &LED_PC13_state, "LED PC13", nullptr, monitor_tag_slow},
-        {"LED5 PWM", type_uint16_t, &LED5_pwm_num, "LED5 PWM", nullptr, monitor_tag_slow},
-        {"ANGLE(float)", type_float, &ANGLE, "角度", nullptr, monitor_tag_slow},
-        {"this is a so long num", type_uint64_t, &so_long_num, "这是一个很长的数", nullptr, monitor_tag_slow},
-        {"this is an int8_t num", type_int8_t, &int8tnum, "这是一个8位整数", nullptr, monitor_tag_slow},
-        {"this is an int16_t num", type_int16_t, &int16tnum, "这是一个16位整数", nullptr, monitor_tag_slow},
-        {"this is an int32_t num", type_int32_t, &int32tnum, "这是一个32位整数", nullptr, monitor_tag_slow},
-        {"this is an int64_t num", type_int64_t, &int64tnum, "这是一个64位整数", nullptr, monitor_tag_none},
-        {"small num", type_uint8_t, &small_num, "很小的数", nullptr, monitor_tag_slow},
+        // 场地图语义：高速推送（tag 3/4/5）
+        {"chassis_x", type_float, &chassis.x, "全局X", "m", monitor_tag_pos_x},
+        {"chassis_y", type_float, &chassis.y, "全局Y", "m", monitor_tag_pos_y},
+        {"chassis_heading", type_float, &chassis.heading, "航向", "deg", monitor_tag_yaw},
+
+        // 本段相对量（手推/动作时看定位是否准）
+        {"dist_seg", type_float, &chassis.distance_from_reset, "段内前向", "m", monitor_tag_fast},
+        {"side_seg", type_float, &chassis.side_distance_from_reset, "段内侧向", "m", monitor_tag_fast},
+        {"head_seg", type_float, &chassis.heading_from_reset, "段内转角", "deg", monitor_tag_fast},
+
+        // 瞬时速度（判停、StableJudge 对照）
+        {"v_lin", type_float, &chassis.linear_speed, "线速度", "m/s", monitor_tag_fast},
+        {"w_ang", type_float, &chassis.angular_speed, "角速度", "deg/s", monitor_tag_fast},
+
+        // 定位轮原始累计（第4步正负与尺度）
+        {"trk_fwd", type_float, &chassis.forward_tracking_distance, "前向轮里程", "m", monitor_tag_slow},
+        {"trk_side", type_float, &chassis.side_tracking_distance, "侧向轮里程", "m", monitor_tag_slow},
+
+        // 手柄（手动/Arcade 对照）
+        {"axis_Lx", type_int32_t, &left_axis.value[left_axis.value_p].value_x, "左杆X", nullptr, monitor_tag_slow},
+        {"axis_Ly", type_int32_t, &left_axis.value[left_axis.value_p].value_y, "左杆Y", nullptr, monitor_tag_slow},
+        {"axis_Rx", type_int32_t, &right_axis.value[right_axis.value_p].value_x, "右杆X", nullptr, monitor_tag_slow},
+        {"axis_Ry", type_int32_t, &right_axis.value[right_axis.value_p].value_y, "右杆Y", nullptr, monitor_tag_slow},
 };
 
 MENU menu(menu_item,

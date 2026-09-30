@@ -15,21 +15,22 @@
 class PositionPID
 {
 private:
-    // 三个控制系数在创建对象时确定；内部 ki、kd 已换算为 us 量纲。
-    float kp;
-    float ki; // 内部单位：输出 / (误差·us)
-    float kd; // 内部单位：输出·us / 误差
-    // integral 保存误差累计；本类所有时间量统一使用 us。
-    float integral;
-    // previous_error 保存上一轮误差，用于计算 D 项和判断误差是否越过零点。
-    float previous_error;
-
     // 上一轮 update() 使用的 VEX 系统微秒时间戳。
     uint32_t last_time_us;
 
     int8_t pre_sign = 0;
 
 public:
+    // 三个控制系数在创建对象时确定；内部 ki、kd 已换算为 us 量纲。
+    float kp;
+    float ki; // 内部单位：输出 / (误差·us)
+    float kd; // 内部单位：输出·us / 误差
+
+    // integral 保存误差累计；本类所有时间量统一使用 us。
+    float integral;
+    // previous_error 保存上一轮误差，用于计算 D 项和判断误差是否越过零点。
+    float previous_error;
+
     // 输出限幅
     float max_output;
 

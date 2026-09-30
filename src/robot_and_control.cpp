@@ -18,11 +18,11 @@ static vex::motor right_chassis_4(vex::PORT9, vex::ratio6_1, true);   // 右后�
 // 后四个为速度环增益（秒量纲，误差单位 pct）：kf 阻力前馈(输出/pct)、kp(输出/pct)、
 // ki(输出/(pct·秒))、kd(输出·秒/pct)。
 // 当前为接通链路用的占位值，两组相同，必须在实车上重新标定后再用于比赛。
-static MyMotorGroup left_motors(
+MyMotorGroup left_motors(
     left_chassis_1, left_chassis_2, left_chassis_3, left_chassis_4,
     0.008f, 0.02f, 0.5f, 0.0f);
-static MyMotorGroup right_motors(
-    right_chassis_2, right_chassis_3, right_chassis_1, right_chassis_4,
+MyMotorGroup right_motors(
+    right_chassis_1, right_chassis_2, right_chassis_3, right_chassis_4,
     0.008f, 0.02f, 0.5f, 0.0f);
 
 // 两个定位轮均已接入底盘里程计；reverse 标志若与实际滚动方向不符，试车时在此翻转。

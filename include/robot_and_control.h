@@ -9,6 +9,8 @@
 extern RobotAction robot_action;
 // 底盘实例：监控菜单要直接读它的全局坐标x/y与航向heading，故对外可见。
 extern Chassis chassis;
+extern MyMotorGroup left_motors;
+extern MyMotorGroup right_motors;
 
 // 本车动作命令总表（停止/转向/直行/局部移动）：构造USB_Comm时整张传入。
 extern const CMD_ITEM robot_cmds[];
