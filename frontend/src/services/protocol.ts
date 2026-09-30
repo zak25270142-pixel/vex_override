@@ -53,14 +53,28 @@ export const enum ValueType {
   Other = 14,
 }
 
-/** 监控标签，编号与 my_main.h 的 MONITOR_TAG 一致 */
-export const enum MonitorTag {
+/** 监控 tag 单字节位域，与 my_main.h 的 MENU_TAG_* 常量一一对应 */
+export const MONITOR_TAG_SUB = 0x80 // bit7：是否推送
+export const MONITOR_TAG_FAST = 0x40 // bit6：高速区（每拍）还是低速区（8相轮转）
+export const MONITOR_TAG_GETTER = 0x20 // bit5：值为下位机 float() 函数取数（只读，不占用 RAM 指针）
+export const MONITOR_TAG_KIND_MASK = 0x07 // bit2~0：语义种类
+
+/** 语义种类（tag & KIND_MASK），位置量由前端自动订阅并喂给场地图 */
+export const enum MonitorKind {
   None = 0,
-  Slow = 1,
-  Fast = 2,
-  PosX = 3,
-  PosY = 4,
-  Yaw = 5,
+  PosX = 1,
+  PosY = 2,
+  Yaw = 3,
+}
+
+export function tagSubscribed(tag: number): boolean {
+  return (tag & MONITOR_TAG_SUB) !== 0
+}
+export function tagFast(tag: number): boolean {
+  return (tag & MONITOR_TAG_FAST) !== 0
+}
+export function tagKind(tag: number): MonitorKind {
+  return (tag & MONITOR_TAG_KIND_MASK) as MonitorKind
 }
 
 /** 单帧 payload 上限（uint8 长度的天然最大值；整帧 258B < USB 单包 512B） */
@@ -115,11 +129,11 @@ export function typeName(type: ValueType): string {
 /** 一个值：数值类为 number，color 为 #RRGGBB 字符串 */
 export type CellValue = number | string
 
-/** 目录项（一帧一项） */
+/** 目录项（一帧一项）；tag 为位域字节，用 tagSubscribed/tagFast/tagKind 解读 */
 export interface DirItem {
   index: number
   type: ValueType
-  tag: MonitorTag
+  tag: number
   name: string
   value: CellValue
 }
@@ -278,9 +292,11 @@ export function requestMonitor(): Uint8Array {
 }
 /**
  * 改订阅档位；index=0xff 对全部生效。
- * tag=0(None) 即退订，与订阅是同一条命令，无需单独的退订命令。
+ * 只发上位机负责的两个位（SUB/FAST），下位机合并时保留 GETTER/KIND 等本机位；
+ * sub=false 即退订，与订阅是同一条命令，无需单独的退订命令。
  */
-export function subscribe(index: number, tag: MonitorTag): Uint8Array {
+export function subscribe(index: number, sub: boolean, fast: boolean): Uint8Array {
+  const tag = (sub ? MONITOR_TAG_SUB : 0) | (fast ? MONITOR_TAG_FAST : 0)
   return buildFrame(CmdGet.Subscribe, [index, tag])
 }
 /** 心跳帧 A5 FF FF，1s 一发；主控回同形帧 Pong */

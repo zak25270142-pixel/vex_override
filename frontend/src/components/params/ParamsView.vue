@@ -53,7 +53,7 @@
           <tr
             v-for="it in visibleRows"
             :key="it.index"
-            :class="{ 'row--sub': paramTable === 'monitor' && it.tag !== MonitorTag.None }"
+            :class="{ 'row--sub': paramTable === 'monitor' && tagSubscribed(it.tag) }"
           >
             <td class="c-idx">{{ it.index }}</td>
             <td class="c-name">{{ it.name }}</td>
@@ -121,12 +121,12 @@
                 {{ tagLabel(it.tag) }}·自动
               </span>
               <select
-                :value="it.tag"
+                :value="subLevel(it.tag)"
                 @change="onTagChange(it.index, ($event.target as HTMLSelectElement).value)"
               >
-                <option :value="MonitorTag.None">未订阅</option>
-                <option :value="MonitorTag.Slow">低速（约80ms）</option>
-                <option :value="MonitorTag.Fast">高速（约10ms）</option>
+                <option value="none">未订阅</option>
+                <option value="slow">低速（约80ms）</option>
+                <option value="fast">高速（约10ms）</option>
               </select>
             </td>
           </tr>
@@ -139,8 +139,9 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import {
-  MonitorTag,
   ValueType,
+  tagFast,
+  tagSubscribed,
   typeName,
   valueSize,
   type CellValue,
@@ -164,9 +165,15 @@ function displayValue(index: number, fallback: CellValue): CellValue {
   return paramTable.value === 'monitor' ? (monitorLatest[index] ?? fallback) : fallback
 }
 
-/** 档位下拉变化：未订阅(0)/低速(1)/高速(2) 都是同一条 Subscribe 命令 */
+/** 档位下拉当前值：由位域折算成字符串档位 */
+function subLevel(tag: number): string {
+  if (!tagSubscribed(tag)) return 'none'
+  return tagFast(tag) ? 'fast' : 'slow'
+}
+
+/** 档位下拉变化：未订阅/低速/高速 都是同一条 Subscribe 命令的两个位 */
 async function onTagChange(index: number, raw: string): Promise<void> {
-  await setSubscription(index, Number(raw) as MonitorTag)
+  await setSubscription(index, raw !== 'none', raw === 'fast')
 }
 
 /* ===== 调参编辑 ===== */

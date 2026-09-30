@@ -46,22 +46,44 @@ typedef enum
     type_other,
 } VALUE_TYPE;
 
-// 监控项标签：同时承担两个职责——
-//   1. 连接后的默认订阅档位（上位机请求监控目录后按此推送，也可再用命令改档）
-//   2. 语义标记：x/y/yaw供上位机场地图页自动识别，不用按名字猜
-// 档位规则：0不订阅；1低速(8相轮转约80ms)；>=2高速(每10ms)，
-// 所以语义量x/y/yaw天然按高速推送。
-enum MONITOR_TAG : uint8_t
-{
-    monitor_tag_none = 0,
-    monitor_tag_slow = 1,
-    monitor_tag_fast = 2,
-    monitor_tag_pos_x = 3,
-    monitor_tag_pos_y = 4,
-    monitor_tag_yaw = 5,
-};
+// 监控项 tag：单字节位域（复用原 8bit，不再用 0/1/2/3/4/5 枚举占满语义）
+//   bit7 (0x80) MENU_TAG_SUB     是否订阅：1=参与推送，0=不推送（退订）
+//   bit6 (0x40) MENU_TAG_FAST    速率：1=高速(每10ms)，0=低速(8相轮转约80ms)
+//   bit5 (0x20) MENU_TAG_GETTER  取数方式：1=data_ptr 为 float(*)() 函数指针；
+//                                 0=data_ptr 为普通变量地址（直接解引用）
+//   bit4~3      预留，写 0；订阅合并时下位机保留，上位机不要当速率位用
+//   bit2~0      语义种类 MENU_TAG_KIND_*：场地图等特殊量
+//                 0 none，1 pos_x，2 pos_y，3 yaw，4~7 预留
+static constexpr uint8_t MENU_TAG_SUB = 0x80u;
+static constexpr uint8_t MENU_TAG_FAST = 0x40u;
+static constexpr uint8_t MENU_TAG_GETTER = 0x20u;
+static constexpr uint8_t MENU_TAG_KIND_MASK = 0x07u;
+static constexpr uint8_t MENU_TAG_KIND_NONE = 0u;
+static constexpr uint8_t MENU_TAG_KIND_POS_X = 1u;
+static constexpr uint8_t MENU_TAG_KIND_POS_Y = 2u;
+static constexpr uint8_t MENU_TAG_KIND_YAW = 3u;
+
+// 表项常用默认 tag（已含 SUB；getter 构造函数会再或上 MENU_TAG_GETTER）
+static constexpr uint8_t monitor_tag_none = 0; // 不订阅
+static constexpr uint8_t monitor_tag_slow =
+    MENU_TAG_SUB; // 订阅 + 低速 + 内存指针
+static constexpr uint8_t monitor_tag_fast =
+    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST); // 订阅 + 高速 + 内存指针
+static constexpr uint8_t monitor_tag_pos_x =
+    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_POS_X);
+static constexpr uint8_t monitor_tag_pos_y =
+    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_POS_Y);
+static constexpr uint8_t monitor_tag_yaw =
+    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_YAW);
+
+// 无参读函数：返回 float；监控项的 data_type 必须为 type_float 才能用此构造函数。
+// （当前协议 GETTER 项固定发 4B float；若未来需其他类型，再按 VALUE_TYPE 追加同风格 typedef。）
+typedef float (*MenuFloatGetter)();
 
 // 菜单与通信共用的条目描述：名字、数据类型、数据指针、中文名、单位、监控标签
+// data_ptr 双重含义（由 tag 的 MENU_TAG_GETTER 区分，不另增指针成员）：
+//   - 未置 GETTER：指向可读写变量（调参/普通监控）
+//   - 已置 GETTER：值为 MenuFloatGetter，只读；禁止 write/旋钮改值
 struct MENU_ITEM
 {
     const char *item_name;
@@ -69,10 +91,30 @@ struct MENU_ITEM
     void *data_ptr;
     const char *Chinese_name;
     const char *unit;
-    MONITOR_TAG tag; // 仅监控表使用；调参表默认none即可
+    uint8_t tag; // 监控表用位域；调参表保持 0 即可
+
+    // 内存项（可读写）：ptr 为变量地址
     MENU_ITEM(const char *name, VALUE_TYPE type, void *ptr, const char *c,
-              const char *u = nullptr, MONITOR_TAG t = monitor_tag_none)
-        : item_name(name), data_type(type), data_ptr(ptr), Chinese_name(c), unit(u), tag(t) {}
+              const char *u = nullptr, uint8_t t = monitor_tag_none)
+        : item_name(name), data_type(type), data_ptr(ptr), Chinese_name(c),
+          unit(u), tag(t)
+    {
+    }
+
+    // getter 只读项：固定 type_float；get 无参，返回 float；tag 自动加上 MENU_TAG_GETTER
+    // （构造函数不接收 VALUE_TYPE，因当前协议 GETTER 项只支持 float，避免不对称）
+    MENU_ITEM(const char *name, MenuFloatGetter get, const char *c,
+              const char *u, uint8_t t)
+        : item_name(name), data_type(type_float),
+          data_ptr(reinterpret_cast<void *>(get)), Chinese_name(c), unit(u),
+          tag(static_cast<uint8_t>(t | MENU_TAG_GETTER))
+    {
+    }
+
+    bool is_getter() const { return (tag & MENU_TAG_GETTER) != 0; }
+    bool is_subscribed() const { return (tag & MENU_TAG_SUB) != 0; }
+    bool is_fast() const { return (tag & MENU_TAG_FAST) != 0; }
+    uint8_t kind() const { return static_cast<uint8_t>(tag & MENU_TAG_KIND_MASK); }
 };
 
 // 所有周期任务共用的生命周期；每个模块分别保存自己的状态变量。

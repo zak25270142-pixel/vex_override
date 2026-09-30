@@ -1,4 +1,4 @@
-#include "my_main.h"
+﻿#include "my_main.h"
 #include "menu_func.h"
 #include "key_set.h"
 #include "LCD_menu.h"
@@ -14,30 +14,18 @@ enum MENU_state : uint8_t
 
 static MENU_state menu_state = pre;
 
-uint32_t Lucky_num = 114514;
-uint32_t Lucky_num2 = 1919810;
-bool A_bool = false;
-float ANGLE = 114.514;
-uint64_t so_long_num = 1145141919810;
-uint8_t LED_PC13_state = 0;
-uint16_t LED5_pwm_num = 990;
-uint8_t small_num = 114;
-int8_t int8tnum = -114;
-int16_t int16tnum = -1145;
-int32_t int32tnum = -1145141909;
-int64_t int64tnum = -1145141909810114514;
-
 const struct MENU_ITEM menu_item[] =
     {
         // ========== 速度环（左右）==========
-        {"L_kf", type_float, &left_motors.kf, "左速度前馈kf", ""},
-        {"L_kp", type_float, &left_motors.kp, "左速度kp", ""},
-        {"L_ki", type_float, &left_motors.ki, "左速度ki(内部)", ""},
-        {"L_kd", type_float, &left_motors.kd, "左速度kd(内部)", ""},
-        {"R_kf", type_float, &right_motors.kf, "右速度前馈kf", ""},
-        {"R_kp", type_float, &right_motors.kp, "右速度kp", ""},
-        {"R_ki", type_float, &right_motors.ki, "右速度ki(内部)", ""},
-        {"R_kd", type_float, &right_motors.kd, "右速度kd(内部)", ""},
+        // kp/kf 与构造入参同量纲；ki 成员=秒量纲/1e6；kd 成员=秒量纲*1e6
+        {"L_kf", type_float, &left_motors.kf, "左kf 输出/pct", ""},
+        {"L_kp", type_float, &left_motors.kp, "左kp 输出/pct", ""},
+        {"L_ki", type_float, &left_motors.ki, "左ki内部÷1e6", ""},
+        {"L_kd", type_float, &left_motors.kd, "左kd内部×1e6", ""},
+        {"R_kf", type_float, &right_motors.kf, "右kf 输出/pct", ""},
+        {"R_kp", type_float, &right_motors.kp, "右kp 输出/pct", ""},
+        {"R_ki", type_float, &right_motors.ki, "右ki内部÷1e6", ""},
+        {"R_kd", type_float, &right_motors.kd, "右kd内部×1e6", ""},
 
         {"L_st_dz", type_float, &left_motors.static_deadzone, "左静摩擦", "V"},
         {"L_dy_dz", type_float, &left_motors.dynamic_deadzone, "左动摩擦", "V"},
@@ -45,19 +33,19 @@ const struct MENU_ITEM menu_item[] =
         {"R_dy_dz", type_float, &right_motors.dynamic_deadzone, "右动摩擦", "V"},
 
         // ========== 位置环 ==========
-        {"d_kp", type_float, &robot_action.distance_pid.kp, "距离环kp", ""},
-        {"d_ki", type_float, &robot_action.distance_pid.ki, "距离环ki(内部)", ""},
-        {"d_kd", type_float, &robot_action.distance_pid.kd, "距离环kd(内部)", ""},
+        {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},
+        {"d_ki", type_float, &robot_action.distance_pid.ki, "距离ki内部÷1e6", ""},
+        {"d_kd", type_float, &robot_action.distance_pid.kd, "距离kd内部×1e6", ""},
         {"d_max", type_float, &robot_action.distance_pid.max_output, "距离环限速", "pct"},
 
-        {"h_kp", type_float, &robot_action.heading_pid.kp, "纠偏kp", ""},
-        {"h_ki", type_float, &robot_action.heading_pid.ki, "纠偏ki(内部)", ""},
-        {"h_kd", type_float, &robot_action.heading_pid.kd, "纠偏kd(内部)", ""},
+        {"h_kp", type_float, &robot_action.heading_pid.kp, "纠偏kp 输出/误差", ""},
+        {"h_ki", type_float, &robot_action.heading_pid.ki, "纠偏ki内部÷1e6", ""},
+        {"h_kd", type_float, &robot_action.heading_pid.kd, "纠偏kd内部×1e6", ""},
         {"h_max", type_float, &robot_action.heading_pid.max_output, "纠偏限速", "pct"},
 
-        {"t_kp", type_float, &robot_action.turn_pid.kp, "转向kp", ""},
-        {"t_ki", type_float, &robot_action.turn_pid.ki, "转向ki(内部)", ""},
-        {"t_kd", type_float, &robot_action.turn_pid.kd, "转向kd(内部)", ""},
+        {"t_kp", type_float, &robot_action.turn_pid.kp, "转向kp 输出/误差", ""},
+        {"t_ki", type_float, &robot_action.turn_pid.ki, "转向ki内部÷1e6", ""},
+        {"t_kd", type_float, &robot_action.turn_pid.kd, "转向kd内部×1e6", ""},
         {"t_max", type_float, &robot_action.turn_pid.max_output, "转向限速", "pct"},
 
         // ========== 几何 / 满速 / 容差 ==========
@@ -77,10 +65,10 @@ const struct MENU_ITEM menu_item[] =
 };
 
 // 监控表要在运行时被通信模块改订阅档位（改tag字段），不能加const。
-// tag决定上位机连接后的默认推送档位；x/y/yaw还兼作场地图的语义标记。
+// tag 为位域：SUB/FAST/GETTER/KIND；x/y/yaw 用 KIND 供场地图识别。
 static struct MENU_ITEM monitor_menu_item[] =
     {
-        // 场地图语义：高速推送（tag 3/4/5）
+        // 场地图语义：订阅+高速+KIND
         {"chassis_x", type_float, &chassis.x, "全局X", "m", monitor_tag_pos_x},
         {"chassis_y", type_float, &chassis.y, "全局Y", "m", monitor_tag_pos_y},
         {"chassis_heading", type_float, &chassis.heading, "航向", "deg", monitor_tag_yaw},
@@ -97,6 +85,80 @@ static struct MENU_ITEM monitor_menu_item[] =
         // 定位轮原始累计（第4步正负与尺度）
         {"trk_fwd", type_float, &chassis.forward_tracking_distance, "前向轮里程", "m", monitor_tag_slow},
         {"trk_side", type_float, &chassis.side_tracking_distance, "侧向轮里程", "m", monitor_tag_slow},
+
+        // 指令电压：有稳定地址，内存项即可（无需 getter）
+        {"L0_Vcmd", type_float, &left_motors.volt_output[0], "左0指令电压", "V", monitor_tag_fast},
+        {"R0_Vcmd", type_float, &right_motors.volt_output[0], "右0指令电压", "V", monitor_tag_fast},
+        {"L1_Vcmd", type_float, &left_motors.volt_output[1], "左1指令电压", "V", monitor_tag_slow},
+        {"R1_Vcmd", type_float, &right_motors.volt_output[1], "右1指令电压", "V", monitor_tag_slow},
+        {"L2_Vcmd", type_float, &left_motors.volt_output[2], "左2指令电压", "V", monitor_tag_slow},
+        {"R2_Vcmd", type_float, &right_motors.volt_output[2], "右2指令电压", "V", monitor_tag_slow},
+        {"L3_Vcmd", type_float, &left_motors.volt_output[3], "左3指令电压", "V", monitor_tag_slow},
+        {"R3_Vcmd", type_float, &right_motors.volt_output[3], "右3指令电压", "V", monitor_tag_slow},
+
+        // 指令转速：速度环目标，内存项直接读（与 L0/R0_rpm 对照即跟踪误差）
+        {"L_tgt", type_float, &left_motors.target, "左指令转速", "pct", monitor_tag_fast},
+        {"R_tgt", type_float, &right_motors.target, "右指令转速", "pct", monitor_tag_fast},
+
+        // 转速/电流/编码器：无捕获 lambda 直接转 MenuFloatGetter，构造自动置 GETTER；
+        // SDK 读数是 double，cast 成 float 匹配签名。加/删一项只动这一行
+        // 转速只取 motors[0]（与轮轴直连，经齿轮传动的读数不代表轮速），pct 与 target 同口径
+        {"L0_rpm", []
+         { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左0转速", "pct", monitor_tag_fast},
+        {"R0_rpm", []
+         { return static_cast<float>(right_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "右0转速", "pct", monitor_tag_fast},
+
+        // 实际电压：SDK 回读，与指令电压 Vcmd 对照（差距大说明被限幅/堵转）
+        {"L0_Vact", []
+         { return static_cast<float>(left_motors.motors[0]->voltage(vex::voltageUnits::volt)); }, "左0实际电压", "V", monitor_tag_fast},
+        {"R0_Vact", []
+         { return static_cast<float>(right_motors.motors[0]->voltage(vex::voltageUnits::volt)); }, "右0实际电压", "V", monitor_tag_fast},
+        {"L1_Vact", []
+         { return static_cast<float>(left_motors.motors[1]->voltage(vex::voltageUnits::volt)); }, "左1实际电压", "V", monitor_tag_slow},
+        {"R1_Vact", []
+         { return static_cast<float>(right_motors.motors[1]->voltage(vex::voltageUnits::volt)); }, "右1实际电压", "V", monitor_tag_slow},
+        {"L2_Vact", []
+         { return static_cast<float>(left_motors.motors[2]->voltage(vex::voltageUnits::volt)); }, "左2实际电压", "V", monitor_tag_slow},
+        {"R2_Vact", []
+         { return static_cast<float>(right_motors.motors[2]->voltage(vex::voltageUnits::volt)); }, "右2实际电压", "V", monitor_tag_slow},
+        {"L3_Vact", []
+         { return static_cast<float>(left_motors.motors[3]->voltage(vex::voltageUnits::volt)); }, "左3实际电压", "V", monitor_tag_slow},
+        {"R3_Vact", []
+         { return static_cast<float>(right_motors.motors[3]->voltage(vex::voltageUnits::volt)); }, "右3实际电压", "V", monitor_tag_slow},
+
+        {"L0_I", []
+         { return static_cast<float>(left_motors.motors[0]->current(vex::currentUnits::amp)); }, "左0电流", "A", monitor_tag_slow},
+        {"L0_pos", []
+         { return static_cast<float>(left_motors.motors[0]->position(vex::rotationUnits::rev)); }, "左0编码器", "rev", monitor_tag_slow},
+        {"L1_I", []
+         { return static_cast<float>(left_motors.motors[1]->current(vex::currentUnits::amp)); }, "左1电流", "A", monitor_tag_slow},
+        {"L1_pos", []
+         { return static_cast<float>(left_motors.motors[1]->position(vex::rotationUnits::rev)); }, "左1编码器", "rev", monitor_tag_slow},
+        {"L2_I", []
+         { return static_cast<float>(left_motors.motors[2]->current(vex::currentUnits::amp)); }, "左2电流", "A", monitor_tag_slow},
+        {"L2_pos", []
+         { return static_cast<float>(left_motors.motors[2]->position(vex::rotationUnits::rev)); }, "左2编码器", "rev", monitor_tag_slow},
+        {"L3_I", []
+         { return static_cast<float>(left_motors.motors[3]->current(vex::currentUnits::amp)); }, "左3电流", "A", monitor_tag_slow},
+        {"L3_pos", []
+         { return static_cast<float>(left_motors.motors[3]->position(vex::rotationUnits::rev)); }, "左3编码器", "rev", monitor_tag_slow},
+
+        {"R0_I", []
+         { return static_cast<float>(right_motors.motors[0]->current(vex::currentUnits::amp)); }, "右0电流", "A", monitor_tag_slow},
+        {"R0_pos", []
+         { return static_cast<float>(right_motors.motors[0]->position(vex::rotationUnits::rev)); }, "右0编码器", "rev", monitor_tag_slow},
+        {"R1_I", []
+         { return static_cast<float>(right_motors.motors[1]->current(vex::currentUnits::amp)); }, "右1电流", "A", monitor_tag_slow},
+        {"R1_pos", []
+         { return static_cast<float>(right_motors.motors[1]->position(vex::rotationUnits::rev)); }, "右1编码器", "rev", monitor_tag_slow},
+        {"R2_I", []
+         { return static_cast<float>(right_motors.motors[2]->current(vex::currentUnits::amp)); }, "右2电流", "A", monitor_tag_slow},
+        {"R2_pos", []
+         { return static_cast<float>(right_motors.motors[2]->position(vex::rotationUnits::rev)); }, "右2编码器", "rev", monitor_tag_slow},
+        {"R3_I", []
+         { return static_cast<float>(right_motors.motors[3]->current(vex::currentUnits::amp)); }, "右3电流", "A", monitor_tag_slow},
+        {"R3_pos", []
+         { return static_cast<float>(right_motors.motors[3]->position(vex::rotationUnits::rev)); }, "右3编码器", "rev", monitor_tag_slow},
 
         // 手柄（手动/Arcade 对照）
         {"axis_Lx", type_int32_t, &left_axis.value[left_axis.value_p].value_x, "左杆X", nullptr, monitor_tag_slow},

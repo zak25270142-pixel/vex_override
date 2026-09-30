@@ -8,11 +8,12 @@
 class MyMotorGroup
 {
 private:
-    // 绑定构造传入的四台电机
-    vex::motor *motors[4];
     bool is_stoped = true;
 
 public:
+    // 绑定构造传入的四台电机（public：监控 getter 模板直接调 motors[i] 的 SDK 读数）
+    vex::motor *motors[4];
+
     // 电压缩放因子
     float volt_factor[4] = {1.0f, 1.0f, 1.2f, 1.2f};
 

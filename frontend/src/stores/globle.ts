@@ -6,7 +6,9 @@ import { computed, reactive, ref } from 'vue'
 import { serialClient } from '@/services/serialClient'
 import {
   FrameParser,
-  MonitorTag,
+  MONITOR_TAG_FAST,
+  MONITOR_TAG_SUB,
+  MonitorKind,
   ValueType,
   requestMonitor,
   requestTunable,
@@ -15,6 +17,9 @@ import {
   requestCommand,
   commandSend,
   ping,
+  tagFast,
+  tagKind,
+  tagSubscribed,
   typeName,
   valueSize,
   type CellValue,
@@ -175,32 +180,25 @@ export const channelSel = reactive<(number | null)[]>(CHANNELS.map(() => null))
 export const merged = ref(false)
 export const plotWindowS = ref(PLOT_WINDOW_S)
 
-/* ===== 订阅档位展示文案 ===== */
-export function tagLabel(tag: MonitorTag): string {
-  switch (tag) {
-    case MonitorTag.Slow:
-      return '低速'
-    case MonitorTag.Fast:
-      return '高速'
-    case MonitorTag.PosX:
-      return '位置X'
-    case MonitorTag.PosY:
-      return '位置Y'
-    case MonitorTag.Yaw:
-      return '航向'
-    default:
-      return '未订阅'
-  }
+/* ===== 订阅档位展示文案（tag 为位域：先看语义种类，再按订阅位拼档位） ===== */
+export function tagLabel(tag: number): string {
+  const kind = tagKind(tag)
+  if (kind === MonitorKind.PosX) return '位置X'
+  if (kind === MonitorKind.PosY) return '位置Y'
+  if (kind === MonitorKind.Yaw) return '航向'
+  if (!tagSubscribed(tag)) return '未订阅'
+  return tagFast(tag) ? '高速' : '低速'
 }
 
 /** x/y/yaw 三个语义标记量：连接时即自动订阅，不允许在界面上改档位 */
-export function isPoseTag(tag: MonitorTag): boolean {
-  return tag === MonitorTag.PosX || tag === MonitorTag.PosY || tag === MonitorTag.Yaw
+export function isPoseTag(tag: number): boolean {
+  const kind = tagKind(tag)
+  return kind === MonitorKind.PosX || kind === MonitorKind.PosY || kind === MonitorKind.Yaw
 }
 
 /** 可绑到曲线通道的监听量：数值类型且当前已订阅（x/y/yaw 也算） */
 export const plottableItems = computed<DirItem[]>(() =>
-  sortedMonitor(monitorMap).filter((it) => it.tag !== MonitorTag.None && valueSize(it.type) > 0),
+  sortedMonitor(monitorMap).filter((it) => tagSubscribed(it.tag) && valueSize(it.type) > 0),
 )
 
 function sortedIndices(map: Record<number, DirItem>): number[] {
@@ -210,14 +208,18 @@ function sortedIndices(map: Record<number, DirItem>): number[] {
 }
 
 function sortedMonitor(map: Record<number, DirItem>): DirItem[] {
-  // 已订阅优先（档位高的排前），同档按 index；未订阅按 index 跟在后面
+  // 已订阅优先（高速排前），同档按 index；未订阅按 index 跟在后面
   return sortedIndices(map)
     .map((i) => map[i]!)
     .sort((a, b) => {
-      const sa = a.tag === MonitorTag.None ? 0 : 1
-      const sb = b.tag === MonitorTag.None ? 0 : 1
+      const sa = tagSubscribed(a.tag) ? 1 : 0
+      const sb = tagSubscribed(b.tag) ? 1 : 0
       if (sa !== sb) return sb - sa
-      if (sa === 1 && a.tag !== b.tag) return b.tag - a.tag
+      if (sa === 1) {
+        const fa = tagFast(a.tag) ? 1 : 0
+        const fb = tagFast(b.tag) ? 1 : 0
+        if (fa !== fb) return fb - fa
+      }
       return a.index - b.index
     })
 }
@@ -338,11 +340,12 @@ function handleEvent(e: RxEvent): void {
     }
   }
 
-  // x/y/yaw 按语义 tag 识别（不依赖名字）
+  // x/y/yaw 按语义种类识别（不依赖名字）
   if (item && typeof e.value === 'number') {
-    if (item.tag === MonitorTag.PosX) rawPose.x = e.value
-    else if (item.tag === MonitorTag.PosY) rawPose.y = e.value
-    else if (item.tag === MonitorTag.Yaw) rawPose.yaw = e.value
+    const kind = tagKind(item.tag)
+    if (kind === MonitorKind.PosX) rawPose.x = e.value
+    else if (kind === MonitorKind.PosY) rawPose.y = e.value
+    else if (kind === MonitorKind.Yaw) rawPose.yaw = e.value
   }
 }
 
@@ -361,9 +364,9 @@ setInterval(() => {
   commStats.badChecksum = parser.stats.badChecksum
   commStats.unknownCmd = parser.stats.unknownCmd
   commStats.overflow = parser.stats.overflow
-  const item3 = Object.values(monitorMap).find((it) => it.tag === MonitorTag.PosX)
-  const item4 = Object.values(monitorMap).find((it) => it.tag === MonitorTag.PosY)
-  const item5 = Object.values(monitorMap).find((it) => it.tag === MonitorTag.Yaw)
+  const item3 = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.PosX)
+  const item4 = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.PosY)
+  const item5 = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.Yaw)
   if (item3 || item4 || item5) {
     pose.x = rawPose.x
     pose.y = rawPose.y
@@ -478,12 +481,20 @@ export async function sendCommand(index: number, values: CellValue[]): Promise<v
   await sendFrame(commandSend(item, values), `下发命令 ${item.name}`)
 }
 
-/* ===== 动作：订阅 / 退订（同一条 Subscribe，tag=0 即退订） ===== */
-export async function setSubscription(index: number, tag: MonitorTag): Promise<void> {
+/* ===== 动作：订阅 / 退订（同一条 Subscribe，sub=false 即退订） ===== */
+export async function setSubscription(index: number, sub: boolean, fast: boolean): Promise<void> {
   if (!connected.value) return
-  const ok = await sendFrame(subscribe(index, tag), `订阅 #${index}→${tagLabel(tag)}`)
-  // 等主控目录/推送侧自然印证即可；发送成功才本地先改，避免失败时界面说谎
-  if (ok && monitorMap[index]) monitorMap[index]!.tag = tag
+  const label = sub ? (fast ? '高速' : '低速') : '未订阅'
+  const ok = await sendFrame(subscribe(index, sub, fast), `订阅 #${index}→${label}`)
+  // 等主控目录/推送侧自然印证即可；发送成功才本地先改，避免失败时界面说谎。
+  // 本地只覆盖 SUB/FAST 两位，GETTER/KIND 等本机位与下位机 merge 语义保持一致
+  if (ok && monitorMap[index]) {
+    const old = monitorMap[index]!.tag
+    monitorMap[index]!.tag =
+      (old & ~(MONITOR_TAG_SUB | MONITOR_TAG_FAST)) |
+      (sub ? MONITOR_TAG_SUB : 0) |
+      (fast ? MONITOR_TAG_FAST : 0)
+  }
 }
 
 /* ===== 动作：写调参（SetTunable，以 TunableEcho 回显为确认） ===== */

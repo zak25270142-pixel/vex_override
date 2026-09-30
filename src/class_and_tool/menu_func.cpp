@@ -23,10 +23,10 @@ MENU::MENU(const struct MENU_ITEM *items,
 }
 // 私有方法实现
 
-// 打印数值+单位或个性化打印
+// 打印数值+单位或个性化打印（仅内存指针路径；GETTER 项走 print_item）
 void MENU::print_value(int32_t y, void *ptr, VALUE_TYPE type, const char *unit, bool bOpaque)
 {
-    char str_buffer[28] = {32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,'\0'};
+    char str_buffer[28] = {32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, '\0'};
     switch (type)
     {
     case type_str:
@@ -54,17 +54,30 @@ void MENU::print_value(int32_t y, void *ptr, VALUE_TYPE type, const char *unit, 
         break;
     default:
         value_to_str(ptr, str_buffer, type);
-        uint8_t len=strlen(str_buffer);
+        uint8_t len = strlen(str_buffer);
         if (unit != nullptr)
         {
-            uint8_t ulen=strlen(unit);
-            list_copy2(str_buffer, unit, len, 0,ulen);
-            len+=ulen;
+            uint8_t ulen = strlen(unit);
+            list_copy2(str_buffer, unit, len, 0, ulen);
+            len += ulen;
         }
-        str_buffer[27]='\0';
+        str_buffer[27] = '\0';
         Brain.Screen.printAt(0, y, bOpaque, (const char *)str_buffer);
         break;
     }
+}
+
+// 按 MENU_ITEM 打印：GETTER 项先把函数取到的值落到本地变量，再与内存项共用 print_value
+void MENU::print_item(int32_t y, const MENU_ITEM &item, bool bOpaque)
+{
+    if (item.is_getter())
+    {
+        MenuFloatGetter get = reinterpret_cast<MenuFloatGetter>(item.data_ptr);
+        float v = get ? get() : 0.0f;
+        print_value(y, &v, type_float, item.unit, bOpaque);
+        return;
+    }
+    print_value(y, item.data_ptr, item.data_type, item.unit, bOpaque);
 }
 
 // 调参倍率++
@@ -213,7 +226,7 @@ void MENU::refresh_highlight_line_right()
     Brain.Screen.drawRectangle(-1, -1, size.width - blank_width + 1, y_gap + 2, highlightbg_color);
     Brain.Screen.setFont(font);
     Brain.Screen.setPenColor(highlightnm_color);
-    print_value(y_gap - 3, menu_item[now_choose].data_ptr, menu_item[now_choose].data_type, menu_item[now_choose].unit);
+    print_item(y_gap - 3, menu_item[now_choose]);
     reset_origin();
 }
 
@@ -263,7 +276,7 @@ void MENU::refresh_value()
     for (int8_t i = 1; i <= line_num && i <= menu_len; i++)
     {
         uint8_t index = (now_choose + i + menu_len - highlight_line) % menu_len;
-        print_value(i * y_gap, menu_item[index].data_ptr, menu_item[index].data_type, menu_item[index].unit, true);
+        print_item(i * y_gap, menu_item[index], true);
     }
     reset_origin();
 }
@@ -326,6 +339,9 @@ void MENU::shift()
 
 void MENU::enter()
 {
+    if (!is_monitor_menu && menu_item[now_choose].is_getter())
+        return;
+
     inner_menu = true;
     if (is_monitor_menu)
     {

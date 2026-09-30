@@ -16,7 +16,7 @@ uint8_t USB_Comm::cmd_payload_len(uint8_t cmd)
     case Ping:
         return 0;
     case Subscribe:
-        return 2; // [index][tag]，档位由第二字节给出，tag=0即退订
+        return 2; // [index][tag]，tag 为位域；bit7=0 即退订
     case Set_Tunable:
         return 9; // [index][value×8B]，定长，实际宽度由下位机按表里类型取
     }
@@ -94,8 +94,17 @@ uint8_t USB_Comm::value_size(VALUE_TYPE type)
 // 把参数当前值序列化到发送缓冲。
 // 参数out要由调用方保证至少有value_size(type)字节的空间。
 // 返回实际写入的字节数，调用方据此推进缓冲位置。
+// GETTER：data_ptr 为 MenuFloatGetter，只走 float 小端（监控电机遥测约定）。
 uint8_t USB_Comm::append_value(uint8_t *out, const MENU_ITEM &item)
 {
+    if (item.is_getter())
+    {
+        MenuFloatGetter get = reinterpret_cast<MenuFloatGetter>(item.data_ptr);
+        float v = get ? get() : 0.0f;
+        memcpy(out, &v, 4);
+        return 4;
+    }
+
     switch (item.data_type)
     {
     case type_color:
@@ -199,7 +208,7 @@ void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd
 
         tx_frame[2] = i;                       // 用原数组下标当编号
         tx_frame[3] = (uint8_t)item.data_type; // 上位机据此知道后面的值占几字节
-        tx_frame[4] = (uint8_t)item.tag;       // 监控目录据此给出默认订阅档位和语义标记
+        tx_frame[4] = (uint8_t)item.tag;       // 位域：SUB/FAST/GETTER/KIND
         tx_frame[5] = name_len;                // 名字字节数，上位机读完名字正好对齐到值
         memcpy(&tx_frame[6], item.Chinese_name, name_len);
         append_value(&tx_frame[6 + name_len], item);
@@ -248,6 +257,13 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
     }
 }
 
+// 只合并上位机的订阅/速率位，保留本机 GETTER 与 KIND（及预留位）
+static uint8_t merge_subscribe_tag(uint8_t old_tag, uint8_t incoming)
+{
+    const uint8_t host_bits = MENU_TAG_SUB | MENU_TAG_FAST;
+    return static_cast<uint8_t>((incoming & host_bits) | (old_tag & static_cast<uint8_t>(~host_bits)));
+}
+
 // 接收状态机收齐一帧、且校验通过后调用。
 // 此时rx_cmd是命令字，rx_payload前rx_len字节是数据。
 void USB_Comm::handle_command()
@@ -272,22 +288,23 @@ void USB_Comm::handle_command()
         break;
     case Subscribe:
     {
-        // Payload: [index][tag]，tag取值0~5：
-        //   0=退订（停推），1低速，2高速，3/4/5=x/y/yaw语义档
-        // 退订和订阅是同一套写法（往tag里写0），所以不再单设退订命令。
+        // Payload: [index][tag]
+        // tag 为位域（见 my_main.h）。上位机主要改 bit7(SUB)/bit6(FAST)；
+        // 下位机 merge 时保留 bit5(GETTER) 与 bit2~0(KIND) 及预留位。
+        // 旧习惯整字节 0 表示退订 → bit7=0，仍然成立。
         uint8_t index = rx_payload[0];
         uint8_t tag = rx_payload[1];
-        if (tag > monitor_tag_yaw)
-            break; // 超出已定义档位范围，忽略
         if (index == 0xFF)
+        {
             for (uint8_t i = 0; i < monitor_count; i++)
             {
                 VALUE_TYPE t = monitor_items[i].data_type;
                 if (t != type_str && t != type_other)
-                    monitor_items[i].tag = (MONITOR_TAG)tag;
+                    monitor_items[i].tag = merge_subscribe_tag(monitor_items[i].tag, tag);
             }
+        }
         else if (index < monitor_count)
-            monitor_items[index].tag = (MONITOR_TAG)tag;
+            monitor_items[index].tag = merge_subscribe_tag(monitor_items[index].tag, tag);
         break;
     }
     case Set_Tunable:
@@ -328,9 +345,7 @@ void USB_Comm::handle_command()
 }
 
 // 分区推送，每次tx_tick调用一次：
-//   tag>=2（高速/x/y/yaw语义量）：每轮都发，约100Hz
-//   tag==1（低速）：按index%8分到8个轮转相，每轮只发本相的项，单项约80ms
-//   tag==0：不发
+//   位域：无 SUB 不发；有 FAST 每拍发；仅 SUB 则按 index%8 低速轮转。
 // 用index%8取模代替位图轮转，不用任何额外订阅存储。
 // 本函数只按当前tick的值发，不推进tick——推进由tx_tick末尾统一做。
 void USB_Comm::monitor_tick()
@@ -355,10 +370,12 @@ void USB_Comm::monitor_tick()
     uint8_t phase = tick & (SLOW_PHASES - 1); // SLOW_PHASES是2的幂，用掩码代替取模
     for (uint8_t i = 0; i < monitor_count; i++)
     {
-        uint8_t tag = (uint8_t)monitor_items[i].tag;
-        if (tag >= monitor_tag_fast)
+        const MENU_ITEM &item = monitor_items[i];
+        if (!item.is_subscribed())
+            continue;
+        if (item.is_fast())
             post_item(i); // 高速项每轮直发
-        else if (tag == monitor_tag_slow && (i & (SLOW_PHASES - 1)) == phase)
+        else if ((i & (SLOW_PHASES - 1)) == phase)
             post_item(i); // 低速项轮到自己所在的相才发
     }
 }

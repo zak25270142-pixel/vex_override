@@ -17,6 +17,8 @@ private:
     uint8_t menu_len_buffer;
 
     void print_value(int32_t y, void *ptr, VALUE_TYPE type, const char *unit, bool bOpaque = false);
+    // 按 MENU_ITEM 打印：GETTER 项调函数取 float 打印，否则走 print_value
+    void print_item(int32_t y, const MENU_ITEM &item, bool bOpaque = false);
     void tc_value_add();
     void tc_value_reduce();
     void refresh_highlight_line_left();

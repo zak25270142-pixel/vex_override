@@ -19,10 +19,11 @@
 //     Payload 0~255B数据，有些命令没有数据
 //     XOR     1B校验，把Cmd和Payload每个字节依次异或得到；传错一个字节就对不上
 //
-// 订阅档位不靠位图，直接存在每个监控项的tag字段里（见MENU_ITEM）：
-//   tag=0 不订阅；tag=1 低速区，8相轮扫约80ms；tag>=2 高速区，每10ms。
-// tag在菜单表里写好，连接后天然就是默认订阅；上位机用Subscribe改档位，
-// 写tag=0即退订，不需要单独的退订命令。
+// 订阅档位存在每个监控项的 tag 字段里（见 MENU_ITEM / my_main.h 位域说明）：
+//   bit7 SUB：是否推送；bit6 FAST：高速/低速；bit5 GETTER：函数指针取数；
+//   bit2~0：语义种类（x/y/yaw）。目录帧仍带完整 tag 字节，上位机解析位域。
+//   连接后表内预置的 SUB/FAST/KIND 即默认订阅；Subscribe 改档时下位机只合并
+//   上位机下发的 SUB+FAST，保留本机 GETTER 与 KIND（见 handle_command）。
 //
 // 心跳：上位机每1s发Ping(A5 FF FF)，主控下一拍回Pong(同为A5 FF FF)；
 // 主控每256拍(2.56s)巡视一次，周期内没收到Ping就停推监控值，Ping恢复即续传。
@@ -53,7 +54,7 @@ private:
     {
         // 目录项 Payload:
         Post_Tunable_Directory, // 有内容命令 [CMD 1B][index索引1B][数据类型1B][中文名称长度1B][中文名称][当前数值?B取决于type 可选][XOR]
-        Post_Monitor_Directory, // 有内容命令 格式同上
+        Post_Monitor_Directory, // 有内容命令 格式同上；其中 tag 为位域字节（见 my_main.h）
         Monitor_Post,           // 有内容命令 [CMD 1B][index索引1B][当前数值?B取决于type][XOR]
         Tunable_Echo,           // 有内容命令 [CMD 1B][index索引1B][实际生效值?B取决于type][XOR]
         Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][名长][名][参数量][每参:类型+字段名长+字段名]，一命令一帧
@@ -64,9 +65,10 @@ private:
         Request_Tunable, // 无Payload，接收后发送可调参数目录(遍历tunable_items数组)
         Request_Monitor, // 无Payload，接收后发送监控目录，并开始按各项tag推送
 
-        // Payload 2B: [index 1B][tag 1B]，把该项订阅档位改成tag
-        // （0退订/1低速/2高速，也可写3/4/5恢复x/y/yaw语义档）；
-        // index=0xFF时对全部项生效，tag=0即一键全部退订
+        // Payload 2B: [index 1B][tag 1B]
+        // tag 位域：上位机主要写 bit7(SUB)/bit6(FAST)；bit5 与 bit2~0 由下位机保留。
+        // 旧习惯 tag 字节为 0 表示退订，对应 bit7=0，仍然成立。
+        // index=0xFF 时对全部监控项套用同一套 SUB+FAST。
         Subscribe,
 
         // Payload固定9B: [index 1B][value 8B]，按调参表里该项的真实类型只取前若干字节，
@@ -144,9 +146,11 @@ private:
     const CMD_ITEM *find_cmd(uint8_t cmd) const;
 
     // 把一个参数项的当前值按协议写进out指向的缓冲，返回写了几个字节。
+    // GETTER 项：调用 MenuFloatGetter 取 float 再按小端写入。
     uint8_t append_value(uint8_t *out, const MENU_ITEM &item);
 
     // append_value的逆操作：把帧里的value字节按项的真实类型写回data_ptr。
+    // GETTER 项直接返回，不写。
     void write_value(const uint8_t *in, const MENU_ITEM &item);
 
     // payload已直接拼在tx_frame[2]起时调用：补帧头、命令、校验后整帧发出，len是payload字节数
@@ -159,7 +163,7 @@ private:
     void send_cmd_dir_batch(uint8_t batch);
 
     void handle_command(); // 一帧接收完整且校验通过后，按命令字只置请求标志，真正的发送留给tx_tick
-    void monitor_tick();   // 高速项直发+低速项按tick轮转相发（本拍不推进tick）
+    void monitor_tick();   // 按 tag 位域：SUB 才发；FAST 每拍；否则低速轮转（本拍不推进tick）
 
 public:
     USB_Comm(const MENU_ITEM *tunable, uint8_t tunable_len,

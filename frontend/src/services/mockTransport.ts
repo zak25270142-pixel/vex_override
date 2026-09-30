@@ -1,34 +1,51 @@
 /**
  * 演示传输：无硬件时模拟下位机行为，走与真机完全相同的二进制帧路径。
- * 收到目录请求后回目录帧，随后按 tag 节奏推送监控值（x/y/yaw 10ms，其余 80ms）。
+ * 收到目录请求后回目录帧，随后按 tag 位域节奏推送监控值（x/y/yaw 10ms，其余 80ms）。
  */
 
-import { FRAME_HEAD, CmdGet, CmdPost, MonitorTag, ValueType } from './protocol'
+import {
+  FRAME_HEAD,
+  CmdGet,
+  CmdPost,
+  MONITOR_TAG_FAST,
+  MONITOR_TAG_SUB,
+  MonitorKind,
+  ValueType,
+  tagFast,
+  tagSubscribed,
+} from './protocol'
 import type { SerialTransport, TransportCallbacks } from './transport'
 
 interface MockItem {
   type: ValueType
-  tag: MonitorTag
+  tag: number
   name: string
   read: () => number
 }
 
+// tag 位域与真机一致：位姿量 = SUB|FAST|KIND_*（语义由本机钉死，上位机订阅命令改不动）
+const POS_X = MONITOR_TAG_SUB | MONITOR_TAG_FAST | MonitorKind.PosX
+const POS_Y = MONITOR_TAG_SUB | MONITOR_TAG_FAST | MonitorKind.PosY
+const YAW = MONITOR_TAG_SUB | MONITOR_TAG_FAST | MonitorKind.Yaw
+const SLOW = MONITOR_TAG_SUB
+const NONE = 0
+
 const monitorItems: MockItem[] = [
-  { type: ValueType.Float, tag: MonitorTag.PosX, name: '全局坐标X', read: () => 1.2 + Math.sin(performance.now() / 1000) * 0.8 },
-  { type: ValueType.Float, tag: MonitorTag.PosY, name: '全局坐标Y', read: () => 0.6 + Math.cos(performance.now() / 1400) * 0.5 },
-  { type: ValueType.Float, tag: MonitorTag.Yaw, name: '航向角', read: () => (performance.now() / 20) % 360 - 180 },
-  { type: ValueType.Float, tag: MonitorTag.Slow, name: '角度', read: () => 114.514 + Math.sin(performance.now() / 800) * 20 },
-  { type: ValueType.UInt32, tag: MonitorTag.Slow, name: '幸运数2', read: () => 1919810 },
-  { type: ValueType.Bool, tag: MonitorTag.Slow, name: 'LED PC13', read: () => (Math.floor(performance.now() / 700) % 2) },
-  { type: ValueType.Int64, tag: MonitorTag.None, name: '这是一个64位整数', read: () => -1145141909810114514 },
+  { type: ValueType.Float, tag: POS_X, name: '全局坐标X', read: () => 1.2 + Math.sin(performance.now() / 1000) * 0.8 },
+  { type: ValueType.Float, tag: POS_Y, name: '全局坐标Y', read: () => 0.6 + Math.cos(performance.now() / 1400) * 0.5 },
+  { type: ValueType.Float, tag: YAW, name: '航向角', read: () => (performance.now() / 20) % 360 - 180 },
+  { type: ValueType.Float, tag: SLOW, name: '角度', read: () => 114.514 + Math.sin(performance.now() / 800) * 20 },
+  { type: ValueType.UInt32, tag: SLOW, name: '幸运数2', read: () => 1919810 },
+  { type: ValueType.Bool, tag: SLOW, name: 'LED PC13', read: () => (Math.floor(performance.now() / 700) % 2) },
+  { type: ValueType.Int64, tag: NONE, name: '这是一个64位整数', read: () => -1145141909810114514 },
 ]
 
 // 调参项是可写的：当前值单独放一份状态，SetTunable 时改写并回显
 const tunableState = [114514, 990, 114.514]
 const tunableItems: MockItem[] = [
-  { type: ValueType.UInt32, tag: MonitorTag.None, name: '幸运数', read: () => tunableState[0]! },
-  { type: ValueType.UInt16, tag: MonitorTag.None, name: 'LED5 PWM', read: () => tunableState[1]! },
-  { type: ValueType.Float, tag: MonitorTag.None, name: '角度', read: () => tunableState[2]! },
+  { type: ValueType.UInt32, tag: NONE, name: '幸运数', read: () => tunableState[0]! },
+  { type: ValueType.UInt16, tag: NONE, name: 'LED5 PWM', read: () => tunableState[1]! },
+  { type: ValueType.Float, tag: NONE, name: '角度', read: () => tunableState[2]! },
 ]
 
 /** 按类型从小端字节解码（SetTunable 的 8B value 段），与 protocol.encodeValue8 对应 */
@@ -209,11 +226,14 @@ export class MockTransport implements SerialTransport {
       directoryFrames(CmdPost.MonitorDirectory, monitorItems).forEach((f) => this.emit(f))
       this.startTimers()
     } else if (cmd === CmdGet.Subscribe) {
-      // [index][tag]，与真机同语义：tag=0 退订；index=0xFF 全部生效
+      // [index][tag]，与真机 merge_subscribe_tag 同语义：
+      // 只合并上位机的 SUB/FAST 两位，GETTER/KIND 等本机位保留；bit7=0 即退订；index=0xFF 全部生效
       const index = data[2]!
-      const tag = data[3]!
-      if (index === 0xff) monitorItems.forEach((it) => (it.tag = tag))
-      else if (monitorItems[index]) monitorItems[index]!.tag = tag
+      const incoming = data[3]!
+      const hostBits = MONITOR_TAG_SUB | MONITOR_TAG_FAST
+      const merge = (old: number) => (incoming & hostBits) | (old & ~hostBits & 0xff)
+      if (index === 0xff) monitorItems.forEach((it) => (it.tag = merge(it.tag)))
+      else if (monitorItems[index]) monitorItems[index]!.tag = merge(monitorItems[index]!.tag)
     } else if (cmd === CmdGet.SetTunable) {
       // [index][value 8B]：按类型解码写入状态，下一"拍"回 TunableEcho
       const index = data[2]!
@@ -245,13 +265,14 @@ export class MockTransport implements SerialTransport {
     // 高速项 10ms
     this.fastTimer = setInterval(() => {
       monitorItems.forEach((it, i) => {
-        if (it.tag >= MonitorTag.Fast) this.cb.onData(valueFrame(i, it))
+        if (tagSubscribed(it.tag) && tagFast(it.tag)) this.cb.onData(valueFrame(i, it))
       })
     }, 10)
     // 低速项按 index%8 分相，80ms 一轮（演示源每项都在相0，简化）
     this.slowTimer = setInterval(() => {
       monitorItems.forEach((it, i) => {
-        if (it.tag === MonitorTag.Slow && (i & 7) === this.slowPhase) this.cb.onData(valueFrame(i, it))
+        if (tagSubscribed(it.tag) && !tagFast(it.tag) && (i & 7) === this.slowPhase)
+          this.cb.onData(valueFrame(i, it))
       })
       this.slowPhase = (this.slowPhase + 1) & 7
     }, 10)
