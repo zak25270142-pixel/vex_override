@@ -164,8 +164,13 @@ export const tunableMap = reactive<Record<number, DirItem>>({})
 export const monitorMap = reactive<Record<number, DirItem>>({})
 /** 动作命令目录（key=命令字 0x80~0x9F），右侧下发表单按它渲染 */
 export const commandMap = reactive<Record<number, CmdDirItem>>({})
-/** 已发出 SetTunable、尚未收到回显确认的调参项 index（行内显示"等待确认"） */
+/** 已发出 SetTunable、尚未收到回显确认的调参项 index（右侧面板显示"等待确认"） */
 export const pendingTunable = reactive(new Set<number>())
+/** 参数表单击选中的调参项 index（右侧面板据此显示编辑卡片）；null=未选中，右侧保持任务下发 */
+export const selectedTunableIndex = ref<number | null>(null)
+export const selectedTunableItem = computed<DirItem | null>(() =>
+  selectedTunableIndex.value === null ? null : (tunableMap[selectedTunableIndex.value] ?? null),
+)
 /** index→超时计时器：超时还没收到 TunableEcho 就判失败，避免一直转圈 */
 const setTimers = new Map<number, number>()
 const SET_ACK_TIMEOUT_MS = 2000
@@ -175,10 +180,47 @@ export const monitorLatest = reactive<Record<number, CellValue>>({})
 /* ===== 场地位姿（x/y 单位米，yaw 单位度、顺时针正、0°朝 X+） ===== */
 export const pose = reactive({ x: 0, y: 0, yaw: 0, valid: false })
 
-/* ===== 曲线：4 个通道各自绑定一个监控量 index，null=未绑定 ===== */
-export const channelSel = reactive<(number | null)[]>(CHANNELS.map(() => null))
-export const merged = ref(false)
-export const plotWindowS = ref(PLOT_WINDOW_S)
+/* ===== 曲线：4 个通道，每通道至多 4 条追踪曲线 ===== */
+/** 每通道追踪槽上限（槽位颜色取 --channel-1~4） */
+export const TRACE_MAX = 4
+/** traces[ch]：该通道当前追踪的监控量 index，按槽位顺序排列 */
+export const channelTraces = reactive<number[][]>(CHANNELS.map(() => []))
+/** 当前在右栏配置 / 大图查看的通道，null=未选中 */
+export const focusCh = ref<number | null>(null)
+/** 显示模式：false=2×2分图，true=选中通道大图（大图占满宽，配置卡默认收起为浮层） */
+export const bigView = ref(false)
+/** 大图模式下配置浮层是否展开（切通道自动收起） */
+export const scopeDrawer = ref(false)
+
+/** 每通道独立的坐标轴配置（x 时间窗口、y 自动/手动量程） */
+export interface ChannelAxisCfg {
+  windowS: number
+  yAuto: boolean
+  yMin: number
+  yMax: number
+}
+export const channelCfg = reactive<ChannelAxisCfg[]>(
+  CHANNELS.map(() => ({ windowS: PLOT_WINDOW_S, yAuto: true, yMin: 0, yMax: 1 })),
+)
+
+/** 改动某通道已有槽位的追踪项：raw='' 移除该槽，否则换成新 index（同通道禁重复） */
+export function pickTrace(ch: number, slot: number, raw: string): void {
+  const list = channelTraces[ch]!
+  if (raw === '') {
+    list.splice(slot, 1)
+    return
+  }
+  const index = Number(raw)
+  if (list.some((v, k) => k !== slot && v === index)) return
+  if (slot < list.length) list[slot] = index
+  else if (list.length < TRACE_MAX) list.push(index)
+}
+
+/** 末尾空槽添加追踪项（raw='' 是占位"未选择"，忽略） */
+export function addTrace(ch: number, raw: string): void {
+  if (raw === '') return
+  pickTrace(ch, channelTraces[ch]!.length, raw)
+}
 
 /* ===== 订阅档位展示文案（tag 为位域：先看语义种类，再按订阅位拼档位） ===== */
 export function tagLabel(tag: number): string {
@@ -247,7 +289,6 @@ interface SeriesBuf {
 const seriesBuf = new Map<number, SeriesBuf>()
 const rawLatest: Record<number, CellValue> = {}
 const rawPose = { x: 0, y: 0, yaw: 0 }
-let tOrigin = 0
 
 /** 图表 20fps 拉取曲线数据 */
 export function getSeries(index: number): SeriesBuf | undefined {
@@ -262,7 +303,6 @@ function clearMonitorData(): void {
   for (const k of Object.keys(monitorLatest)) delete monitorLatest[Number(k)]
   seriesBuf.clear()
   parser.resetMonitorTypes()
-  tOrigin = 0
   pose.valid = false
 }
 
@@ -326,13 +366,13 @@ function handleEvent(e: RxEvent): void {
 
   if (typeof e.value === 'number') {
     // 曲线缓冲（所有数值量都记，是否展示由通道绑定决定）
-    if (tOrigin === 0) tOrigin = performance.now()
+    // t 存绝对接收时刻（秒），显示时由图表换算成"距现在"，实现示波器式右对齐时间轴
     let buf = seriesBuf.get(index)
     if (!buf) {
       buf = { t: [], v: [] }
       seriesBuf.set(index, buf)
     }
-    buf.t.push((performance.now() - tOrigin) / 1000)
+    buf.t.push(performance.now() / 1000)
     buf.v.push(e.value)
     if (buf.t.length > MAX_POINTS) {
       buf.t.splice(0, buf.t.length - MAX_POINTS)
@@ -389,6 +429,7 @@ serialClient.onStatus = (state, message) => {
   } else {
     stopPing() // 断开/连接中/出错都停心跳，避免向已关闭的端口写
     clearPendingTunable() // 待确认的写参也全部作废
+    selectedTunableIndex.value = null
   }
 }
 serialClient.onData = (data) => {
@@ -442,6 +483,7 @@ export async function fetchTunable(): Promise<void> {
   for (const k of Object.keys(tunableMap)) delete tunableMap[Number(k)]
   parser.resetTunableTypes()
   clearPendingTunable()
+  selectedTunableIndex.value = null // 表都没了，右侧编辑卡片一并关闭
   // 先上屏"请求已发出"，再走统一发帧出口（失败也会被捕获上屏）
   statusText.value = '已发送调参表请求，等待主控回传…'
   const ok = await sendFrame(requestTunable(), '请求调参表')

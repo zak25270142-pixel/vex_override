@@ -180,7 +180,8 @@ void USB_Comm::send_frame(uint8_t cmd, uint8_t len)
 // 目录由tx_tick分多个10ms拍发完，避免一次性write几百项时长时间占用发送任务。
 // 参数cmd决定这些帧标成"可调目录"还是"监控目录"，复用同一套拼帧逻辑。
 // 直接在成员tx_frame里拼帧，不再用临时payload数组中转，省一次栈空间和拷贝：
-//   [A5][Cmd]由send_frame补，[index][类型][tag][名字长度][名字][当前值]在这里写
+//   [A5][Cmd]由send_frame补，
+//   [index][类型][tag][名字长度][名字][单位长度][单位][当前值]在这里写
 void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, uint8_t batch)
 {
     uint8_t start = batch * DIR_BATCH;
@@ -206,13 +207,21 @@ void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd
         if (name_len > 30)
             name_len = 30; // 名称基本在30字节以下
 
+        // 单位可能没填（nullptr或空串），统一发成长度0的单位段
+        uint8_t unit_len = item.unit != nullptr ? (uint8_t)strlen(item.unit) : 0;
+        if (unit_len > UNIT_MAX)
+            unit_len = UNIT_MAX;
+
         tx_frame[2] = i;                       // 用原数组下标当编号
         tx_frame[3] = (uint8_t)item.data_type; // 上位机据此知道后面的值占几字节
         tx_frame[4] = (uint8_t)item.tag;       // 位域：SUB/FAST/GETTER/KIND
-        tx_frame[5] = name_len;                // 名字字节数，上位机读完名字正好对齐到值
+        tx_frame[5] = name_len;                // 名字字节数，上位机读完名字正好对齐到单位段
         memcpy(&tx_frame[6], item.Chinese_name, name_len);
-        append_value(&tx_frame[6 + name_len], item);
-        send_frame(cmd, 4 + name_len + vlen);
+        tx_frame[6 + name_len] = unit_len; // 单位字节数，0表示无单位
+        if (unit_len > 0)
+            memcpy(&tx_frame[7 + name_len], item.unit, unit_len);
+        append_value(&tx_frame[7 + name_len + unit_len], item);
+        send_frame(cmd, 5 + name_len + unit_len + vlen);
     }
 }
 

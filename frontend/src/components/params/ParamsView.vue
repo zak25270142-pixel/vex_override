@@ -46,88 +46,72 @@
             <th class="c-name">名称</th>
             <th class="c-type">类型</th>
             <th class="c-value">当前值</th>
-            <th v-if="paramTable === 'monitor'" class="c-sub">订阅档位</th>
+            <th v-if="paramTable === 'monitor'" class="c-sub">订阅</th>
           </tr>
         </thead>
         <tbody>
           <tr
             v-for="it in visibleRows"
             :key="it.index"
-            :class="{ 'row--sub': paramTable === 'monitor' && tagSubscribed(it.tag) }"
+            :class="{
+              'row--sub': paramTable === 'monitor' && tagSubscribed(it.tag),
+              'row--sel': paramTable === 'tunable' && selectedTunableIndex === it.index,
+              'row--clickable': paramTable === 'tunable',
+            }"
+            :title="paramTable === 'tunable' ? '单击在右侧面板修改' : undefined"
+            @click="paramTable === 'tunable' && (selectedTunableIndex = it.index)"
           >
             <td class="c-idx">{{ it.index }}</td>
             <td class="c-name">{{ it.name }}</td>
             <td class="c-type">{{ typeName(it.type) }}</td>
             <td class="c-value">
-              <!-- ===== 调参表：可写，以主控回显为确认 ===== -->
+              <!-- ===== 调参表：只读展示，单击行到右侧面板编辑；下发后等回显期间显等待 ===== -->
               <template v-if="paramTable === 'tunable'">
                 <span v-if="pendingTunable.has(it.index)" class="ack" title="已下发，等待主控回显确认">
                   等待确认…
                 </span>
-                <!-- str/other 下位机不可写，只展示 -->
-                <template v-else-if="isWritable(it.type)">
-                  <input
-                    v-if="isBoolType(it.type)"
-                    class="switch"
-                    type="checkbox"
-                    title="勾选=开"
-                    :checked="Number(it.value) !== 0"
-                    @change="onBoolCommit(it.index, ($event.target as HTMLInputElement).checked)"
-                  />
-                  <label v-else-if="it.type === ValueType.Color" class="swatch">
-                    <input
-                      type="color"
-                      :value="String(it.value)"
-                      @change="onColorCommit(it.index, ($event.target as HTMLInputElement).value)"
-                    />
+                <template v-else>
+                  <label v-if="it.type === ValueType.Color" class="swatch">
+                    <i :style="{ background: String(it.value) }" />
                     {{ it.value }}
                   </label>
-                  <!-- 数值：双击当前值进入编辑，回车或失焦提交，Esc取消 -->
-                  <input
-                    v-else-if="editing === it.index"
-                    v-model="draft"
-                    class="num-edit"
-                    type="number"
-                    :step="isFloatType(it.type) ? 'any' : '1'"
-                    autofocus
-                    @keyup.enter="onNumCommit(it.index)"
-                    @keyup.esc="cancelEdit()"
-                    @blur="onNumCommit(it.index)"
-                  />
-                  <span
-                    v-else
-                    class="edit-hint"
-                    title="双击修改"
-                    @dblclick="startEdit(it.index, it.value)"
-                  >
-                    {{ formatValue(it, it.value) }}
-                  </span>
+                  <template v-else>
+                    {{ formatValue(it, it.value) }}<span v-if="it.unit" class="val-unit">{{ it.unit }}</span>
+                  </template>
                 </template>
-                <span v-else>{{ formatValue(it, it.value) }}</span>
               </template>
 
-              <!-- ===== 实参表：只读，展示实时推送值 ===== -->
+              <!-- ===== 实参表：只读，展示实时推送值（值直接挂单位） ===== -->
               <template v-else>
                 <span v-if="it.type === ValueType.Color" class="swatch">
                   <i :style="{ background: String(displayValue(it.index, it.value)) }" />
                   {{ displayValue(it.index, it.value) }}
                 </span>
-                <template v-else>{{ formatValue(it, displayValue(it.index, it.value)) }}</template>
+                <template v-else>
+                  {{ formatValue(it, displayValue(it.index, it.value))
+                  }}<span v-if="it.unit" class="val-unit">{{ it.unit }}</span>
+                </template>
               </template>
             </td>
-            <!-- 订阅：实参表才有；x/y/yaw 语义量固定自动订阅，不允许改 -->
+            <!-- 订阅：实参表才有；徽标标当前档位（灰=未订阅/黄=低速/青=高速），右侧两按钮按当前档位切换 -->
             <td v-if="paramTable === 'monitor'" class="c-sub">
-              <span v-if="isPoseTag(it.tag)" class="pose-badge">
-                {{ tagLabel(it.tag) }}·自动
-              </span>
-              <select
-                :value="subLevel(it.tag)"
-                @change="onTagChange(it.index, ($event.target as HTMLSelectElement).value)"
-              >
-                <option value="none">未订阅</option>
-                <option value="slow">低速（约80ms）</option>
-                <option value="fast">高速（约10ms）</option>
-              </select>
+              <div class="sub-cell">
+                <template v-if="!tagSubscribed(it.tag)">
+                  <span class="sub-state sub-state--off"><i />未订阅</span>
+                  <button class="sub-btn sub-btn--slow" @click="onSub(it.index, false)">订阅低速</button>
+                  <button class="sub-btn sub-btn--fast" @click="onSub(it.index, true)">订阅高速</button>
+                </template>
+                <template v-else-if="tagFast(it.tag)">
+                  <span class="sub-state sub-state--fast"><i />高速</span>
+                  <button class="sub-btn sub-btn--off" @click="onUnsub(it.index)">退订</button>
+                  <button class="sub-btn sub-btn--slow" @click="onSub(it.index, false)">降级低速</button>
+                </template>
+                <template v-else>
+                  <span class="sub-state sub-state--slow"><i />低速</span>
+                  <button class="sub-btn sub-btn--off" @click="onUnsub(it.index)">退订</button>
+                  <button class="sub-btn sub-btn--fast" @click="onSub(it.index, true)">升级高速</button>
+                </template>
+              </div>
             </td>
           </tr>
         </tbody>
@@ -137,26 +121,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
-import {
-  ValueType,
-  tagFast,
-  tagSubscribed,
-  typeName,
-  valueSize,
-  type CellValue,
-} from '@/services/protocol'
+import { ValueType, tagFast, tagSubscribed, typeName, type CellValue } from '@/services/protocol'
 import {
   connected,
   formatValue,
-  isPoseTag,
   keyword,
   monitorLatest,
   paramTable,
   pendingTunable,
+  selectedTunableIndex,
   setSubscription,
-  setTunableValue,
-  tagLabel,
   visibleRows,
 } from '@/stores/globle'
 
@@ -165,58 +139,13 @@ function displayValue(index: number, fallback: CellValue): CellValue {
   return paramTable.value === 'monitor' ? (monitorLatest[index] ?? fallback) : fallback
 }
 
-/** 档位下拉当前值：由位域折算成字符串档位 */
-function subLevel(tag: number): string {
-  if (!tagSubscribed(tag)) return 'none'
-  return tagFast(tag) ? 'fast' : 'slow'
+/** 订阅（fast=true 高速约10ms，false 低速约80ms）；与退订同走一条 Subscribe 命令 */
+async function onSub(index: number, fast: boolean): Promise<void> {
+  await setSubscription(index, true, fast)
 }
 
-/** 档位下拉变化：未订阅/低速/高速 都是同一条 Subscribe 命令的两个位 */
-async function onTagChange(index: number, raw: string): Promise<void> {
-  await setSubscription(index, raw !== 'none', raw === 'fast')
-}
-
-/* ===== 调参编辑 ===== */
-/** 正在编辑的行 index；draft 是输入框原始字符串，提交时才解析 */
-const editing = ref<number | null>(null)
-const draft = ref('')
-
-/** 有存储宽度的类型才可写（str/other 宽度为 0，下位机会拒绝） */
-function isWritable(type: ValueType): boolean {
-  return valueSize(type) > 0
-}
-function isBoolType(type: ValueType): boolean {
-  return type === ValueType.Bool || type === ValueType.OnOff
-}
-function isFloatType(type: ValueType): boolean {
-  return type === ValueType.Float || type === ValueType.Double
-}
-
-function startEdit(index: number, v: CellValue): void {
-  editing.value = index
-  draft.value = String(v)
-}
-
-function cancelEdit(): void {
-  // 先清空 editing，随后触发的 blur 会因此跳过提交
-  editing.value = null
-}
-
-/** 数值提交：回车或失焦触发；非法输入直接取消。editing 守卫保证 blur/enter 不重复发 */
-async function onNumCommit(index: number): Promise<void> {
-  if (editing.value !== index) return
-  editing.value = null
-  const n = Number(draft.value)
-  if (!Number.isFinite(n)) return
-  await setTunableValue(index, n)
-}
-
-async function onBoolCommit(index: number, checked: boolean): Promise<void> {
-  await setTunableValue(index, checked ? 1 : 0)
-}
-
-async function onColorCommit(index: number, hex: string): Promise<void> {
-  await setTunableValue(index, hex)
+async function onUnsub(index: number): Promise<void> {
+  await setSubscription(index, false, false)
 }
 </script>
 
@@ -347,6 +276,16 @@ async function onColorCommit(index: number, hex: string): Promise<void> {
   font-weight: 700;
 }
 
+/* 调参表行可单击（到右侧面板编辑），选中行软底+左侧高亮 */
+.ptable tbody tr.row--clickable {
+  cursor: pointer;
+}
+
+.row--sel {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 .c-idx {
   width: 60px;
   color: var(--text-muted);
@@ -363,38 +302,111 @@ async function onColorCommit(index: number, hex: string): Promise<void> {
   font-family: var(--font-mono);
 }
 
+/* 值直接挂的单位：小一号、弱化，与数值留点气口 */
+.val-unit {
+  margin-left: 5px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
 .c-sub {
-  width: 170px;
+  width: 232px;
 }
 
-.c-sub select {
-  width: 150px;
-  height: 28px;
-  font-size: 12.5px;
-  font-family: inherit;
-  color: var(--text-primary);
-  background: var(--surface-input);
-  border: var(--border-input);
-  border-radius: var(--radius);
-  outline: none;
+/* 状态徽标 + 两个按钮同一行排开 */
+.sub-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
 }
 
-.c-sub select:focus {
-  border-color: var(--accent);
-}
-
-/* x/y/yaw 语义徽标 */
-.pose-badge {
-  display: inline-block;
-  padding: 3px 10px;
+/* 当前档位徽标：圆点+文字；灰=未订阅（无发光），黄=低速，青=高速 */
+.sub-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 52px;
   font-size: 12px;
   font-weight: 700;
+}
+
+.sub-state i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.sub-state--off {
+  color: var(--status-offline);
+}
+
+.sub-state--off i {
+  background: var(--status-offline);
+}
+
+.sub-state--slow {
   color: var(--status-waiting);
+  text-shadow: var(--glow-waiting);
+}
+
+.sub-state--slow i {
+  background: var(--status-waiting);
+  box-shadow: var(--glow-waiting);
+}
+
+.sub-state--fast {
+  color: var(--accent);
+  text-shadow: var(--glow-accent);
+}
+
+.sub-state--fast i {
+  background: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+
+/* 操作按钮：低速=黄软底，高速=青软底，退订=红软底 */
+.sub-btn {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 700;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.sub-btn--slow {
+  color: var(--status-waiting);
+  background: rgba(249, 199, 94, 0.12);
   border: 1px solid rgba(249, 199, 94, 0.5);
-  background: rgba(249, 199, 94, 0.1);
-  border-radius: 999px;
-  text-shadow: 0 0 8px rgba(249, 199, 94, 0.4);
-  white-space: nowrap;
+  text-shadow: 0 0 8px rgba(249, 199, 94, 0.35);
+}
+
+.sub-btn--slow:hover {
+  background: rgba(249, 199, 94, 0.24);
+}
+
+.sub-btn--fast {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  text-shadow: 0 0 8px rgba(79, 224, 255, 0.35);
+}
+
+.sub-btn--fast:hover {
+  background: rgba(79, 224, 255, 0.24);
+}
+
+.sub-btn--off {
+  color: var(--status-danger);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-border);
+  text-shadow: 0 0 8px rgba(255, 83, 61, 0.35);
+}
+
+.sub-btn--off:hover {
+  background: rgba(255, 83, 61, 0.24);
 }
 
 .swatch {
@@ -409,51 +421,6 @@ async function onColorCommit(index: number, hex: string): Promise<void> {
   height: 14px;
   border-radius: 3px;
   border: 1px solid rgba(255, 255, 255, 0.35);
-}
-
-/* 调参行内编辑控件 */
-.swatch input[type='color'] {
-  width: 26px;
-  height: 22px;
-  padding: 0;
-  background: transparent;
-  border: var(--border-input);
-  border-radius: var(--radius);
-  cursor: pointer;
-}
-
-.edit-hint {
-  cursor: text;
-  border-bottom: 1px dashed transparent;
-}
-
-.edit-hint:hover {
-  border-bottom-color: var(--text-muted);
-}
-
-.num-edit {
-  width: 110px;
-  height: 26px;
-  padding: 0 6px;
-  font-size: 13px;
-  font-family: var(--font-mono);
-  color: var(--text-primary);
-  background: var(--surface-input);
-  border: var(--border-input);
-  border-radius: var(--radius);
-  outline: none;
-}
-
-.num-edit:focus {
-  border-color: var(--accent);
-  box-shadow: var(--shadow-focus);
-}
-
-.switch {
-  width: 16px;
-  height: 16px;
-  cursor: pointer;
-  accent-color: var(--accent);
 }
 
 .ack {

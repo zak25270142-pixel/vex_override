@@ -20,6 +20,7 @@ interface MockItem {
   type: ValueType
   tag: number
   name: string
+  unit: string
   read: () => number
 }
 
@@ -31,21 +32,21 @@ const SLOW = MONITOR_TAG_SUB
 const NONE = 0
 
 const monitorItems: MockItem[] = [
-  { type: ValueType.Float, tag: POS_X, name: '全局坐标X', read: () => 1.2 + Math.sin(performance.now() / 1000) * 0.8 },
-  { type: ValueType.Float, tag: POS_Y, name: '全局坐标Y', read: () => 0.6 + Math.cos(performance.now() / 1400) * 0.5 },
-  { type: ValueType.Float, tag: YAW, name: '航向角', read: () => (performance.now() / 20) % 360 - 180 },
-  { type: ValueType.Float, tag: SLOW, name: '角度', read: () => 114.514 + Math.sin(performance.now() / 800) * 20 },
-  { type: ValueType.UInt32, tag: SLOW, name: '幸运数2', read: () => 1919810 },
-  { type: ValueType.Bool, tag: SLOW, name: 'LED PC13', read: () => (Math.floor(performance.now() / 700) % 2) },
-  { type: ValueType.Int64, tag: NONE, name: '这是一个64位整数', read: () => -1145141909810114514 },
+  { type: ValueType.Float, tag: POS_X, name: '全局坐标X', unit: 'm', read: () => 1.2 + Math.sin(performance.now() / 1000) * 0.8 },
+  { type: ValueType.Float, tag: POS_Y, name: '全局坐标Y', unit: 'm', read: () => 0.6 + Math.cos(performance.now() / 1400) * 0.5 },
+  { type: ValueType.Float, tag: YAW, name: '航向角', unit: 'deg', read: () => (performance.now() / 20) % 360 - 180 },
+  { type: ValueType.Float, tag: SLOW, name: '角度', unit: 'deg', read: () => 114.514 + Math.sin(performance.now() / 800) * 20 },
+  { type: ValueType.UInt32, tag: SLOW, name: '幸运数2', unit: '', read: () => 1919810 },
+  { type: ValueType.Bool, tag: SLOW, name: 'LED PC13', unit: '', read: () => (Math.floor(performance.now() / 700) % 2) },
+  { type: ValueType.Int64, tag: NONE, name: '这是一个64位整数', unit: '', read: () => -1145141909810114514 },
 ]
 
 // 调参项是可写的：当前值单独放一份状态，SetTunable 时改写并回显
 const tunableState = [114514, 990, 114.514]
 const tunableItems: MockItem[] = [
-  { type: ValueType.UInt32, tag: NONE, name: '幸运数', read: () => tunableState[0]! },
-  { type: ValueType.UInt16, tag: NONE, name: 'LED5 PWM', read: () => tunableState[1]! },
-  { type: ValueType.Float, tag: NONE, name: '角度', read: () => tunableState[2]! },
+  { type: ValueType.UInt32, tag: NONE, name: '幸运数', unit: '', read: () => tunableState[0]! },
+  { type: ValueType.UInt16, tag: NONE, name: 'LED5 PWM', unit: '', read: () => tunableState[1]! },
+  { type: ValueType.Float, tag: NONE, name: '角度', unit: 'deg', read: () => tunableState[2]! },
 ]
 
 /** 按类型从小端字节解码（SetTunable 的 8B value 段），与 protocol.encodeValue8 对应 */
@@ -169,10 +170,13 @@ function frame(cmd: number, payload: number[]): Uint8Array {
   return out
 }
 
+/** 拼调参/监控目录帧：[index][type][tag][名长][名][单位长][单位][值]，与真机 send_dir_batch 同构 */
 function directoryFrames(cmd: number, items: MockItem[]): Uint8Array[] {
   return items.map((it, i) => {
-    const nameBytes = [...new TextEncoder().encode(it.name)]
-    const payload = [i, it.type, it.tag, nameBytes.length, ...nameBytes]
+    const enc = new TextEncoder()
+    const nameBytes = [...enc.encode(it.name)]
+    const unitBytes = [...enc.encode(it.unit)]
+    const payload = [i, it.type, it.tag, nameBytes.length, ...nameBytes, unitBytes.length, ...unitBytes]
     appendValue(payload, it.type, it.read())
     return frame(cmd, payload)
   })

@@ -129,12 +129,13 @@ export function typeName(type: ValueType): string {
 /** 一个值：数值类为 number，color 为 #RRGGBB 字符串 */
 export type CellValue = number | string
 
-/** 目录项（一帧一项）；tag 为位域字节，用 tagSubscribed/tagFast/tagKind 解读 */
+/** 目录项（一帧一项）；tag 为位域字节，用 tagSubscribed/tagFast/tagKind 解读；unit 为空串表示无单位 */
 export interface DirItem {
   index: number
   type: ValueType
   tag: number
   name: string
+  unit: string
   value: CellValue
 }
 
@@ -325,7 +326,7 @@ export function commandSend(item: CmdDirItem, values: CellValue[]): Uint8Array {
 
 /* ===== 解帧（接收状态机，与下位机 refresh 里的状态机同构） =====
    注意：上行帧全是变长帧——
-   目录帧 = 4B定长头 + 名字(nameLen) + 值(宽度由type决定)
+   目录帧 = 4B定长头 + 名字(nameLen) + 单位长1B + 单位(unitLen) + 值(宽度由type决定)
    监控帧 = 1B index + 值(宽度查目录登记表)
    长度要边收边算，不能像下行命令那样查固定长度表。 */
 
@@ -334,6 +335,19 @@ const enum RxState {
   WaitCmd,
   WaitData,
   WaitXor,
+}
+
+/**
+ * 试算调参/监控目录帧的 payload 总长：
+ *   [index][type][tag][名长][名][单位长][单位][值]
+ * 单位长字节还没收到时返回 -1（继续等），收齐后算出总长。
+ */
+function dirLen(p: Uint8Array, len: number): number {
+  if (len < 4) return -1
+  const nameLen = p[3]!
+  const unitLenAt = 4 + nameLen // 单位长字节的位置
+  if (len < unitLenAt + 1) return -1
+  return 5 + nameLen + p[unitLenAt]! + valueSize(p[1]!)
 }
 
 /**
@@ -457,10 +471,9 @@ export class FrameParser {
               const total = cmdDirLen(this.payload, this.len)
               if (total >= 0) this.expect = total
             } else {
-              // 目录帧：4B 头齐了，总长 = 4 + 名字长 + 值宽
-              if (this.len >= 4) {
-                this.expect = 4 + this.payload[3]! + valueSize(this.payload[1]!)
-              }
+              // 目录帧：沿 名长→名→单位长 走查才能算出总长
+              const total = dirLen(this.payload, this.len)
+              if (total >= 0) this.expect = total
             }
           }
           if (this.expect > 0 && this.len >= this.expect) this.state = RxState.WaitXor
@@ -484,23 +497,25 @@ export class FrameParser {
     switch (this.cmd) {
       case CmdPost.TunableDirectory:
       case CmdPost.MonitorDirectory: {
-        // [index][type][tag][名字长度][名字UTF-8][值]
+        // [index][type][tag][名字长度][名字UTF-8][单位长度][单位UTF-8][值]
         if (this.len < 4) return
         const index = p[0]!
         const type = p[1]!
         const tag = p[2]!
         const nameLen = p[3]!
-        if (this.len < 4 + nameLen) return
-        const name = new TextDecoder('utf-8').decode(p.subarray(4, 4 + nameLen))
-        const value = decodeValue(
-          new DataView(p.buffer, p.byteOffset + 4 + nameLen),
-          0,
-          type,
-        )
+        const unitLenAt = 4 + nameLen
+        if (this.len < unitLenAt + 1) return
+        const unitLen = p[unitLenAt]!
+        const valueAt = 5 + nameLen + unitLen
+        if (this.len < valueAt) return
+        const decoder = new TextDecoder('utf-8')
+        const name = decoder.decode(p.subarray(4, unitLenAt))
+        const unit = decoder.decode(p.subarray(unitLenAt + 1, valueAt))
+        const value = decodeValue(new DataView(p.buffer, p.byteOffset + valueAt), 0, type)
         onEvent({
           kind: 'directory',
           table: this.cmd === CmdPost.TunableDirectory ? 'tunable' : 'monitor',
-          item: { index, type, tag, name, value },
+          item: { index, type, tag, name, unit, value },
         })
         break
       }

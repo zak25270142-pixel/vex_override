@@ -53,8 +53,9 @@ private:
     enum Cmd_Post
     {
         // 目录项 Payload:
-        Post_Tunable_Directory, // 有内容命令 [CMD 1B][index索引1B][数据类型1B][中文名称长度1B][中文名称][当前数值?B取决于type 可选][XOR]
-        Post_Monitor_Directory, // 有内容命令 格式同上；其中 tag 为位域字节（见 my_main.h）
+        // [index 1B][数据类型 1B][tag 1B][名称长度 1B][名称][单位长度 1B][单位][当前值?B取决于type]
+        Post_Tunable_Directory, // 调参目录（tag 位调参表固定为0）
+        Post_Monitor_Directory, // 监控目录；其中 tag 为位域字节（见 my_main.h）
         Monitor_Post,           // 有内容命令 [CMD 1B][index索引1B][当前数值?B取决于type][XOR]
         Tunable_Echo,           // 有内容命令 [CMD 1B][index索引1B][实际生效值?B取决于type][XOR]
         Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][名长][名][参数量][每参:类型+字段名长+字段名]，一命令一帧
@@ -91,6 +92,7 @@ private:
     static constexpr uint16_t MAX_PAYLOAD = 255;
     static constexpr uint8_t SLOW_PHASES = 8; // 低速项轮转相数：单项刷新周期=8×10ms=80ms
     static constexpr uint8_t DIR_BATCH = 8;   // 调参/监控目录分批：每个10ms拍最多连续发8项
+    static constexpr uint8_t UNIT_MAX = 8;    // 目录帧单位名截断长度（字节），如 m/s、deg/s
     // ---- 动作命令表 ----
     static constexpr uint8_t CMD_BASE = 0x80;    // 用户命令段起点，0x80~0x9F共32个合法命令字
     static constexpr uint8_t CMD_SLOT_MAX = 32;  // 合法命令字个数，仅用于收帧时的范围校验
