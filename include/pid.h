@@ -56,14 +56,16 @@ public:
 class StableJudge
 {
 private:
+    // 记录条件开始持续满足的 us 时间戳，0 表示当前未在计时。
     uint32_t stable_start_time;
 
 public:
-    uint16_t stable_time; // 单位 ms
+    uint32_t stable_time; // 单位 us
 
+    // 参数单位 ms，内部换算为 us（与 PositionPID 构造换算同一风格）。
     StableJudge(uint16_t time = 180);
 
-    bool update(bool condition, uint32_t current_time = vex::timer::system());
+    bool update(bool condition, uint32_t current_time_us = vex::timer::systemHighResolution());
 };
 
 #endif

@@ -109,15 +109,17 @@ static void cmd_set_spin(const uint8_t *p)
 
 static void cmd_reset_pos(const uint8_t *p)
 {
-    // 直接改软件里程计全局位姿：x/y(米)、yaw(度)，并以其为新段起点。
-    // 只改内存里的累计量(begin_segment 无传感器 I/O)，定位轮/IMU 硬件零位不动。
+    // 直接改软件里程计全局位姿：x/y(米)、全局 yaw(度)，并以其为新段起点。
+    // heading_offset 负责把 IMU 原始读数映射到全局航向，不碰 IMU 硬件零位。
+    // 车必须处于停车空闲态（is_busy 拦截），否则里程计在运动中突变会失配。
     if (robot_action.is_busy())
         return;
     float arg[3];
     memcpy(arg, p, sizeof(arg));
     chassis.x = arg[0];
     chassis.y = arg[1];
-    chassis.heading = arg[2];
+    chassis.heading_offset = arg[2] - chassis.imu_heading;
+    chassis.heading = arg[2]; // 同步供 begin_segment() 快照，下一拍 update() 写同一值也无害
     chassis.begin_segment();
 }
 

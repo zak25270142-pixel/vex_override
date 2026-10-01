@@ -89,10 +89,12 @@ void Chassis::update(uint32_t now)
     angular_speed = static_cast<float>(inertial_sensor.gyroRate(vex::axisType::zaxis, vex::velocityUnits::dps));
     // - gyro_bias;
 
-    // 读取惯性传感器航向，并按距起点的时间扣除零偏累计量（静止时修正航向保持0）
-    float new_heading = static_cast<float>(inertial_sensor.rotation(vex::rotationUnits::deg));
+    // 读取惯性传感器航向。增量只从 IMU 原始读数差分：上位机改 heading_offset
+    // （或任何时刻写 heading）都不会让本轮增量失真，定位轮旋转补偿因此不受污染。
+    float new_imu_heading = static_cast<float>(inertial_sensor.rotation(vex::rotationUnits::deg));
     // - gyro_bias * (now - heading_origin) / 1000000.0f;
-    heading_change = new_heading - heading;
+    heading_change = new_imu_heading - imu_heading;
+    imu_heading = new_imu_heading;
     // 转换为弧度
     float rotation_change = heading_change * deg_to_rad; // 单位 rad
 
@@ -134,10 +136,10 @@ void Chassis::update(uint32_t now)
     // left_distance = new_left_distance;
     // right_distance = new_right_distance;
 
-    // 定位轮里程与惯性传感器航向回写，用于下一轮
+    // 定位轮里程回写用于下一轮；全局航向 = IMU 读数 + 软件偏置。
     forward_tracking_distance = new_forward_tracking_distance;
     side_tracking_distance = new_side_tracking_distance;
-    heading = new_heading;
+    heading = new_imu_heading + heading_offset;
     // 定位轮可以宣告到此结束
 
     // 里程计速度使用本轮前向位移除以实际更新时间。

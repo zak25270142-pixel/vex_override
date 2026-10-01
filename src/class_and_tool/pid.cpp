@@ -72,19 +72,19 @@ float PositionPID::update(float error, uint32_t current_time_us)
 }
 
 StableJudge::StableJudge(uint16_t time)
-    : stable_start_time(0), stable_time(time) {}
+    : stable_start_time(0), stable_time((uint32_t)time * 1000) {}
 
-bool StableJudge::update(bool condition, uint32_t current_time)
+bool StableJudge::update(bool condition, uint32_t current_time_us)
 {
     if (stable_start_time == 0)
     {
         if (condition)
-            stable_start_time = current_time;
+            stable_start_time = current_time_us;
     }
     else
     {
         if (condition)
-            return (current_time - stable_start_time >= stable_time);
+            return (current_time_us - stable_start_time >= stable_time);
         else
             stable_start_time = 0;
     }

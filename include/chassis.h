@@ -130,9 +130,11 @@ public:
     // float right_distance = 0.0f;
     float left_speed = 0.0f; // 电机组编码器测得的转速，单位 rpm。
     float right_speed = 0.0f;
-    float linear_speed = 0.0f;  // 车体中心沿自身前方的线速度，单位 m/s。
-    float heading = 0.0f;       // IMU 测得的累计航向角，向右转为正，单位 deg。
-    float angular_speed = 0.0f; // IMU 测得的车体转动角速度，单位 deg/s。
+    float linear_speed = 0.0f;   // 车体中心沿自身前方的线速度，单位 m/s。
+    float heading = 0.0f;        // 全局航向角 = IMU 读数 + heading_offset，向右转为正，单位 deg。
+    float heading_offset = 0.0f; // 全局航向相对 IMU 零点的软件偏置，单位 deg；上位机 0x86 改航向即改它。
+    float imu_heading = 0.0f;    // update() 维护的 IMU 原始累计航向，单位 deg；里程计增量只从它差分。
+    float angular_speed = 0.0f;  // IMU 测得的车体转动角速度，单位 deg/s。
 
     // 传感器角位置乘以周长得到的一维有符号坐标 沿轮的测量方向，前进为正、后退为负 算出的定位轮滚动距离
     float forward_tracking_distance = 0.0f; // 前向定位轮的累计滚动距离，单位 m，有符号。
