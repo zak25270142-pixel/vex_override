@@ -18,6 +18,11 @@
         通道设置
       </button>
 
+      <!-- 导出通道追踪历史（环形缓冲内最近3分钟）为 txt，供离线/AI 分析 -->
+      <button class="chart-view__export" title="导出通道追踪数据（最近3分钟）为 txt 文件" @click="onExport">
+        导出数据
+      </button>
+
       <div class="chart-view__switch">
         <button :class="{ 'chart-view__btn--on': !bigView }" @click="bigView = false">分图</button>
         <button :class="{ 'chart-view__btn--on': bigView }" @click="bigView = true">大图</button>
@@ -54,9 +59,10 @@ import {
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import type { ECharts } from 'echarts/core'
-import { CHANNELS, PLOT_REFRESH_MS } from '@/config/workspace'
+import { CHANNELS, PLOT_REFRESH_MS, TRACE_BUF_CAP } from '@/config/workspace'
 import {
   bigView,
+  buildExportText,
   channelCfg,
   channelTraces,
   connected,
@@ -65,6 +71,7 @@ import {
   monitorMap,
   plottableItems,
   scopeDrawer,
+  statusText,
 } from '@/stores/globle'
 
 echarts.use([LineChart, GridComponent, LegendComponent, TitleComponent, TooltipComponent, CanvasRenderer])
@@ -133,16 +140,19 @@ function baseOption(extra: echarts.EChartsCoreOption): echarts.EChartsCoreOption
   }
 }
 
-/** 取某条追踪曲线当前窗口内的点；t 换算成"距现在的秒数"（最新点≈0） */
+/** 取某条追踪曲线当前窗口内的点；t 换算成"距现在的秒数"（最新点≈0）。
+    缓冲是环形（时间升序），从最旧端线性走到最新端，早于窗口起点的直接跳过 */
 function tracePoints(index: number | undefined, windowS: number): [number, number][] {
   if (index === undefined) return []
   const buf = getSeries(index)
-  if (!buf || buf.t.length < 2) return []
+  if (!buf || buf.len < 2) return []
   const now = performance.now() / 1000
   const t0 = now - windowS
   const out: [number, number][] = []
-  for (let k = 0; k < buf.t.length; k++) {
-    if (buf.t[k]! >= t0) out.push([buf.t[k]! - now, buf.v[k]!])
+  const start = (buf.head - buf.len + TRACE_BUF_CAP) % TRACE_BUF_CAP
+  for (let k = 0; k < buf.len; k++) {
+    const pos = (start + k) % TRACE_BUF_CAP
+    if (buf.t[pos]! >= t0) out.push([buf.t[pos]! - now, buf.v[pos]!])
   }
   return out
 }
@@ -269,6 +279,59 @@ watch(focusCh, () => {
   scopeDrawer.value = false
 })
 
+/* ===== 导出：保存文件对话框优先从桌面开始，不支持的浏览器退回普通下载 ===== */
+interface SaveWritable {
+  write(data: unknown): Promise<void>
+  close(): Promise<void>
+}
+type SaveFilePicker = (opts: {
+  suggestedName?: string
+  startIn?: string
+  types?: { description: string; accept: Record<string, string[]> }[]
+}) => Promise<{ createWritable: () => Promise<SaveWritable> }>
+
+async function saveTextFile(name: string, text: string): Promise<'saved' | 'canceled' | 'download'> {
+  const picker = (window as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker
+  if (picker) {
+    try {
+      const handle = await picker({
+        suggestedName: name,
+        startIn: 'desktop',
+        types: [{ description: '文本文件', accept: { 'text/plain': ['.txt'] } }],
+      })
+      const w = await handle.createWritable()
+      await w.write(text)
+      await w.close()
+      return 'saved'
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return 'canceled'
+      // 其它错误（权限等）落到下方普通下载
+    }
+  }
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+  return 'download'
+}
+
+async function onExport(): Promise<void> {
+  const text = buildExportText()
+  if (!text) {
+    statusText.value = '没有可导出的数据（先在通道中添加追踪项并等到曲线出点）'
+    return
+  }
+  const d = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const name = `v5-trace-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.txt`
+  const r = await saveTextFile(name, text)
+  if (r === 'saved') statusText.value = `已保存 ${name} 到所选位置`
+  else if (r === 'download') statusText.value = `已下载 ${name}（到浏览器下载目录）`
+  else statusText.value = '已取消导出'
+}
+
 onMounted(() => {
   // ECharts 在 canvas 中不能消费 CSS 变量，挂载时从 :root 解析一次实际色值
   const styles = getComputedStyle(document.documentElement)
@@ -355,6 +418,27 @@ onBeforeUnmount(() => {
 .chart-view__drawer:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* 导出按钮：与工具栏其余按钮同高度的中性描边样式 */
+.chart-view__export {
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 12px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: transparent;
+  border: var(--border-subtle);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.chart-view__export:hover {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  box-shadow: var(--shadow-focus);
 }
 
 .chart-view__switch {

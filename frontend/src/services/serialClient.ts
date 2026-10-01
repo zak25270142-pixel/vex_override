@@ -150,9 +150,10 @@ class SerialClient {
     await this.transport?.send(data)
   }
 
-  /** 切换演示模式；若已连接先断开，避免串口占用 */
+  /** 切换演示模式；若已连接先断开，避免串口占用。
+      同模式但传输实例尚未安装（如启动时按持久化直接恢复演示）也会补装 */
   async setDemoMode(on: boolean): Promise<void> {
-    if (this.demo === on) return
+    if (this.demo === on && this.transport?.kind === (on ? 'mock' : 'webserial')) return
     if (this.connected) await this.disconnect()
     this.wantConnected = false
     this.gestureBlocked = false

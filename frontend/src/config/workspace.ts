@@ -21,7 +21,7 @@ export const CELL_CM = 60
 export const FIELD_CM = FIELD_SIZE * CELL_CM // 360
 
 /* ===== 曲线缓冲与刷新 ===== */
-export const MAX_POINTS = 1000 // 每路环形缓冲容量（高速100Hz下约10秒）
+export const TRACE_BUF_CAP = 18000 // 每条追踪曲线的环形缓冲容量（高速100Hz下约3分钟），图表显示与导出共用
 export const PLOT_REFRESH_MS = 50 // 图表 20fps 批量刷新，避免逐点重绘
 export const PLOT_WINDOW_S = 10 // X 轴默认滑动窗口
 

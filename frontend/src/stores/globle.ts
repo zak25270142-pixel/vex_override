@@ -28,7 +28,7 @@ import {
   type CmdDirItem,
   type RxEvent,
 } from '@/services/protocol'
-import { CHANNELS, MAX_POINTS, PLOT_WINDOW_S } from '@/config/workspace'
+import { CHANNELS, PLOT_WINDOW_S, TRACE_BUF_CAP } from '@/config/workspace'
 import type { WorkView } from '@/config/workspace'
 
 /* ===== 连接 ===== */
@@ -338,17 +338,72 @@ export const visibleRows = computed<DirItem[]>(() => {
 })
 
 /* ===== 高频数据的非响应式缓冲（串口回调里写，定时/组件按需读） ===== */
+/** 追踪曲线环形缓冲：写满后覆盖最旧数据，图表显示与导出共用同一份 */
 interface SeriesBuf {
-  t: number[]
-  v: number[]
+  t: Float64Array
+  v: Float64Array
+  /** 下一个写入位置 */
+  head: number
+  /** 已存点数（≤ TRACE_BUF_CAP） */
+  len: number
 }
 const seriesBuf = new Map<number, SeriesBuf>()
 const rawLatest: Record<number, CellValue> = {}
 const rawPose = { x: 0, y: 0, yaw: 0 }
 
+/** 该 index 是否被任一通道追踪——只给通道里的量留历史，其余不占内存 */
+function isTraced(index: number): boolean {
+  for (const list of channelTraces) if (list.includes(index)) return true
+  return false
+}
+
 /** 图表 20fps 拉取曲线数据 */
 export function getSeries(index: number): SeriesBuf | undefined {
   return seriesBuf.get(index)
+}
+
+/**
+ * 导出所有通道追踪量的历史为文本（CSV 长表 t,name,value），供丢给 AI / 离线分析。
+ * t 为相对导出时刻的秒数（负=过去），与曲线页 x 轴同语义；没有任何数据时返回空串。
+ */
+export function buildExportText(): string {
+  const now = performance.now() / 1000
+  const lines: string[] = [
+    `# VEX V5 曲线数据导出 ${new Date().toLocaleString('sv-SE')}`,
+    '# t=相对导出时刻的秒数(0=导出时刻,负=过去)；环形缓冲最多保留最近3分钟',
+  ]
+  for (let ch = 0; ch < channelTraces.length; ch++) {
+    const list = channelTraces[ch]!
+    if (list.length === 0) continue
+    lines.push(
+      `# 通道${ch + 1}: ` +
+        list
+          .map((idx) => {
+            const it = monitorMap[idx]
+            return it ? `${it.name}${it.unit ? `(${it.unit})` : ''}` : `#${idx}`
+          })
+          .join(', '),
+    )
+  }
+  lines.push('t,name,value')
+  let rows = 0
+  const seen = new Set<number>()
+  for (const list of channelTraces) {
+    for (const idx of list) {
+      if (seen.has(idx)) continue // 同一量可被多通道追踪，导出一份即可
+      seen.add(idx)
+      const buf = seriesBuf.get(idx)
+      if (!buf || buf.len === 0) continue
+      const name = monitorMap[idx]?.name ?? `#${idx}`
+      const start = (buf.head - buf.len + TRACE_BUF_CAP) % TRACE_BUF_CAP
+      for (let k = 0; k < buf.len; k++) {
+        const pos = (start + k) % TRACE_BUF_CAP
+        lines.push(`${(buf.t[pos]! - now).toFixed(3)},${name},${buf.v[pos]}`)
+      }
+      rows += buf.len
+    }
+  }
+  return rows > 0 ? lines.join('\n') : ''
 }
 
 /* ===== 协议解析 ===== */
@@ -422,20 +477,18 @@ function handleEvent(e: RxEvent): void {
   const item = monitorMap[index]
   rawLatest[index] = e.value
 
-  if (typeof e.value === 'number') {
-    // 曲线缓冲（所有数值量都记，是否展示由通道绑定决定）
-    // t 存绝对接收时刻（秒），显示时由图表换算成"距现在"，实现示波器式右对齐时间轴
+  if (typeof e.value === 'number' && isTraced(index)) {
+    // 只给被通道追踪的量留历史；t 存绝对接收时刻（秒），显示/导出时换算成"距现在"，
+    // 实现示波器式右对齐时间轴。环形缓冲写满即覆盖最旧点
     let buf = seriesBuf.get(index)
     if (!buf) {
-      buf = { t: [], v: [] }
+      buf = { t: new Float64Array(TRACE_BUF_CAP), v: new Float64Array(TRACE_BUF_CAP), head: 0, len: 0 }
       seriesBuf.set(index, buf)
     }
-    buf.t.push(performance.now() / 1000)
-    buf.v.push(e.value)
-    if (buf.t.length > MAX_POINTS) {
-      buf.t.splice(0, buf.t.length - MAX_POINTS)
-      buf.v.splice(0, buf.v.length - MAX_POINTS)
-    }
+    buf.t[buf.head] = performance.now() / 1000
+    buf.v[buf.head] = e.value
+    buf.head = (buf.head + 1) % TRACE_BUF_CAP
+    if (buf.len < TRACE_BUF_CAP) buf.len++
   }
 
   // x/y/yaw 按语义种类识别（不依赖名字）
