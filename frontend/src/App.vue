@@ -33,17 +33,27 @@ import ViewStage from '@/components/stage/ViewStage.vue'
 import CommandPanel from '@/components/command/CommandPanel.vue'
 import TunablePanel from '@/components/params/TunablePanel.vue'
 import ScopeConfig from '@/components/chart/ScopeConfig.vue'
-import { bigView, focusCh, paramTable, scopeDrawer, selectedTunableItem, view } from '@/stores/globle'
+import { bigView, autoConnect, baud, demoMode, focusCh, paramTable, scopeDrawer, selectedTunableItem, setDemoMode, view } from '@/stores/globle'
 import { serialClient } from '@/services/serialClient'
 
 onMounted(() => {
-  void serialClient.init()
   window.addEventListener('beforeunload', onBeforeUnload)
+  void startup()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', onBeforeUnload)
 })
+
+async function startup(): Promise<void> {
+  // 沿用上次的演示模式；实机模式下按开关自动连接已授权设备
+  if (demoMode.value) {
+    await setDemoMode(true)
+    return
+  }
+  await serialClient.init()
+  if (autoConnect.value) await serialClient.autoConnect(baud)
+}
 
 function onBeforeUnload() {
   // 尽力释放串口，避免刷新后短暂占用

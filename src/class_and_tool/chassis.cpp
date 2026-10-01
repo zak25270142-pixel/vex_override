@@ -45,6 +45,17 @@ bool Chassis::is_ready()
 // 初始化后半段(init的结尾)
 void Chassis::finish_init()
 {
+    // // IMU 校准后仍有残余零偏（实测约0.014°/s），静止采样1s取平均，
+    // // 之后每拍从航向和角速度里扣掉它，采样期间车体必须保持静止。
+    // float bias_sum = 0.0f;
+    // const int bias_samples = 100;
+    // for (int i = 0; i < bias_samples; ++i)
+    // {
+    //     bias_sum += static_cast<float>(inertial_sensor.gyroRate(vex::axisType::zaxis, vex::velocityUnits::dps));
+    //     vex::this_thread::sleep_for(10);
+    // }
+    // gyro_bias = bias_sum / bias_samples;
+    // heading_origin = now;
     inertial_sensor.resetRotation();
     uint32_t now = get_time_us();
     previous_time = now;
@@ -74,11 +85,13 @@ void Chassis::update(uint32_t now)
     // left_distance_change = new_left_distance - left_distance;
     // right_distance_change = new_right_distance - right_distance;
 
-    // 读取惯性传感器角速度，用于pid控制
+    // 读取惯性传感器角速度，用于pid控制，扣除零偏使静止时读数在0附近
     angular_speed = static_cast<float>(inertial_sensor.gyroRate(vex::axisType::zaxis, vex::velocityUnits::dps));
+    // - gyro_bias;
 
-    // 读取惯性传感器航向
+    // 读取惯性传感器航向，并按距起点的时间扣除零偏累计量（静止时修正航向保持0）
     float new_heading = static_cast<float>(inertial_sensor.rotation(vex::rotationUnits::deg));
+       // - gyro_bias * (now - heading_origin) / 1000000.0f;
     heading_change = new_heading - heading;
     // 转换为弧度
     float rotation_change = heading_change * deg_to_rad; // 单位 rad

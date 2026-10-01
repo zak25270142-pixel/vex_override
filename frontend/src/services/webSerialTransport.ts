@@ -1,6 +1,7 @@
 /** Web Serial API 传输实现（Chrome/Edge，navigator.serial），收发均为原始字节 */
 
 import type { SerialTransport, TransportCallbacks } from './transport'
+import type { PortIdentity } from './persist'
 
 export class WebSerialTransport implements SerialTransport {
   readonly kind = 'webserial' as const
@@ -9,6 +10,10 @@ export class WebSerialTransport implements SerialTransport {
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null
   private keepReading = false
   private readTask: Promise<void> | null = null
+  /** 上次成功使用的端口身份（VID/PID），用于多设备时优先选中同一台 V5 */
+  private identity: PortIdentity | null = null
+  /** 已授权设备中存在多个同型端口，无法区分 */
+  private ambiguous = false
 
   constructor(private cb: TransportCallbacks) {}
 
@@ -16,15 +21,74 @@ export class WebSerialTransport implements SerialTransport {
     return this.port !== null
   }
 
+  /** 是否有多个同 VID/PID 的已授权设备（供上层提示用户手动选口） */
+  get hasAmbiguousPort(): boolean {
+    return this.ambiguous
+  }
+
+  /** 注入持久化记住的端口身份，需在 preselect() 之前调用 */
+  setIdentity(id: PortIdentity | null): void {
+    this.identity = id
+  }
+
+  get portIdentity(): PortIdentity | null {
+    return this.identity
+  }
+
   /** 页面加载时自动预选浏览器记住的已授权设备，实现刷新后一键回连 */
   async preselect(): Promise<boolean> {
     if (!('serial' in navigator)) return false
     const ports = await navigator.serial.getPorts()
-    if (ports.length > 0) {
-      this.port = ports[0]!
-      return true
+    if (ports.length === 0) return false
+    this.port = this.pickFrom(ports)
+    this.rememberIdentity()
+    return this.port !== null
+  }
+
+  /**
+   * 重连前重新解析端口对象：设备重插后 Chrome 通常复用同一 SerialPort 但不保证，
+   * 且断电期间 getPorts() 可能返回空数组，此时沿用旧对象继续尝试。
+   * 静默循环里绝不能调 requestPort()（需要用户手势）。
+   */
+  async reacquire(): Promise<boolean> {
+    if (!('serial' in navigator)) return this.port !== null
+    let ports: SerialPort[] = []
+    try {
+      ports = await navigator.serial.getPorts()
+    } catch {
+      /* 查询失败：沿用旧对象 */
     }
-    return false
+    if (ports.length > 0) {
+      const picked = this.pickFrom(ports)
+      if (picked) this.port = picked
+    }
+    this.rememberIdentity()
+    return this.port !== null
+  }
+
+  /** 优先选中与记住的身份一致的端口，否则退回第一个 */
+  private pickFrom(ports: SerialPort[]): SerialPort | null {
+    if (ports.length === 0) return null
+    const id = this.identity
+    if (id) {
+      const hit = ports.filter((p) => {
+        const info = p.getInfo()
+        return info.usbVendorId === id.vid && (info.usbProductId ?? 0) === id.pid
+      })
+      if (hit.length > 0) {
+        this.ambiguous = hit.length > 1
+        return hit[0]!
+      }
+    }
+    this.ambiguous = ports.length > 1
+    return ports[0]!
+  }
+
+  private rememberIdentity(): void {
+    const info = this.port?.getInfo()
+    if (info && info.usbVendorId !== undefined) {
+      this.identity = { vid: info.usbVendorId, pid: info.usbProductId ?? 0 }
+    }
   }
 
   /** 必须在点击事件中调用 */
@@ -33,6 +97,8 @@ export class WebSerialTransport implements SerialTransport {
       throw new Error('当前浏览器不支持 Web Serial，请使用 Chrome 或 Edge')
     }
     this.port = await navigator.serial.requestPort()
+    this.ambiguous = false
+    this.rememberIdentity()
   }
 
   get portLabel(): string {
@@ -49,6 +115,9 @@ export class WebSerialTransport implements SerialTransport {
   async connect(baudRate: number): Promise<void> {
     if (!this.port) throw new Error('请先选择串口')
     if (this.keepReading) return
+
+    // 先清掉上一次可能残留的读写状态，否则二次 open 会抛 already open / Failed to open
+    await this.closeStreams()
 
     this.cb.onStatus('connecting', `正在打开 ${this.portLabel} …`)
 
@@ -81,8 +150,16 @@ export class WebSerialTransport implements SerialTransport {
 
   async disconnect(): Promise<void> {
     if (!this.port) return
+    await this.closeStreams()
+  }
+
+  /**
+   * 关闭读写流并释放端口。每步独立 try/catch：物理拔线后旧对象上的调用可能抛异常，
+   * 但不能中断清理链，否则残留的读写锁会让下次 open() 失败。
+   */
+  private async closeStreams(): Promise<void> {
     this.keepReading = false
-    this.port.removeEventListener('disconnect', this.handleUnexpectedDisconnect)
+    this.port?.removeEventListener('disconnect', this.handleUnexpectedDisconnect)
     try {
       await this.reader?.cancel()
     } catch {
@@ -96,15 +173,25 @@ export class WebSerialTransport implements SerialTransport {
       }
       this.readTask = null
     }
+    try {
+      this.reader?.releaseLock()
+    } catch {
+      /* 锁已释放或流已失效 */
+    }
     this.reader = null
     try {
       await this.writer?.close()
     } catch {
       /* 写端关闭异常忽略 */
     }
+    try {
+      this.writer?.releaseLock()
+    } catch {
+      /* 锁已释放或流已失效 */
+    }
     this.writer = null
     try {
-      if (this.port.readable || this.port.writable) await this.port.close()
+      if (this.port && (this.port.readable || this.port.writable)) await this.port.close()
     } catch {
       /* 物理断开后 close 可能抛错，忽略 */
     }

@@ -86,6 +86,11 @@ private:
     // 上一次 update() 的系统时间戳，单位 ms。
     uint32_t previous_time = 0;
 
+    // // 陀螺残余零偏，单位 deg/s；finish_init 静止采样得到，update 每拍从航向中扣除。
+    // float gyro_bias = 0.0f;
+    // // 零偏补偿的计时起点（finish_init 时刻），单位 us，与传入 update 的 now 同时基。
+    // uint32_t heading_origin = 0;
+
     // reset() 时起始航向 heading_start 的正余弦，update() 用它把全局坐标投影回起点方向
     float cos_i = 1.0f; // 起始航向的余弦，用于计算从起点开始的位移
     float sin_i = 0.0f; // 起始航向的正弦，用于计算从起点开始的位移

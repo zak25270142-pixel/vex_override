@@ -45,6 +45,12 @@
       <span>演示</span>
     </label>
 
+    <!-- 自动连接：打开页面 / 断线后自动重连已授权的串口设备 -->
+    <label class="demo-switch" title="打开页面或断线后自动重连已授权串口（首次需手动选口授权）">
+      <input type="checkbox" :checked="autoConnect" @change="onAutoConnectChange" />
+      <span>自动连接</span>
+    </label>
+
     <!-- 连接链路：未选口时可先选口，再连接；已连接可断开 -->
     <div class="conn-group">
       <button
@@ -70,6 +76,7 @@
 
 <script setup lang="ts">
 import {
+  autoConnect,
   commStats,
   connState,
   connected,
@@ -79,6 +86,7 @@ import {
   fetchTunable,
   pickPort,
   serialSupported,
+  setAutoConnect,
   setDemoMode,
   statusText,
   toggleConnect,
@@ -87,6 +95,10 @@ import DiagnosticsDialog from '@/components/shell/DiagnosticsDialog.vue'
 
 function onDemoChange(e: Event): void {
   void setDemoMode((e.target as HTMLInputElement).checked)
+}
+
+function onAutoConnectChange(e: Event): void {
+  setAutoConnect((e.target as HTMLInputElement).checked)
 }
 </script>
 
