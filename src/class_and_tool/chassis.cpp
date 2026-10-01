@@ -91,7 +91,7 @@ void Chassis::update(uint32_t now)
 
     // 读取惯性传感器航向，并按距起点的时间扣除零偏累计量（静止时修正航向保持0）
     float new_heading = static_cast<float>(inertial_sensor.rotation(vex::rotationUnits::deg));
-       // - gyro_bias * (now - heading_origin) / 1000000.0f;
+    // - gyro_bias * (now - heading_origin) / 1000000.0f;
     heading_change = new_heading - heading;
     // 转换为弧度
     float rotation_change = heading_change * deg_to_rad; // 单位 rad

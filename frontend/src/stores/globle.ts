@@ -28,7 +28,7 @@ import {
   type CmdDirItem,
   type RxEvent,
 } from '@/services/protocol'
-import { CHANNELS, PLOT_WINDOW_S, TRACE_BUF_CAP } from '@/config/workspace'
+import { CHANNELS, FAST_PERIOD, PLOT_WINDOW_S, TRACE_BUF_CAP } from '@/config/workspace'
 import type { WorkView } from '@/config/workspace'
 
 /* ===== 连接 ===== */
@@ -207,23 +207,64 @@ export const channelCfg = reactive<ChannelAxisCfg[]>(
   CHANNELS.map(() => ({ windowS: PLOT_WINDOW_S, yAuto: true, yMin: 0, yMax: 1 })),
 )
 
+/**
+ * 追踪量强制高速档：加入通道时先记下用户原挡位，再升到高速（100Hz），
+ * 导出宽表才能按 10ms 节拍对齐；取消追踪时还原原挡位。
+ * 用 sendSubscribe（不写持久化意向），避免自动提速污染用户的订阅设置
+ */
+const traceOrigSubs = new Map<number, { sub: boolean; fast: boolean }>()
+
 /** 改动某通道已有槽位的追踪项：raw='' 移除该槽，否则换成新 index（同通道禁重复） */
 export function pickTrace(ch: number, slot: number, raw: string): void {
   const list = channelTraces[ch]!
+  const before = tracedIndices()
   if (raw === '') {
     list.splice(slot, 1)
-    return
+  } else {
+    const index = Number(raw)
+    if (list.some((v, k) => k !== slot && v === index)) return
+    if (slot < list.length) list[slot] = index
+    else if (list.length < TRACE_MAX) list.push(index)
   }
-  const index = Number(raw)
-  if (list.some((v, k) => k !== slot && v === index)) return
-  if (slot < list.length) list[slot] = index
-  else if (list.length < TRACE_MAX) list.push(index)
+  syncTraceSubs(before, tracedIndices())
 }
 
 /** 末尾空槽添加追踪项（raw='' 是占位"未选择"，忽略） */
 export function addTrace(ch: number, raw: string): void {
   if (raw === '') return
   pickTrace(ch, channelTraces[ch]!.length, raw)
+}
+
+/** 当前被任一通道追踪的 index 集合 */
+function tracedIndices(): Set<number> {
+  const s = new Set<number>()
+  for (const list of channelTraces) for (const i of list) s.add(i)
+  return s
+}
+
+/** 新加入追踪的量提速、取消追踪的量还原（同一量被多通道共享，只在整个集合里增删时动手） */
+function syncTraceSubs(before: Set<number>, after: Set<number>): void {
+  for (const idx of after) {
+    if (before.has(idx)) continue
+    rememberTraceOrigin(idx)
+    void sendSubscribe(idx, true, true)
+  }
+  for (const idx of before) {
+    if (after.has(idx)) continue
+    const orig = traceOrigSubs.get(idx)
+    traceOrigSubs.delete(idx)
+    if (orig && !(orig.sub && orig.fast)) void sendSubscribe(idx, orig.sub, orig.fast)
+  }
+}
+
+/** 记录用户原挡位（只记一次）：优先取持久化意向，其次主控当前挡位 */
+function rememberTraceOrigin(idx: number): void {
+  if (traceOrigSubs.has(idx)) return
+  const want = desiredSubs.get(idx)
+  const item = monitorMap[idx]
+  if (want) traceOrigSubs.set(idx, { sub: want.sub, fast: want.fast })
+  else if (item) traceOrigSubs.set(idx, { sub: tagSubscribed(item.tag), fast: tagFast(item.tag) })
+  else traceOrigSubs.set(idx, { sub: true, fast: false })
 }
 
 /* ===== 持久化：订阅意向 + 曲线配置 ===== */
@@ -351,6 +392,13 @@ const seriesBuf = new Map<number, SeriesBuf>()
 const rawLatest: Record<number, CellValue> = {}
 const rawPose = { x: 0, y: 0, yaw: 0 }
 
+/**
+ * x/y/yaw 三个位姿量在主控表里的 index（-1=表里没有）。
+ * 位姿历史不单开缓冲，而是与追踪量共用 seriesBuf（每拍一个样本，天然 100Hz），
+ * 场地图与导出处按它取数。
+ */
+export const poseIndex = reactive({ x: -1, y: -1, yaw: -1 })
+
 /** 该 index 是否被任一通道追踪——只给通道里的量留历史，其余不占内存 */
 function isTraced(index: number): boolean {
   for (const list of channelTraces) if (list.includes(index)) return true
@@ -363,47 +411,109 @@ export function getSeries(index: number): SeriesBuf | undefined {
 }
 
 /**
- * 导出所有通道追踪量的历史为文本（CSV 长表 t,name,value），供丢给 AI / 离线分析。
- * t 为相对导出时刻的秒数（负=过去），与曲线页 x 轴同语义；没有任何数据时返回空串。
+ * 导出追踪量历史为「JSON 元数据头 + 宽表」文本，供丢给 AI 或离线分析。
+ * - 元数据头用 JSON：逐列给出名称与单位（不再区分曲线通道——通道只是给人看的）
+ * - 数据行按主控推送节拍对齐：同一拍到达的量落在同一行，该拍没采到的量记 NaN
+ * - t 为相对导出时刻的秒数（负=过去），与曲线页 x 轴同语义
+ * 没有任何数据时返回空串。
  */
 export function buildExportText(): string {
   const now = performance.now() / 1000
-  const lines: string[] = [
-    `# VEX V5 曲线数据导出 ${new Date().toLocaleString('sv-SE')}`,
-    '# t=相对导出时刻的秒数(0=导出时刻,负=过去)；环形缓冲最多保留最近3分钟',
-  ]
-  for (let ch = 0; ch < channelTraces.length; ch++) {
-    const list = channelTraces[ch]!
-    if (list.length === 0) continue
-    lines.push(
-      `# 通道${ch + 1}: ` +
-        list
-          .map((idx) => {
-            const it = monitorMap[idx]
-            return it ? `${it.name}${it.unit ? `(${it.unit})` : ''}` : `#${idx}`
-          })
-          .join(', '),
-    )
-  }
-  lines.push('t,name,value')
-  let rows = 0
+  // 导出列：位姿 x/y/yaw 优先置于最前（分析里程/轨迹常用），随后是被追踪的量。
+  // 同一量只出一份（位姿被通道追踪时也在其中），只保留真出过历史点的
+  const cols: number[] = []
   const seen = new Set<number>()
+  for (const idx of [poseIndex.x, poseIndex.y, poseIndex.yaw]) {
+    if (idx < 0 || seen.has(idx)) continue
+    seen.add(idx)
+    const buf = seriesBuf.get(idx)
+    if (buf && buf.len > 0) cols.push(idx)
+  }
   for (const list of channelTraces) {
     for (const idx of list) {
-      if (seen.has(idx)) continue // 同一量可被多通道追踪，导出一份即可
+      if (seen.has(idx)) continue
       seen.add(idx)
       const buf = seriesBuf.get(idx)
-      if (!buf || buf.len === 0) continue
-      const name = monitorMap[idx]?.name ?? `#${idx}`
-      const start = (buf.head - buf.len + TRACE_BUF_CAP) % TRACE_BUF_CAP
-      for (let k = 0; k < buf.len; k++) {
-        const pos = (start + k) % TRACE_BUF_CAP
-        lines.push(`${(buf.t[pos]! - now).toFixed(3)},${name},${buf.v[pos]}`)
-      }
-      rows += buf.len
+      if (buf && buf.len > 0) cols.push(idx)
     }
   }
-  return rows > 0 ? lines.join('\n') : ''
+  if (cols.length === 0) return ''
+
+  // 对齐节拍：各序列相邻间隔的中位数里最小的那个（最快的那档就是采样节拍，通常 10ms）
+  let period = FAST_PERIOD
+  let fastest = Infinity
+  for (const idx of cols) {
+    const buf = seriesBuf.get(idx)!
+    if (buf.len < 8) continue
+    const start = bufStart(buf)
+    const gaps: number[] = []
+    for (let k = 1; k < buf.len; k++) {
+      const dt = buf.t[(start + k) % TRACE_BUF_CAP]! - buf.t[(start + k - 1) % TRACE_BUF_CAP]!
+      if (dt > 1e-4) gaps.push(dt)
+    }
+    if (gaps.length < 4) continue
+    gaps.sort((a, b) => a - b)
+    fastest = Math.min(fastest, gaps[gaps.length >> 1]!)
+  }
+  if (Number.isFinite(fastest)) period = Math.min(Math.max(fastest, 1e-3), 10)
+
+  // 归行：row=(t-t0)/period 四舍五入；同一行同一列出现多次时保留最新
+  let t0 = Infinity
+  for (const idx of cols) {
+    const buf = seriesBuf.get(idx)!
+    const start = bufStart(buf)
+    for (let k = 0; k < buf.len; k++) t0 = Math.min(t0, buf.t[(start + k) % TRACE_BUF_CAP]!)
+  }
+  const grid = new Map<number, Map<number, number>>()
+  let lastRow = 0
+  for (const idx of cols) {
+    const buf = seriesBuf.get(idx)!
+    const start = bufStart(buf)
+    for (let k = 0; k < buf.len; k++) {
+      const pos = (start + k) % TRACE_BUF_CAP
+      const r = Math.round((buf.t[pos]! - t0) / period)
+      let row = grid.get(r)
+      if (!row) grid.set(r, (row = new Map<number, number>()))
+      row.set(idx, buf.v[pos]!)
+      if (r > lastRow) lastRow = r
+    }
+  }
+
+  const meta = {
+    format: 'v5-trace',
+    version: 1,
+    exportedAt: new Date().toLocaleString('sv-SE'),
+    note: '宽表：每行一拍，t 为相对导出时刻的秒数(0=导出时刻,负=过去)；该拍未采到的量记 NaN',
+    alignMs: Number((period * 1000).toFixed(3)),
+    t0Ms: Math.round((t0 - now) * 1000),
+    rows: lastRow + 1,
+    columns: cols.map((idx) => {
+      const it = monitorMap[idx]
+      return { index: idx, name: it?.name ?? `#${idx}`, unit: it?.unit ?? '' }
+    }),
+  }
+
+  const lines: string[] = [JSON.stringify(meta)]
+  lines.push(['t', ...cols.map((idx) => `#${idx}`)].join(','))
+  // 均匀输出整段网格（含掉线造成的空拍留 NaN），保证时间轴等间隔、可比对
+  for (let r = 0; r <= lastRow; r++) {
+    const row = grid.get(r)
+    const cells = cols.map((idx) => {
+      const v = row?.get(idx)
+      return v === undefined ? 'NaN' : fmtNum(v)
+    })
+    lines.push([(t0 + r * period - now).toFixed(3), ...cells].join(','))
+  }
+  return lines.join('\n')
+}
+
+function bufStart(buf: SeriesBuf): number {
+  return (buf.head - buf.len + TRACE_BUF_CAP) % TRACE_BUF_CAP
+}
+
+/** 数值转文本：整数原样；浮点按 9 位有效数字输出（float32 无损往返所需），避免冗长尾数刷 token */
+function fmtNum(v: number): string {
+  return Number.isInteger(v) ? String(v) : String(Number(v.toPrecision(9)))
 }
 
 /* ===== 协议解析 ===== */
@@ -412,9 +522,12 @@ const parser = new FrameParser()
 function clearMonitorData(): void {
   for (const k of Object.keys(monitorMap)) delete monitorMap[Number(k)]
   for (const k of Object.keys(monitorLatest)) delete monitorLatest[Number(k)]
-  seriesBuf.clear()
+  seriesBuf.clear() // 位姿历史也在 seriesBuf 里，一并清掉
   parser.resetMonitorTypes()
   pose.valid = false
+  poseIndex.x = -1
+  poseIndex.y = -1
+  poseIndex.yaw = -1
 }
 
 /** 清空调参待确认状态（重取目录 / 断开时用） */
@@ -441,8 +554,16 @@ function handleEvent(e: RxEvent): void {
       parser.setMonitorType(item.index, item.type)
       monitorMap[item.index] = item
       monitorLatest[item.index] = item.value
-      // 目录帧能到达即证明主控程序已就绪，此时补发订阅最稳妥
-      restoreSubscription(item)
+      if (isTraced(item.index)) {
+        // 追踪中的量强制高速（导出对齐用）；原挡位记下，取消追踪时还原。
+        // 目录帧能到达即证明主控就绪，此刻提速最稳妥（不受冷启动丢帧影响）
+        rememberTraceOrigin(item.index)
+        restoredSubs.add(item.index) // 已被追踪，不再按持久化意向重复补发
+        if (!tagFast(item.tag)) void sendSubscribe(item.index, true, true)
+      } else {
+        // 目录帧能到达即证明主控程序已就绪，此时补发订阅最稳妥
+        restoreSubscription(item)
+      }
     }
     pushDiag(
       'EVT',
@@ -477,9 +598,13 @@ function handleEvent(e: RxEvent): void {
   const item = monitorMap[index]
   rawLatest[index] = e.value
 
-  if (typeof e.value === 'number' && isTraced(index)) {
-    // 只给被通道追踪的量留历史；t 存绝对接收时刻（秒），显示/导出时换算成"距现在"，
-    // 实现示波器式右对齐时间轴。环形缓冲写满即覆盖最旧点
+  // x/y/yaw 按语义种类识别（不依赖名字）
+  const kind = item ? tagKind(item.tag) : MonitorKind.None
+
+  if (typeof e.value === 'number' && (isTraced(index) || kind !== MonitorKind.None)) {
+    // 留历史的两类量：①被通道追踪的（画曲线/导出）②位姿 x/y/yaw（场地图/导出）。
+    // t 存绝对接收时刻（秒），显示/导出时换算成"距现在"，实现示波器式右对齐时间轴。
+    // 每帧一个样本，跟随主控推送节拍（高速区 10ms 即 100Hz）。环形缓冲写满即覆盖最旧点
     let buf = seriesBuf.get(index)
     if (!buf) {
       buf = { t: new Float64Array(TRACE_BUF_CAP), v: new Float64Array(TRACE_BUF_CAP), head: 0, len: 0 }
@@ -491,16 +616,15 @@ function handleEvent(e: RxEvent): void {
     if (buf.len < TRACE_BUF_CAP) buf.len++
   }
 
-  // x/y/yaw 按语义种类识别（不依赖名字）
-  if (item && typeof e.value === 'number') {
-    const kind = tagKind(item.tag)
+  if (typeof e.value === 'number') {
     if (kind === MonitorKind.PosX) rawPose.x = e.value
     else if (kind === MonitorKind.PosY) rawPose.y = e.value
     else if (kind === MonitorKind.Yaw) rawPose.yaw = e.value
   }
 }
 
-/** 50ms 把高频缓冲搬运到响应式状态（表格数值、场地位姿以 20fps 刷新足够），
+/** 50ms 把高频缓冲搬运到响应式状态（表格数值、场地位姿以 20fps 刷新足够，
+    位姿历史本身已由 seriesBuf 按 100Hz 逐帧记下，这里只搬"当前值"），
     同时搬运解析器计数（高频数据不逐帧触发响应式） */
 setInterval(() => {
   for (const k of Object.keys(rawLatest)) {
@@ -515,10 +639,14 @@ setInterval(() => {
   commStats.badChecksum = parser.stats.badChecksum
   commStats.unknownCmd = parser.stats.unknownCmd
   commStats.overflow = parser.stats.overflow
-  const item3 = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.PosX)
-  const item4 = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.PosY)
-  const item5 = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.Yaw)
-  if (item3 || item4 || item5) {
+  // 位姿三量的 index 只在目录变动后重算；场地图/导出靠它从 seriesBuf 取历史
+  const idxX = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.PosX)?.index ?? -1
+  const idxY = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.PosY)?.index ?? -1
+  const idxYaw = Object.values(monitorMap).find((it) => tagKind(it.tag) === MonitorKind.Yaw)?.index ?? -1
+  if (idxX !== poseIndex.x) poseIndex.x = idxX
+  if (idxY !== poseIndex.y) poseIndex.y = idxY
+  if (idxYaw !== poseIndex.yaw) poseIndex.yaw = idxYaw
+  if (idxX >= 0 || idxY >= 0 || idxYaw >= 0) {
     pose.x = rawPose.x
     pose.y = rawPose.y
     pose.yaw = rawPose.yaw
@@ -648,16 +776,13 @@ export async function sendCommand(index: number, values: CellValue[]): Promise<v
 }
 
 /* ===== 动作：订阅 / 退订（同一条 Subscribe，sub=false 即退订） ===== */
-export async function setSubscription(index: number, sub: boolean, fast: boolean): Promise<void> {
-  if (!connected.value) return
+/** 发订阅帧并本地同步 tag 位（只覆盖 SUB/FAST 两位）；不写持久化意向，供自动提速复用 */
+async function sendSubscribe(index: number, sub: boolean, fast: boolean): Promise<boolean> {
+  if (!connected.value) return false // 未连接不发，避免自动提速在离线时刷错误日志
   const label = sub ? (fast ? '高速' : '低速') : '未订阅'
   const ok = await sendFrame(subscribe(index, sub, fast), `订阅 #${index}→${label}`)
-  if (!ok) return
-  // 记录订阅意向（含退订），重连后按 index 自动恢复
-  desiredSubs.set(index, { sub, fast: sub && fast })
-  savePrefs({ subs: Object.fromEntries(desiredSubs) })
-  // 等主控目录/推送侧自然印证即可；发送成功才本地先改，避免失败时界面说谎。
-  // 本地只覆盖 SUB/FAST 两位，GETTER/KIND 等本机位与下位机 merge 语义保持一致
+  if (!ok) return false
+  // 发送成功才本地先改，避免失败时界面说谎；GETTER/KIND 等本机位保持不动
   if (monitorMap[index]) {
     const old = monitorMap[index]!.tag
     monitorMap[index]!.tag =
@@ -665,6 +790,15 @@ export async function setSubscription(index: number, sub: boolean, fast: boolean
       (sub ? MONITOR_TAG_SUB : 0) |
       (fast ? MONITOR_TAG_FAST : 0)
   }
+  return true
+}
+
+export async function setSubscription(index: number, sub: boolean, fast: boolean): Promise<void> {
+  if (!connected.value) return
+  if (!(await sendSubscribe(index, sub, fast))) return
+  // 记录订阅意向（含退订），重连后按 index 自动恢复
+  desiredSubs.set(index, { sub, fast: sub && fast })
+  savePrefs({ subs: Object.fromEntries(desiredSubs) })
 }
 
 /* ===== 动作：写调参（SetTunable，以 TunableEcho 回显为确认） ===== */

@@ -1,4 +1,4 @@
-﻿#include "my_main.h"
+#include "my_main.h"
 #include "menu_func.h"
 #include "key_set.h"
 #include "LCD_menu.h"
@@ -31,6 +31,35 @@ const struct MENU_ITEM menu_item[] =
         {"L_dy_dz", type_float, &left_motors.dynamic_deadzone, "左动摩擦", "V"},
         {"R_st_dz", type_float, &right_motors.static_deadzone, "右静摩擦", "V"},
         {"R_dy_dz", type_float, &right_motors.dynamic_deadzone, "右动摩擦", "V"},
+
+        // ========== 电压映射（速度环归一输出 → 四路实际电压）==========
+        // V = 摩擦 + volt_min + |out|·(volt_max-摩擦-volt_min)·volt_factor
+        {"L_vmin0", type_float, &left_motors.volt_min[0], "左0最小电压", "V"},
+        {"L_vmin1", type_float, &left_motors.volt_min[1], "左1最小电压", "V"},
+        {"L_vmin2", type_float, &left_motors.volt_min[2], "左2最小电压", "V"},
+        {"L_vmin3", type_float, &left_motors.volt_min[3], "左3最小电压", "V"},
+        {"R_vmin0", type_float, &right_motors.volt_min[0], "右0最小电压", "V"},
+        {"R_vmin1", type_float, &right_motors.volt_min[1], "右1最小电压", "V"},
+        {"R_vmin2", type_float, &right_motors.volt_min[2], "右2最小电压", "V"},
+        {"R_vmin3", type_float, &right_motors.volt_min[3], "右3最小电压", "V"},
+        {"L_vmax0", type_float, &left_motors.volt_max[0], "左0最大电压", "V"},
+        {"L_vmax1", type_float, &left_motors.volt_max[1], "左1最大电压", "V"},
+        {"L_vmax2", type_float, &left_motors.volt_max[2], "左2最大电压", "V"},
+        {"L_vmax3", type_float, &left_motors.volt_max[3], "左3最大电压", "V"},
+        {"R_vmax0", type_float, &right_motors.volt_max[0], "右0最大电压", "V"},
+        {"R_vmax1", type_float, &right_motors.volt_max[1], "右1最大电压", "V"},
+        {"R_vmax2", type_float, &right_motors.volt_max[2], "右2最大电压", "V"},
+        {"R_vmax3", type_float, &right_motors.volt_max[3], "右3最大电压", "V"},
+        {"L_vf0", type_float, &left_motors.volt_factor[0], "左0电压系数", ""},
+        {"L_vf1", type_float, &left_motors.volt_factor[1], "左1电压系数", ""},
+        {"L_vf2", type_float, &left_motors.volt_factor[2], "左2电压系数", ""},
+        {"L_vf3", type_float, &left_motors.volt_factor[3], "左3电压系数", ""},
+        {"R_vf0", type_float, &right_motors.volt_factor[0], "右0电压系数", ""},
+        {"R_vf1", type_float, &right_motors.volt_factor[1], "右1电压系数", ""},
+        {"R_vf2", type_float, &right_motors.volt_factor[2], "右2电压系数", ""},
+        {"R_vf3", type_float, &right_motors.volt_factor[3], "右3电压系数", ""},
+        {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
+        {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
 
         // ========== 位置环 ==========
         {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},

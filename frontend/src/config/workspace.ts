@@ -25,5 +25,8 @@ export const TRACE_BUF_CAP = 18000 // 每条追踪曲线的环形缓冲容量（
 export const PLOT_REFRESH_MS = 50 // 图表 20fps 批量刷新，避免逐点重绘
 export const PLOT_WINDOW_S = 10 // X 轴默认滑动窗口
 
+/* ===== 导出对齐 ===== */
+export const FAST_PERIOD = 0.01 // 主控高速区推送节拍，单位秒（LCD_menu 每 10ms 一拍）；导出宽表按它对齐
+
 /** 主视图分页：参数表 / 曲线 / 场地图 / 视觉（预留） */
 export type WorkView = 'params' | 'chart' | 'map' | 'vision'

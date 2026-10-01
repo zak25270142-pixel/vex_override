@@ -442,6 +442,10 @@ void USB_Comm::tx_tick()
     // 在tick即将从255溢出回0前检查一次：本周期见过Ping就保持/恢复认可，没见过则断链停推。
     if (tick == 255)
     {
+        // 掉线只在"上周期认可、本周期没见Ping"的边沿通知一次：
+        // 直接调注入的回调（本线程=主循环10ms，回调内只做快速收车，不阻塞）
+        if (link_ok && !ping_seen && on_link_lost != nullptr)
+            on_link_lost();
         link_ok = ping_seen;
         ping_seen = false; // 清零，开始统计下一个周期
     }

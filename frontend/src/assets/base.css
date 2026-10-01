@@ -64,6 +64,7 @@
   --map-robot: #ff5050;
   --map-robot-edge: #ffc8c8;
   --map-reference: rgba(140, 140, 190, 0.8);
+  --map-trail: rgba(90, 220, 255, 0.85);
 
   /* ===== 布局 ===== */
   --app-header-height: 52px;

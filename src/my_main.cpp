@@ -51,6 +51,16 @@ static void fast_thread()
 }
 static vex::event fast_thread_event(fast_thread);
 
+// 心跳掉线 failsafe（作为回调注入 comm，检测与处置解耦）：
+// 上位机断线时只在底盘空闲态（说明车在跑上位机直控0x84/0x85）替它收车；
+// is_busy（自动动作/手柄手动）期间上位机本就没有控制权，一律不打断。
+// 调用点是 comm.tx_tick()，与下面 my_while 同一主循环线程，无并发问题。
+static void comm_link_lost_handler()
+{
+    if (!robot_action.is_busy())
+        robot_action.stop_move();
+}
+
 void my_Init()
 { // main.cpp while 前
     robot_action.init();
@@ -60,6 +70,7 @@ void my_Init()
     key_init1();
     pre_menu_init();
     comm.init();
+    comm.on_link_lost = comm_link_lost_handler; // 装配掉线收车回调（comm 本身不认机器人组件）
 
     while (!robot_action.is_ready())
         Delay(20);

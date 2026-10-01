@@ -177,6 +177,11 @@ public:
     // 上位机改过调参的脏标志：Set_Tunable写入成功后由rx置true，本类只置不读不清。
     bool tunable_dirty = false;
 
+    // 心跳掉线回调：tx_tick 巡视发现 link_ok 由真变假的当拍同步调用一次，nullptr=不通知。
+    // 调用点在主循环10ms线程（tx_tick 由 my_while 调用），回调内禁止阻塞，只做快速收车；
+    // 由顶层装配（my_Init）注入。
+    void (*on_link_lost)() = nullptr;
+
     // 接收任务：阻塞在read()上等字节（O_NONBLOCK实测无效），字节一到就喂拼帧状态机，
     // 收齐完整帧立即执行。函数内部死循环，必须由独立vex任务调用，不要在主周期里轮询。
     void rx_task();
