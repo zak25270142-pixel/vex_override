@@ -36,6 +36,12 @@ export interface ChartPrefs {
   bigView: boolean
 }
 
+/** 右栏布局：宽度占工作区比例 + 是否折叠 */
+export interface LayoutPrefs {
+  rightWidthPct: number
+  rightCollapsed: boolean
+}
+
 export interface Prefs {
   autoConnect: boolean
   demo: boolean
@@ -43,6 +49,7 @@ export interface Prefs {
   /** monitor index → 订阅档位（含退订，用于对抗主控默认订阅位） */
   subs: Record<number, SubEntry>
   chart: ChartPrefs
+  layout: LayoutPrefs
 }
 
 function defaultChart(): ChartPrefs {
@@ -54,8 +61,24 @@ function defaultChart(): ChartPrefs {
   }
 }
 
+/** 右栏宽度比例取值范围，与 App.vue 拖拽手柄的钳制保持一致 */
+export const RIGHT_WIDTH_MIN = 0.12
+export const RIGHT_WIDTH_MAX = 0.4
+export const RIGHT_WIDTH_DEFAULT = 0.25
+
+function defaultLayout(): LayoutPrefs {
+  return { rightWidthPct: RIGHT_WIDTH_DEFAULT, rightCollapsed: false }
+}
+
 export function defaultPrefs(): Prefs {
-  return { autoConnect: true, demo: false, port: null, subs: {}, chart: defaultChart() }
+  return {
+    autoConnect: true,
+    demo: false,
+    port: null,
+    subs: {},
+    chart: defaultChart(),
+    layout: defaultLayout(),
+  }
 }
 
 /* ===== 字段校验（storage 是系统边界，脏数据一律回落到默认值） ===== */
@@ -133,6 +156,15 @@ function readChart(raw: unknown): ChartPrefs {
   }
 }
 
+function readLayout(raw: unknown): LayoutPrefs {
+  const def = defaultLayout()
+  if (!raw || typeof raw !== 'object') return def
+  const o = raw as Partial<LayoutPrefs>
+  let pct = typeof o.rightWidthPct === 'number' ? o.rightWidthPct : def.rightWidthPct
+  pct = Math.min(RIGHT_WIDTH_MAX, Math.max(RIGHT_WIDTH_MIN, pct))
+  return { rightWidthPct: pct, rightCollapsed: asBool(o.rightCollapsed, def.rightCollapsed) }
+}
+
 function readPrefs(): Prefs {
   const def = defaultPrefs()
   let raw: Partial<Prefs> | null = null
@@ -149,6 +181,7 @@ function readPrefs(): Prefs {
     port: readPort(raw.port),
     subs: readSubs(raw.subs),
     chart: readChart(raw.chart),
+    layout: readLayout(raw.layout),
   }
 }
 

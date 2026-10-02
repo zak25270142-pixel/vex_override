@@ -59,7 +59,7 @@ export const MONITOR_TAG_FAST = 0x40 // bit6：高速区（每拍）还是低速
 export const MONITOR_TAG_GETTER = 0x20 // bit5：值为下位机 float() 函数取数（只读，不占用 RAM 指针）
 export const MONITOR_TAG_KIND_MASK = 0x07 // bit2~0：语义种类
 
-/** 语义种类（tag & KIND_MASK），位置量由前端自动订阅并喂给场地图 */
+/** 语义种类（tag & KIND_MASK）：位置量由场地图按 kind 取数喂图，订阅档位与普通量一样可自由切换 */
 export const enum MonitorKind {
   None = 0,
   PosX = 1,
@@ -199,6 +199,28 @@ function decodeValue(d: DataView, off: number, type: ValueType, le = true): Cell
 
 function getUint8OrZero(d: DataView, off: number): number {
   return off < d.byteLength ? d.getUint8(off) : 0
+}
+
+/* float32 往返比较用的复用缓冲：JS 数字都是 double，1.2f 进来就是 1.2000000476837158，
+   判"短写法是否无损"要靠重新编码回 float32 比对比特，而不是直接比 double */
+const f32Buf = new DataView(new ArrayBuffer(4))
+function f32Bits(v: number): number {
+  f32Buf.setFloat32(0, v, true)
+  return f32Buf.getUint32(0, true)
+}
+
+/**
+ * 把解出的 float32 值转成最短十进制串：逐位增加有效数字（1~9），
+ * 第一个「parseFloat 后再编码为 float32 与原值逐位相同」的写法即采用。
+ * 这样 1.2f 显示成 "1.2" 而不是 "1.2000000476837158"，且再下发/记录仍是同一个 float32。
+ */
+export function formatFloat32(v: number): string {
+  if (!Number.isFinite(v)) return String(v)
+  for (let p = 1; p <= 9; p++) {
+    const s = v.toPrecision(p)
+    if (f32Bits(Number(s)) === f32Bits(v)) return String(Number(s))
+  }
+  return String(v)
 }
 
 /**

@@ -112,15 +112,10 @@
       </template>
     </svg>
 
-    <!-- 数值读数 -->
-    <div v-if="pose.valid" class="readout">
-      <div><span>X</span><b>{{ pose.x.toFixed(3) }}</b><em>m</em></div>
-      <div><span>Y</span><b>{{ pose.y.toFixed(3) }}</b><em>m</em></div>
-      <div><span>Yaw</span><b>{{ normYaw.toFixed(1) }}</b><em>°</em></div>
-    </div>
+    <!-- 数值读数已迁至右栏「场景数据」标签，地图区只留图形 -->
 
     <!-- 未收到 x/y/yaw 时的提示 -->
-    <div v-else class="hint">
+    <div v-if="!pose.valid" class="hint">
       <template v-if="!connected">尚未连接 V5，请在标题栏连接（或勾选“演示”）</template>
       <template v-else>
         尚未收到全局坐标 X / Y / Yaw。<br />
@@ -189,14 +184,6 @@ const trailPoints = computed(() => {
   if (out[out.length - 1] !== last) out.push(last)
   return out.join(' ')
 })
-
-/** 读数统一显示成 ±180 */
-const normYaw = computed(() => {
-  let a = pose.yaw % 360
-  if (a > 180) a -= 360
-  if (a < -180) a += 360
-  return a
-})
 </script>
 
 <style scoped>
@@ -219,45 +206,6 @@ const normYaw = computed(() => {
   height: 100%;
   max-width: 100%;
   max-height: 100%;
-}
-
-.readout {
-  position: absolute;
-  left: 18px;
-  top: 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 12px 16px;
-  background: rgba(6, 20, 35, 0.78);
-  border: var(--border-subtle);
-  border-radius: var(--radius);
-  font-family: var(--font-mono);
-  font-size: 16px;
-}
-
-.readout div {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.readout span {
-  width: 38px;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.readout b {
-  color: var(--text-bright);
-  font-weight: 700;
-  min-width: 92px;
-}
-
-.readout em {
-  font-style: normal;
-  font-size: 11px;
-  color: var(--text-muted);
 }
 
 .hint {

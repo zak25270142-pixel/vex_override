@@ -55,17 +55,17 @@
             :key="it.index"
             :class="{
               'row--sub': paramTable === 'monitor' && tagSubscribed(it.tag),
-              'row--sel': paramTable === 'tunable' && selectedTunableIndex === it.index,
-              'row--clickable': paramTable === 'tunable',
+              'row--sel': isRowSel(it.index),
+              'row--clickable': true,
             }"
-            :title="paramTable === 'tunable' ? '单击在右侧面板修改' : undefined"
-            @click="paramTable === 'tunable' && (selectedTunableIndex = it.index)"
+            :title="paramTable === 'tunable' ? '单击在右栏底部修改' : '单击在右栏底部查看实时值/订阅'"
+            @click="onRowClick(it.index)"
           >
             <td class="c-idx">{{ it.index }}</td>
             <td class="c-name">{{ it.name }}</td>
             <td class="c-type">{{ typeName(it.type) }}</td>
             <td class="c-value">
-              <!-- ===== 调参表：只读展示，单击行到右侧面板编辑；下发后等回显期间显等待 ===== -->
+              <!-- ===== 调参表：只读展示，单击行到右栏底部缩略卡编辑；下发后等回显期间显等待 ===== -->
               <template v-if="paramTable === 'tunable'">
                 <span v-if="pendingTunable.has(it.index)" class="ack" title="已下发，等待主控回显确认">
                   等待确认…
@@ -76,7 +76,7 @@
                     {{ it.value }}
                   </label>
                   <template v-else>
-                    {{ formatValue(it, it.value) }}<span v-if="it.unit" class="val-unit">{{ it.unit }}</span>
+                    <span class="val-num">{{ formatValue(it, it.value) }}</span><span v-if="it.unit" class="val-unit">{{ it.unit }}</span>
                   </template>
                 </template>
               </template>
@@ -88,28 +88,27 @@
                   {{ displayValue(it.index, it.value) }}
                 </span>
                 <template v-else>
-                  {{ formatValue(it, displayValue(it.index, it.value))
-                  }}<span v-if="it.unit" class="val-unit">{{ it.unit }}</span>
+                  <span class="val-num">{{ formatValue(it, displayValue(it.index, it.value)) }}</span><span v-if="it.unit" class="val-unit">{{ it.unit }}</span>
                 </template>
               </template>
             </td>
             <!-- 订阅：实参表才有；徽标标当前档位（灰=未订阅/黄=低速/青=高速），右侧两按钮按当前档位切换 -->
-            <td v-if="paramTable === 'monitor'" class="c-sub">
+            <td v-if="paramTable === 'monitor'" class="c-sub" @click.stop>
               <div class="sub-cell">
                 <template v-if="!tagSubscribed(it.tag)">
                   <span class="sub-state sub-state--off"><i />未订阅</span>
-                  <button class="sub-btn sub-btn--slow" @click="onSub(it.index, false)">订阅低速</button>
-                  <button class="sub-btn sub-btn--fast" @click="onSub(it.index, true)">订阅高速</button>
+                  <button class="sub-btn sub-btn--slow" @click.stop="onSub(it.index, false)">订阅低速</button>
+                  <button class="sub-btn sub-btn--fast" @click.stop="onSub(it.index, true)">订阅高速</button>
                 </template>
                 <template v-else-if="tagFast(it.tag)">
                   <span class="sub-state sub-state--fast"><i />高速</span>
-                  <button class="sub-btn sub-btn--off" @click="onUnsub(it.index)">退订</button>
-                  <button class="sub-btn sub-btn--slow" @click="onSub(it.index, false)">降级低速</button>
+                  <button class="sub-btn sub-btn--off" @click.stop="onUnsub(it.index)">退订</button>
+                  <button class="sub-btn sub-btn--slow" @click.stop="onSub(it.index, false)">降级低速</button>
                 </template>
                 <template v-else>
                   <span class="sub-state sub-state--slow"><i />低速</span>
-                  <button class="sub-btn sub-btn--off" @click="onUnsub(it.index)">退订</button>
-                  <button class="sub-btn sub-btn--fast" @click="onSub(it.index, true)">升级高速</button>
+                  <button class="sub-btn sub-btn--off" @click.stop="onUnsub(it.index)">退订</button>
+                  <button class="sub-btn sub-btn--fast" @click.stop="onSub(it.index, true)">升级高速</button>
                 </template>
               </div>
             </td>
@@ -129,6 +128,9 @@ import {
   monitorLatest,
   paramTable,
   pendingTunable,
+  selectMonitor,
+  selectTunable,
+  selectedMonitorIndex,
   selectedTunableIndex,
   setSubscription,
   visibleRows,
@@ -137,6 +139,22 @@ import {
 /** 调参表没有实时推送，显示目录帧里带的初始值；实参表显示实时值 */
 function displayValue(index: number, fallback: CellValue): CellValue {
   return paramTable.value === 'monitor' ? (monitorLatest[index] ?? fallback) : fallback
+}
+
+/** 当前行是否被选中（调参表看 selectedTunableIndex，实参表看 selectedMonitorIndex） */
+function isRowSel(index: number): boolean {
+  return paramTable.value === 'tunable'
+    ? selectedTunableIndex.value === index
+    : selectedMonitorIndex.value === index
+}
+
+/** 行点击：再点同一行取消选中；不同行选中并互斥 */
+function onRowClick(index: number): void {
+  if (paramTable.value === 'tunable') {
+    selectTunable(selectedTunableIndex.value === index ? null : index)
+  } else {
+    selectMonitor(selectedMonitorIndex.value === index ? null : index)
+  }
 }
 
 /** 订阅（fast=true 高速约10ms，false 低速约80ms）；与退订同走一条 Subscribe 命令 */
@@ -238,15 +256,19 @@ async function onUnsub(index: number): Promise<void> {
 
 .ptable {
   width: 100%;
+  /* 面板过窄时横向滚动，而不是把列挤瘪 */
+  min-width: 740px;
   border-collapse: collapse;
   font-size: 14px;
+  /* 固定布局：列宽由下面的 width 决定，数值刷新时列不会左右晃 */
+  table-layout: fixed;
 }
 
 .ptable thead th {
   position: sticky;
   top: 0;
   z-index: 1;
-  padding: 10px 14px;
+  padding: 10px 20px;
   text-align: left;
   font-size: 12px;
   letter-spacing: 0.1em;
@@ -256,10 +278,12 @@ async function onUnsub(index: number): Promise<void> {
 }
 
 .ptable tbody td {
-  padding: 9px 14px;
+  padding: 9px 20px;
   color: var(--text-primary);
   border-bottom: var(--border-subtle);
   font-variant-numeric: tabular-nums;
+  text-align: left; /* 数据左对齐，不再挤在最右 */
+  vertical-align: middle;
 }
 
 .ptable tbody tr:hover {
@@ -287,30 +311,49 @@ async function onUnsub(index: number): Promise<void> {
 }
 
 .c-idx {
-  width: 60px;
+  width: 64px;
   color: var(--text-muted);
 }
 
+/* 名称列吃掉剩余宽度，过长的名字省略号 */
+.c-name {
+  width: auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .c-type {
-  width: 110px;
+  width: 160px;
   color: var(--text-secondary);
   font-family: var(--font-mono);
   font-size: 12.5px;
 }
 
+/* 值列定宽：数值位数来回变也不影响其它列 */
 .c-value {
+  width: 280px;
   font-family: var(--font-mono);
+}
+
+/* 数值左对齐 + 单位紧跟，高速波动时数值位置稳定（tabular-nums 等宽数字） */
+.val-num {
+  display: inline-block;
+  text-align: left;
 }
 
 /* 值直接挂的单位：小一号、弱化，与数值留点气口 */
 .val-unit {
+  display: inline-block;
+  width: 2.5em;
   margin-left: 5px;
+  text-align: left;
   font-size: 11.5px;
   color: var(--text-muted);
 }
 
 .c-sub {
-  width: 232px;
+  width: 235px;
 }
 
 /* 状态徽标 + 两个按钮同一行排开 */

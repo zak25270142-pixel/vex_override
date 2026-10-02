@@ -6,17 +6,7 @@
       <span v-if="focusCh !== null" class="chart-view__focus">
         当前：通道{{ focusCh + 1 }}（{{ channelTraces[focusCh]!.length }}/4 条曲线）
       </span>
-      <span class="chart-view__tip">点击分图选中通道，在右侧添加追踪曲线（每通道最多 4 条）</span>
-
-      <!-- 大图模式曲线占满宽，配置改为浮层，按需呼出 -->
-      <button
-        v-if="bigView"
-        class="chart-view__drawer"
-        :disabled="focusCh === null"
-        @click="scopeDrawer = !scopeDrawer"
-      >
-        通道设置
-      </button>
+      <span class="chart-view__tip">点击分图选中通道，在右侧「曲线设置」添加追踪曲线（每通道最多 4 条）</span>
 
       <!-- 导出通道追踪历史（环形缓冲内最近3分钟）为 txt，供离线/AI 分析 -->
       <button class="chart-view__export" title="导出通道追踪数据（最近3分钟）为 txt 文件" @click="onExport">
@@ -30,19 +20,22 @@
     </div>
 
     <div class="chart-view__body">
-      <div v-show="bigView" ref="bigEl" class="chart-view__big" />
+      <div v-show="bigView" class="chart-view__big">
+        <div ref="bigEl" class="chart-view__canvas" />
+        <div v-if="hint" class="hint-card">{{ hint }}</div>
+      </div>
       <div v-show="!bigView" class="chart-view__grid">
         <div
           v-for="(ch, i) in CHANNELS"
           :key="ch.id"
-          :ref="(el) => setSepEl(el, i)"
           class="chart-view__cell"
           :class="{ 'is-focus': focusCh === i }"
           @click="focusCh = i"
-        />
+        >
+          <div :ref="(el) => setSepEl(el, i)" class="chart-view__canvas" />
+          <div v-if="cellHint(i)" class="hint-card">{{ cellHint(i) }}</div>
+        </div>
       </div>
-      <!-- 不同状态下的引导提示（不挡点击） -->
-      <div v-if="hint" class="chart-view__hint">{{ hint }}</div>
     </div>
   </div>
 </template>
@@ -70,7 +63,7 @@ import {
   getSeries,
   monitorMap,
   plottableItems,
-  scopeDrawer,
+  rightCollapsed,
   statusText,
 } from '@/stores/globle'
 
@@ -99,17 +92,24 @@ let timer: ReturnType<typeof setInterval> | null = null
 
 const SLOTS = [0, 1, 2, 3]
 
-/** 盖层提示：连接 / 订阅 / 选中 / 加曲线 的分步引导 */
+/** 大图小卡片提示：仅在大图无曲线数据时显示；已有曲线绝不遮挡 */
 const hint = computed(() => {
   if (!connected.value) return '尚未连接 V5，请在标题栏连接（或勾选“演示”）'
   if (plottableItems.value.length === 0)
     return '还没有可绘制的监听量，请先在「参数表-实参表」订阅低速/高速档位'
-  if (bigView.value && focusCh.value === null) return '请先在分图中点击一个通道，再查看大图'
-  if (focusCh.value === null) return '点击任一分图选中通道，然后在右侧面板添加追踪曲线'
+  if (focusCh.value === null) return '请先在分图中点击一个通道，再查看大图'
   if (channelTraces[focusCh.value]!.length === 0)
-    return '该通道还没有追踪曲线，请在右侧面板添加（每通道最多 4 条）'
+    return '该通道还没有追踪曲线，请在右侧「曲线设置」添加'
   return ''
 })
+
+/** 分图小卡片提示：仅在该通道无曲线时显示；已有曲线的通道不遮挡 */
+function cellHint(i: number): string {
+  if (!connected.value) return ''
+  if (plottableItems.value.length === 0) return ''
+  if (channelTraces[i]!.length > 0) return ''
+  return '点击选中本通道，在右侧「曲线设置」添加追踪曲线'
+}
 
 function setSepEl(el: Element | ComponentPublicInstance | null, i: number) {
   if (el instanceof HTMLDivElement) sepEls[i] = el
@@ -270,14 +270,10 @@ function refresh() {
   }
 }
 
-/** 选中通道 / 切换模式 / 改配置 / 增删曲线时立即补一帧，不等 50ms 节拍 */
-watch([focusCh, bigView], () => refresh())
+/** 选中通道 / 切换模式 / 折叠右栏 / 改配置 / 增删曲线时立即补一帧，不等 50ms 节拍 */
+watch([focusCh, bigView, rightCollapsed], () => refresh())
 watch(channelCfg, () => refresh(), { deep: true })
 watch(channelTraces, () => refresh(), { deep: true })
-// 切换选中通道时收起大图模式下的配置浮层
-watch(focusCh, () => {
-  scopeDrawer.value = false
-})
 
 /* ===== 导出：保存文件对话框优先从桌面开始，不支持的浏览器退回普通下载 ===== */
 interface SaveWritable {
@@ -395,31 +391,6 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 
-/* 大图模式下呼出配置浮层的按钮 */
-.chart-view__drawer {
-  flex-shrink: 0;
-  height: 26px;
-  padding: 0 12px;
-  font-size: 12px;
-  font-family: inherit;
-  font-weight: 700;
-  color: var(--accent);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-border);
-  border-radius: var(--radius);
-  text-shadow: 0 0 8px rgba(79, 224, 255, 0.35);
-  cursor: pointer;
-}
-
-.chart-view__drawer:hover:not(:disabled) {
-  background: rgba(79, 224, 255, 0.24);
-}
-
-.chart-view__drawer:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
 /* 导出按钮：与工具栏其余按钮同高度的中性描边样式 */
 .chart-view__export {
   flex-shrink: 0;
@@ -476,12 +447,19 @@ onBeforeUnmount(() => {
 }
 
 .chart-view__big {
+  position: relative;
   width: 100%;
   height: 100%;
   border: var(--border-panel);
   border-radius: var(--radius);
   background: var(--chart-surface);
   overflow: hidden;
+}
+
+/* ECharts 独占的纯画布节点：ref 只绑它，提示卡等叠加层放外层，避免与 canvas 抢容器 */
+.chart-view__canvas {
+  width: 100%;
+  height: 100%;
 }
 
 .chart-view__grid {
@@ -495,6 +473,7 @@ onBeforeUnmount(() => {
 }
 
 .chart-view__cell {
+  position: relative;
   min-width: 0;
   min-height: 0;
   border: var(--border-panel);
@@ -515,16 +494,22 @@ onBeforeUnmount(() => {
   box-shadow: 0 0 12px rgba(79, 224, 255, 0.35), inset 0 0 12px rgba(79, 224, 255, 0.08);
 }
 
-.chart-view__hint {
+/* 小卡片提示：只在无曲线的区域出现，居中小卡片、不铺满、不挡操作（pointer-events 穿透） */
+.hint-card {
   position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 24px;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  max-width: 80%;
+  padding: 10px 16px;
+  font-size: 12.5px;
+  line-height: 1.7;
   text-align: center;
-  font-size: 15px;
   color: var(--text-muted);
-  background: rgba(7, 25, 45, 0.55);
+  background: rgba(6, 20, 35, 0.82);
+  border: var(--border-subtle);
+  border-radius: var(--radius);
   pointer-events: none;
 }
 </style>

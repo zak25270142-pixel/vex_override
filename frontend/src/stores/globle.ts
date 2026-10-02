@@ -4,7 +4,13 @@
  */
 import { computed, reactive, ref, watch } from 'vue'
 import { serialClient } from '@/services/serialClient'
-import { loadPrefs, savePrefs } from '@/services/persist'
+import {
+  loadPrefs,
+  savePrefs,
+  RIGHT_WIDTH_DEFAULT,
+  RIGHT_WIDTH_MAX,
+  RIGHT_WIDTH_MIN,
+} from '@/services/persist'
 import {
   FrameParser,
   MONITOR_TAG_FAST,
@@ -21,6 +27,7 @@ import {
   tagFast,
   tagKind,
   tagSubscribed,
+  formatFloat32,
   typeName,
   valueSize,
   type CellValue,
@@ -170,11 +177,26 @@ export const monitorMap = reactive<Record<number, DirItem>>({})
 export const commandMap = reactive<Record<number, CmdDirItem>>({})
 /** 已发出 SetTunable、尚未收到回显确认的调参项 index（右侧面板显示"等待确认"） */
 export const pendingTunable = reactive(new Set<number>())
-/** 参数表单击选中的调参项 index（右侧面板据此显示编辑卡片）；null=未选中，右侧保持任务下发 */
+/** 参数表单击选中的调参项 index（右侧底部缩略卡据此编辑）；null=未选中 */
 export const selectedTunableIndex = ref<number | null>(null)
 export const selectedTunableItem = computed<DirItem | null>(() =>
   selectedTunableIndex.value === null ? null : (tunableMap[selectedTunableIndex.value] ?? null),
 )
+/** 实参表单击选中的监控量 index（右侧底部缩略卡据此查看实时值/订阅/5s 简图）；null=未选中 */
+export const selectedMonitorIndex = ref<number | null>(null)
+export const selectedMonitorItem = computed<DirItem | null>(() =>
+  selectedMonitorIndex.value === null ? null : (monitorMap[selectedMonitorIndex.value] ?? null),
+)
+
+/** 选中互斥：同时只保留一个缩略卡焦点，后点的覆盖前一个 */
+export function selectTunable(index: number | null): void {
+  selectedTunableIndex.value = index
+  if (index !== null) selectedMonitorIndex.value = null
+}
+export function selectMonitor(index: number | null): void {
+  selectedMonitorIndex.value = index
+  if (index !== null) selectedTunableIndex.value = null
+}
 /** index→超时计时器：超时还没收到 TunableEcho 就判失败，避免一直转圈 */
 const setTimers = new Map<number, number>()
 const SET_ACK_TIMEOUT_MS = 2000
@@ -191,10 +213,43 @@ export const TRACE_MAX = 4
 export const channelTraces = reactive<number[][]>(CHANNELS.map(() => []))
 /** 当前在右栏配置 / 大图查看的通道，null=未选中 */
 export const focusCh = ref<number | null>(null)
-/** 显示模式：false=2×2分图，true=选中通道大图（大图占满宽，配置卡默认收起为浮层） */
+/** 显示模式：false=2×2分图，true=选中通道大图 */
 export const bigView = ref(false)
-/** 大图模式下配置浮层是否展开（切通道自动收起） */
-export const scopeDrawer = ref(false)
+
+/* ===== 右侧工作区：标签分页 + 折叠 + 可拖拽宽度 ===== */
+/** 右栏标签：context=随主视图变化的上下文面板，command=任务下发，tunable/monitor=迷你列表 */
+export type RightTab = 'command' | 'tunable' | 'monitor' | 'context'
+export const rightTab = ref<RightTab>('command')
+/** 右栏折叠：收成最右侧一条竖条，点一下展开 */
+export const rightCollapsed = ref(false)
+/** 右栏宽度占工作区比例（折叠不改它，展开时恢复上次值） */
+export const rightWidthPct = ref(loadPrefs().layout.rightWidthPct)
+export { RIGHT_WIDTH_DEFAULT, RIGHT_WIDTH_MAX, RIGHT_WIDTH_MIN }
+
+// 切主视图时落到合理默认标签。
+// 折叠状态不随切页重置——折叠条始终可见，用户自己决定何时展开
+watch(view, (v) => {
+  if (v === 'map') rightTab.value = 'context'
+  else if (v === 'chart') rightTab.value = focusCh.value !== null ? 'context' : 'command'
+  else rightTab.value = 'command'
+})
+
+// 选中曲线通道时跳到「曲线设置」标签
+watch(focusCh, (v) => {
+  if (v !== null && view.value === 'chart') rightTab.value = 'context'
+})
+
+// 在调参表/实参表点中一行时，右栏自动跳到对应的详情标签
+watch(selectedTunableIndex, (v) => {
+  if (v !== null && view.value === 'params' && paramTable.value === 'tunable') {
+    rightTab.value = 'tunable'
+  }
+})
+watch(selectedMonitorIndex, (v) => {
+  if (v !== null && view.value === 'params' && paramTable.value === 'monitor') {
+    rightTab.value = 'monitor'
+  }
+})
 
 /** 每通道独立的坐标轴配置（x 时间窗口、y 自动/手动量程） */
 export interface ChannelAxisCfg {
@@ -298,9 +353,10 @@ export function restorePrefs(): void {
     const target = channelCfg[ch]
     if (target) Object.assign(target, c)
   })
-  // 写在最后：watch(focusCh) 会收起浮层，避免刚恢复的展开态被重置
   focusCh.value = prefs.chart.focusCh
   bigView.value = prefs.chart.bigView
+  rightWidthPct.value = prefs.layout.rightWidthPct
+  rightCollapsed.value = prefs.layout.rightCollapsed
 }
 
 /** 曲线配置改动即落盘（savePrefs 内部已防抖） */
@@ -319,6 +375,11 @@ watch(
   { deep: true },
 )
 
+/** 右栏宽度/折叠改动即落盘 */
+watch([rightWidthPct, rightCollapsed], () => {
+  savePrefs({ layout: { rightWidthPct: rightWidthPct.value, rightCollapsed: rightCollapsed.value } })
+})
+
 /* ===== 订阅档位展示文案（tag 为位域：先看语义种类，再按订阅位拼档位） ===== */
 export function tagLabel(tag: number): string {
   const kind = tagKind(tag)
@@ -327,12 +388,6 @@ export function tagLabel(tag: number): string {
   if (kind === MonitorKind.Yaw) return '航向'
   if (!tagSubscribed(tag)) return '未订阅'
   return tagFast(tag) ? '高速' : '低速'
-}
-
-/** x/y/yaw 三个语义标记量：连接时即自动订阅，不允许在界面上改档位 */
-export function isPoseTag(tag: number): boolean {
-  const kind = tagKind(tag)
-  return kind === MonitorKind.PosX || kind === MonitorKind.PosY || kind === MonitorKind.Yaw
 }
 
 /** 可绑到曲线通道的监听量：数值类型且当前已订阅（x/y/yaw 也算） */
@@ -391,6 +446,38 @@ interface SeriesBuf {
 const seriesBuf = new Map<number, SeriesBuf>()
 const rawLatest: Record<number, CellValue> = {}
 const rawPose = { x: 0, y: 0, yaw: 0 }
+
+/* ===== 实参缩略卡 5s 简易示波缓冲（仅当前选中的一个 monitor index，不强制提速） ===== */
+const MINI_CAP = 512 // 5s @ 100Hz 足够；环形覆盖最旧点
+const miniBuf: SeriesBuf = {
+  t: new Float64Array(MINI_CAP),
+  v: new Float64Array(MINI_CAP),
+  head: 0,
+  len: 0,
+}
+/** 缩略卡读取的缓冲快照接口（与曲线 SeriesBuf 同结构） */
+export interface MiniSeries {
+  t: Float64Array
+  v: Float64Array
+  head: number
+  len: number
+  cap: number
+}
+export function getMiniSeries(): MiniSeries {
+  return { ...miniBuf, cap: MINI_CAP }
+}
+function miniPush(t: number, v: number): void {
+  miniBuf.t[miniBuf.head] = t
+  miniBuf.v[miniBuf.head] = v
+  miniBuf.head = (miniBuf.head + 1) % MINI_CAP
+  if (miniBuf.len < MINI_CAP) miniBuf.len++
+}
+function miniClear(): void {
+  miniBuf.head = 0
+  miniBuf.len = 0
+}
+// 选中监控量变化时清空缓冲，避免上一个量的残留画进新量
+watch(selectedMonitorIndex, () => miniClear())
 
 /**
  * x/y/yaw 三个位姿量在主控表里的 index（-1=表里没有）。
@@ -489,7 +576,12 @@ export function buildExportText(): string {
     rows: lastRow + 1,
     columns: cols.map((idx) => {
       const it = monitorMap[idx]
-      return { index: idx, name: it?.name ?? `#${idx}`, unit: it?.unit ?? '' }
+      return {
+        index: idx,
+        name: it?.name ?? `#${idx}`,
+        unit: it?.unit ?? '',
+        type: it ? typeName(it.type) : 'unknown',
+      }
     }),
   }
 
@@ -500,7 +592,8 @@ export function buildExportText(): string {
     const row = grid.get(r)
     const cells = cols.map((idx) => {
       const v = row?.get(idx)
-      return v === undefined ? 'NaN' : fmtNum(v)
+      if (v === undefined) return 'NaN'
+      return fmtTrace(v, monitorMap[idx]?.type)
     })
     lines.push([(t0 + r * period - now).toFixed(3), ...cells].join(','))
   }
@@ -511,9 +604,15 @@ function bufStart(buf: SeriesBuf): number {
   return (buf.head - buf.len + TRACE_BUF_CAP) % TRACE_BUF_CAP
 }
 
-/** 数值转文本：整数原样；浮点按 9 位有效数字输出（float32 无损往返所需），避免冗长尾数刷 token */
-function fmtNum(v: number): string {
-  return Number.isInteger(v) ? String(v) : String(Number(v.toPrecision(9)))
+/**
+ * 导出单元格转文本。float 列用「最短但重新编码仍是同一个 float32」的写法
+ *（1.2f 写 1.2 而不是 1.20000005，精度一位不丢）；double 走 JS 自带最短写法；
+ * 整数类型直接取整，不带小数点
+ */
+function fmtTrace(v: number, type: ValueType | undefined): string {
+  if (type === ValueType.Float) return formatFloat32(v)
+  if (type === ValueType.Double) return String(v)
+  return String(Math.trunc(v))
 }
 
 /* ===== 协议解析 ===== */
@@ -620,6 +719,8 @@ function handleEvent(e: RxEvent): void {
     if (kind === MonitorKind.PosX) rawPose.x = e.value
     else if (kind === MonitorKind.PosY) rawPose.y = e.value
     else if (kind === MonitorKind.Yaw) rawPose.yaw = e.value
+    // 实参缩略卡的 5s 简图：只存当前选中的那一个量，不强制提速，独立于曲线通道
+    if (index === selectedMonitorIndex.value) miniPush(performance.now() / 1000, e.value)
   }
 }
 
@@ -671,6 +772,7 @@ serialClient.onStatus = (state, message) => {
     stopPing() // 断开/连接中/出错都停心跳，避免向已关闭的端口写
     clearPendingTunable() // 待确认的写参也全部作废
     selectedTunableIndex.value = null
+    selectedMonitorIndex.value = null
   }
 }
 serialClient.onData = (data) => {
@@ -748,6 +850,7 @@ export async function fetchMonitor(): Promise<void> {
     return
   }
   clearMonitorData()
+  selectedMonitorIndex.value = null // 表刷新，缩略卡一并关闭
   statusText.value = '已发送实参表请求，等待主控回传…'
   const ok = await sendFrame(requestMonitor(), '请求实参表')
   if (ok) paramTable.value = 'monitor'
@@ -824,12 +927,26 @@ export async function setTunableValue(index: number, value: CellValue): Promise<
   )
 }
 
-/** 数值显示格式化：浮点保留3位小数，整数原样 */
+/** 数值显示格式化：浮点固定 3 位小数（防位数跳动），整数原样，bool/onoff 显开关 */
 export function formatValue(item: DirItem, v: CellValue): string {
   if (typeof v === 'string') return v // color: #RRGGBB
   if (item.type === ValueType.Bool || item.type === ValueType.OnOff) return v ? '开' : '关'
   if (item.type === ValueType.Float || item.type === ValueType.Double) {
-    return Number.isInteger(v) ? String(v) : v.toFixed(3)
+    return Number(v).toFixed(3)
   }
   return String(v)
+}
+
+/** 迷你列表用的紧凑数值格式：4 位有效数字，极大/极自动用科学计数法 */
+export function formatValueCompact(item: DirItem, v: CellValue): string {
+  if (typeof v === 'string') return v
+  if (item.type === ValueType.Bool || item.type === ValueType.OnOff) return v ? '开' : '关'
+  if (typeof v !== 'number') return String(v)
+  if (v === 0) return '0'
+  const abs = Math.abs(v)
+  // 绝对值在 0.001~9999 之间用定点，否则科学计数法，统一 4 位有效数字
+  if (abs >= 0.001 && abs < 10000) {
+    return Number(v.toPrecision(4)).toString()
+  }
+  return v.toExponential(3) // 4 位有效数字 = 指数后 3 位
 }

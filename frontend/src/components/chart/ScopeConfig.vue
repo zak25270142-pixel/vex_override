@@ -1,12 +1,7 @@
 <template>
-  <!-- 右侧30%通道配置卡：追踪曲线（实时值+单位）、横轴时间窗口、纵轴量程粒度。
-       App 用 :key 按通道号强制重建，故本组件内草稿只需按挂载时的通道初始化一次 -->
+  <!-- 右栏「曲线设置」标签内容：追踪曲线（实时值+单位）、横轴时间窗口、纵轴量程粒度。
+       RightWorkbench 用 :key 按通道号强制重建，故本组件内草稿只需按挂载时的通道初始化一次 -->
   <aside class="scope-panel">
-    <div class="scope-panel__head">
-      <span class="scope-panel__title">通道 {{ ch + 1 }} · 曲线设置</span>
-      <button class="back-btn" title="收起配置卡" @click="focusCh = null">× 返回</button>
-    </div>
-
     <div class="scope-panel__body">
       <!-- 追踪曲线：每槽一个选择器，右侧显示该量当前值与单位 -->
       <section class="blk">
@@ -123,7 +118,7 @@ import {
   plottableItems,
 } from '@/stores/globle'
 
-/** 挂载时必有选中通道（App 的 v-if 保证）；:key 随通道变化整体重建 */
+/** 挂载时必有选中通道（RightWorkbench 的 v-if 保证）；:key 随通道变化整体重建 */
 const ch = computed(() => focusCh.value!)
 const cfg = computed(() => channelCfg[ch.value]!)
 const traces = computed(() => channelTraces[ch.value]!)
@@ -210,37 +205,6 @@ function commitYRange(): void {
   border-radius: var(--radius);
   background: var(--surface-panel);
   overflow: hidden;
-}
-
-.scope-panel__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px;
-  border-bottom: var(--border-panel);
-  flex-shrink: 0;
-}
-
-.scope-panel__title {
-  font-size: 14.5px;
-  font-weight: 700;
-  color: var(--text-primary);
-}
-
-.back-btn {
-  padding: 2px 8px;
-  font-size: 12px;
-  font-family: inherit;
-  color: var(--text-muted);
-  background: transparent;
-  border: var(--border-subtle);
-  border-radius: var(--radius);
-  cursor: pointer;
-}
-
-.back-btn:hover {
-  color: var(--text-bright);
-  border-color: var(--accent-border);
 }
 
 .scope-panel__body {
