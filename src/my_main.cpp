@@ -83,39 +83,6 @@ void my_Init()
     screen_refresh_event.broadcast();
     comm_rx_event.broadcast();     // 接收任务：调度器就绪后启动
     fast_thread_event.broadcast(); // 5ms速度环任务
-
-    // left_motors.motors[0]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // left_motors.motors[0]->stop(vex::brakeType::coast);
-    // Delay(1000);
-    // left_motors.motors[1]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // left_motors.motors[1]->stop(vex::brakeType::coast);
-    // Delay(1000);
-    // left_motors.motors[2]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // left_motors.motors[2]->stop(vex::brakeType::coast);
-    // Delay(1000);
-    // left_motors.motors[3]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // left_motors.motors[3]->stop(vex::brakeType::coast);
-    // Delay(1000);
-    // right_motors.motors[0]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // right_motors.motors[0]->stop(vex::brakeType::coast);
-    // Delay(1000);
-    // right_motors.motors[1]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // right_motors.motors[1]->stop(vex::brakeType::coast);
-    // Delay(1000);
-    // right_motors.motors[2]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // right_motors.motors[2]->stop(vex::brakeType::coast);
-    // Delay(1000);
-    // right_motors.motors[3]->spin(vex::directionType::fwd, 10, vex::voltageUnits::volt);
-    // Delay(1000);
-    // right_motors.motors[3]->stop(vex::brakeType::coast);
-    // Delay(5000);
 }
 
 void my_while()

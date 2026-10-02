@@ -1,12 +1,37 @@
 /** 串口客户端单例：在 Web Serial 与演示传输之间切换，业务组件只与本对象打交道 */
 
-import type { ConnState, SerialTransport, TransportCallbacks } from './transport'
-import { WebSerialTransport } from './webSerialTransport'
+import type { ConnState, PortProbe, SerialTransport, TransportCallbacks } from './transport'
+import { ConnectError, WebSerialTransport } from './webSerialTransport'
 import { MockTransport } from './mockTransport'
 import { loadPrefs, savePrefs } from './persist'
+import { FRAME_HEAD, ping } from './protocol'
 
-/** 断线自动重连的间隔：太密会与主控枚举竞争，太疏体感迟钝 */
+/** 口能打开但收不到 Pong 时的重试间隔：设备在、只是用户程序还没起来，尽快接住 */
 const RETRY_MS = 1500
+
+/**
+ * 一个口都打不开（设备不在 / 被 VEXcode 或别的标签页占用）时的退避间隔：
+ * 此时频繁敲门只会抢口，休息几秒给 VS Code 烧录、主控启动留窗口
+ */
+const RETRY_BUSY_MS = 7000
+
+/** 单口探测时长：有线 USB，主控收到 Ping 最迟下一拍（10ms）就回 Pong，200ms 足够 */
+const PROBE_TIMEOUT_MS = 200
+
+/**
+ * 识别 User 口的探测：发心跳 Ping，收到完整 Pong（A5 FF FF）才算这个口对。
+ * 下载口跑 VEXos 自有协议，不会回这三个字节，借此把两个同 VID/PID 的口区分开。
+ */
+const userPortProbe: PortProbe = {
+  frame: ping(),
+  ack: (bytes) => {
+    for (let i = 0; i + 2 < bytes.length; i++) {
+      if (bytes[i] === FRAME_HEAD && bytes[i + 1] === 0xff && bytes[i + 2] === 0xff) return true
+    }
+    return false
+  },
+  timeoutMs: PROBE_TIMEOUT_MS,
+}
 
 /** 缺少用户手势导致的打开失败：静默重试没有意义，需请用户点一次「连接」 */
 function isGestureError(e: unknown): boolean {
@@ -35,6 +60,16 @@ class SerialClient {
   private gestureBlocked = false
   /** 上次转发的状态文案，用于抑制重试期间的重复刷屏 */
   private lastForwarded = ''
+  /** 最近一次连接使用的波特率，掉线/设备重新接入事件触发重试时沿用 */
+  private lastBaud = 115200
+
+  constructor() {
+    // 设备断电恢复 / 重新插好 / 烧录完重启后，系统重新枚举完成才会发 connect 事件：
+    // 这一下比盲轮询更贴时机（Windows 重新枚举本身有 1~3s 延迟），收到立刻试连一次
+    if (this.supported) {
+      navigator.serial.addEventListener('connect', this.handleDeviceBack)
+    }
+  }
 
   /** 当前环境是否支持 Web Serial */
   get supported(): boolean {
@@ -61,7 +96,11 @@ class SerialClient {
   private readonly cb: TransportCallbacks = {
     onStatus: (state, message) => {
       this.state = state
-      if (state === 'connected') this.retryHinted = false
+      if (state === 'connected') {
+        this.retryHinted = false
+        // 连接过程中可能已挂着重试定时器，连上了立刻撤掉，避免成功后空转一拍
+        this.clearRetry()
+      }
       // 只对"重试过程中"反复出现的 connecting/error 去重，避免每 1.5s 刷屏；
       // 重试循环之外的（如意外断开）必须每次都转发，否则界面会一直停留在"已连接"
       if (this.retrying && (state === 'connecting' || state === 'error')) {
@@ -70,6 +109,17 @@ class SerialClient {
         this.lastForwarded = key
       }
       this.onStatus?.(state, message)
+      // 已连接后中途掉线时 attempt() 早已结束，它的 finally 管不到这里，
+      // 必须在掉线这一刻补挂重试循环，否则"断线自动重连"只会在初次连接失败时生效
+      if (
+        state === 'error' &&
+        this.wantConnected &&
+        !this.demo &&
+        this.autoConnectEnabled &&
+        !this.gestureBlocked
+      ) {
+        this.schedule(this.lastBaud)
+      }
     },
     onData: (data) => this.onData?.(data),
   }
@@ -110,6 +160,7 @@ class SerialClient {
     }
     this.wantConnected = true
     this.gestureBlocked = false
+    this.lastBaud = baudRate
     await this.attempt(baudRate)
   }
 
@@ -135,6 +186,7 @@ class SerialClient {
     this.wantConnected = true
     this.gestureBlocked = false
     this.retryHinted = false
+    this.lastBaud = baudRate
     await this.attempt(baudRate)
   }
 
@@ -175,16 +227,20 @@ class SerialClient {
     if (this.retrying) return
     this.retrying = true
     let gestureBlocked = false
+    let busy = false
     try {
       const t = this.transport
       if (t instanceof WebSerialTransport) {
         await t.reacquire()
-        await t.connect(baudRate)
+        // 带 Ping 探测建链：下载口/User 口同 VID/PID，只在回 Pong 的口上落定
+        await t.connect(baudRate, userPortProbe)
       } else if (t) {
         await t.connect(baudRate)
       }
     } catch (e) {
       gestureBlocked = isGestureError(e)
+      // 一个口都打不开才长退避；能打开但没应答说明车在、程序没起，保持快重试
+      busy = e instanceof ConnectError && e.reason === 'busy'
     } finally {
       this.retrying = false
       if (gestureBlocked) {
@@ -192,12 +248,35 @@ class SerialClient {
         this.clearRetry()
         this.cb.onStatus('idle', '设备已就绪，请点击「连接」')
       } else if (this.wantConnected && !this.connected && !this.demo) {
-        this.schedule(baudRate)
+        // 传输层的 error 回调可能已按默认间隔挂了一次重试，这里按失败原因换成正确节奏
+        this.clearRetry()
+        this.schedule(
+          baudRate,
+          busy ? RETRY_BUSY_MS : RETRY_MS,
+          // 只在进入长退避时提示一次，说明接下来不是卡死而是在给烧录/启动让窗口
+          busy ? `设备未接入或串口被占用，${RETRY_BUSY_MS / 1000}s 后再试（给烧录/启动留窗口）…` : undefined,
+        )
       }
     }
   }
 
-  private schedule(baudRate: number): void {
+  /**
+   * 浏览器通知设备已重新接入（connect 事件）。用户本意是要连着的，就立刻试一次，
+   * 不等 1.5s 轮询节拍；自动连接开关只管轮询，"设备刚回来"本身就值得立即响应。
+   * 手动断开（wantConnected=false）或正在尝试中则不插手。
+   */
+  private handleDeviceBack = (): void => {
+    if (!this.wantConnected || this.connected || this.demo || this.retrying) return
+    this.clearRetry()
+    this.gestureBlocked = false
+    void this.attempt(this.lastBaud)
+  }
+
+  /**
+   * 挂下一次重试。delayMs 按失败原因分两档：设备不在/口被占用用长退避（让出烧录窗口），
+   * 其余快重试；hint 非空时替换默认的"正在自动重连"提示。
+   */
+  private schedule(baudRate: number, delayMs = RETRY_MS, hint?: string): void {
     if (
       !this.wantConnected ||
       !this.autoConnectEnabled ||
@@ -207,14 +286,17 @@ class SerialClient {
     ) {
       return
     }
-    if (!this.retryHinted) {
+    if (hint) {
+      this.retryHinted = true
+      this.cb.onStatus('connecting', hint)
+    } else if (!this.retryHinted) {
       this.retryHinted = true
       this.cb.onStatus('connecting', '设备未连接或已断开，正在自动重连…')
     }
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = null
       void this.attempt(baudRate)
-    }, RETRY_MS)
+    }, delayMs)
   }
 
   private clearRetry(): void {
@@ -225,4 +307,11 @@ class SerialClient {
   }
 }
 
-export const serialClient = new SerialClient()
+/**
+ * 单例挂到 globalThis 上复用：Vite HMR 热更新会重新执行本模块，若直接 new，
+ * 旧实例仍持有打开的串口和读循环，新实例 open() 必然 already open，
+ * 表现为"改了代码/刷新后怎么都连不上，非要重启 dev"。整页硬刷新时 globalThis 一并重置。
+ */
+const globalScope = globalThis as unknown as { __v5SerialClient?: SerialClient }
+export const serialClient: SerialClient =
+  globalScope.__v5SerialClient ?? (globalScope.__v5SerialClient = new SerialClient())
