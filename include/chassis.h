@@ -14,8 +14,13 @@ public:
     // 绑定构造传入的四台电机（public：监控 getter 模板直接调 motors[i] 的 SDK 读数）
     vex::motor *motors[4];
 
-    // 电压缩放因子
-    float volt_factor[4] = {1.0f, 1.0f, 1.2f, 1.2f};
+    // 电压缩放因子：让组内四台电机同指令下输出的轮速一致。空载实测（2026-10-02）
+    // 各台斜率 k(pct/V) 有个体差异，且 motor2/3(48齿)经齿轮后轮速 = 轴速/1.2，
+    // 等效轮速斜率 = k/r（r=1直连 / 1.2齿轮）。只能削峰填谷——以全局最慢
+    // 等效轮速为基准，factor = k_min_等效 / (k_i/r_i)，全部 ≤1，
+    // 组内输出上限 1/max(factor) 才不损失极速。
+    // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
+    float volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
     // 判断“要求电压”和“实际电压”是否明显不一致的容差
     float voltage_tolerance = 0.2f;
@@ -26,11 +31,15 @@ public:
     // 速度环全程使用 pct（±100，100 即满速）：目标来自外部指令，反馈直接读电机
     // 电压限幅与映射
     float volt_max[4] = {12.0f, 12.0f, 12.0f, 12.0f}; // 最大电压(实测，空载时)
-    float volt_min[4] = {1.0f, 1.0f, 1.0f, 1.0f};     // 最小电压(实测，空载时)
-    float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
-    float static_deadzone = 2.0f;                     // 克服静摩擦所需电压(整车下,单位V)
-    float dynamic_deadzone = 1.0f;                    // 克服动摩擦所需电压(整车下,单位V)
-    float output_deadzone = 0.1f;                     // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
+    // 每台电机的个体死区补偿：只要有输出就必须垫上的电压，用来对齐各轮
+    // 开始转动的起点，与整车级的 static/dynamic_deadzone 是两回事。
+    // 取值 = 该电机稳定低速运转所需的最低电压（降压扫描测停转点），
+    // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
+    float volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
+    float static_deadzone = 2.0f;                    // 克服静摩擦所需电压(整车下,单位V)
+    float dynamic_deadzone = 1.0f;                   // 克服动摩擦所需电压(整车下,单位V)
+    float output_deadzone = 0.1f;                    // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
 
     // 编码器运动状态确认阈值，直接对原生 rpm 读数判定：
     bool is_moving = false;
@@ -51,7 +60,8 @@ public:
 
     MyMotorGroup(vex::motor &m1, vex::motor &m2,
                  vex::motor &m3, vex::motor &m4,
-                 float f, float p, float ki, float kd);
+                 float f, float p, float ki, float kd,
+                 const float vf[4], const float vmin[4]);
 
     void setStopping(vex::brakeType brake); // 设置电机刹车类型
 

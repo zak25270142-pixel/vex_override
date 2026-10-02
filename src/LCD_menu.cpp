@@ -158,36 +158,36 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"L0_I", []
          { return static_cast<float>(left_motors.motors[0]->current(vex::currentUnits::amp)); }, "左0电流", "A", monitor_tag_slow},
         {"L0_pos", []
-         { return static_cast<float>(left_motors.motors[0]->position(vex::rotationUnits::rev)); }, "左0编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左0转速", "pct", monitor_tag_slow},
         {"L1_I", []
          { return static_cast<float>(left_motors.motors[1]->current(vex::currentUnits::amp)); }, "左1电流", "A", monitor_tag_slow},
         {"L1_pos", []
-         { return static_cast<float>(left_motors.motors[1]->position(vex::rotationUnits::rev)); }, "左1编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[1]->velocity(vex::velocityUnits::pct)); }, "左1转速", "pct", monitor_tag_slow},
         {"L2_I", []
          { return static_cast<float>(left_motors.motors[2]->current(vex::currentUnits::amp)); }, "左2电流", "A", monitor_tag_slow},
         {"L2_pos", []
-         { return static_cast<float>(left_motors.motors[2]->position(vex::rotationUnits::rev)); }, "左2编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[2]->velocity(vex::velocityUnits::pct)); }, "左2转速", "pct", monitor_tag_slow},
         {"L3_I", []
          { return static_cast<float>(left_motors.motors[3]->current(vex::currentUnits::amp)); }, "左3电流", "A", monitor_tag_slow},
         {"L3_pos", []
-         { return static_cast<float>(left_motors.motors[3]->position(vex::rotationUnits::rev)); }, "左3编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[3]->velocity(vex::velocityUnits::pct)); }, "左3转速", "pct", monitor_tag_slow},
 
         {"R0_I", []
          { return static_cast<float>(right_motors.motors[0]->current(vex::currentUnits::amp)); }, "右0电流", "A", monitor_tag_slow},
         {"R0_pos", []
-         { return static_cast<float>(right_motors.motors[0]->position(vex::rotationUnits::rev)); }, "右0编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "右0转速", "pct", monitor_tag_slow},
         {"R1_I", []
          { return static_cast<float>(right_motors.motors[1]->current(vex::currentUnits::amp)); }, "右1电流", "A", monitor_tag_slow},
         {"R1_pos", []
-         { return static_cast<float>(right_motors.motors[1]->position(vex::rotationUnits::rev)); }, "右1编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[1]->velocity(vex::velocityUnits::pct)); }, "右1转速", "pct", monitor_tag_slow},
         {"R2_I", []
          { return static_cast<float>(right_motors.motors[2]->current(vex::currentUnits::amp)); }, "右2电流", "A", monitor_tag_slow},
         {"R2_pos", []
-         { return static_cast<float>(right_motors.motors[2]->position(vex::rotationUnits::rev)); }, "右2编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[2]->velocity(vex::velocityUnits::pct)); }, "右2转速", "pct", monitor_tag_slow},
         {"R3_I", []
          { return static_cast<float>(right_motors.motors[3]->current(vex::currentUnits::amp)); }, "右3电流", "A", monitor_tag_slow},
         {"R3_pos", []
-         { return static_cast<float>(right_motors.motors[3]->position(vex::rotationUnits::rev)); }, "右3编码器", "rev", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[3]->velocity(vex::velocityUnits::pct)); }, "右3转速", "pct", monitor_tag_slow},
 
         // 手柄（手动/Arcade 对照）
         {"axis_Lx", type_int32_t, &left_axis.value[left_axis.value_p].value_x, "左杆X", nullptr, monitor_tag_slow},

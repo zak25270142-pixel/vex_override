@@ -18,12 +18,25 @@ static vex::motor right_chassis_4(vex::PORT9, vex::ratio6_1, true);   // 右后�
 // 后四个为速度环增益（秒量纲，误差单位 pct）：kf 阻力前馈(输出/pct)、kp(输出/pct)、
 // ki(输出/(pct·秒))、kd(输出·秒/pct)。
 // 当前为接通链路用的占位值，两组相同，必须在实车上重新标定后再用于比赛。
+
+// volt_factor / volt_min 逐台实测值（2026-10-02 空载标定）：
+// 目标：同归一指令下各台电机输出的轮速一致。空载斜率 k(pct/V) 有个体差异，
+// 且 motor2/3(48齿)经齿轮传动后轮速 = 电机轴速/1.2，等效轮速斜率 = k/r。
+// volt_min = 各台稳定低速运转最低电压（降压扫描停转点），对齐各轮转动起点。
+// factor 负责"超出 volt_min 后的斜率"：
+//   factor_i = [k_min/r_min × vmax − k_i/r_i × vmin_i] / [k_i/r_i × (vmax − vmin_i)]
+// 其中 vmax=12，基准 = R3 齿轮后 7.42。max(factor)=1.00，上限 1/max 不损极速。
+// 实测停转点: L0=0.35 L1=0.49 L2=0.47 L3=0.47 R0=0.31 R1=0.57 R2=0.49 R3=0.49
+static const float left_volt_factor[4] = {0.73f, 0.72f, 0.95f, 0.85f};
+static const float right_volt_factor[4] = {0.74f, 0.74f, 0.88f, 1.00f};
+static const float left_volt_min[4] = {0.35f, 0.49f, 0.47f, 0.47f};
+static const float right_volt_min[4] = {0.31f, 0.57f, 0.49f, 0.49f};
 MyMotorGroup left_motors(
     left_chassis_1, left_chassis_2, left_chassis_3, left_chassis_4,
-    0.008f, 0.02f, 0.5f, 0.0f);
+    0.008f, 0.02f, 0.5f, 0.0f, left_volt_factor, left_volt_min);
 MyMotorGroup right_motors(
     right_chassis_1, right_chassis_2, right_chassis_3, right_chassis_4,
-    0.008f, 0.02f, 0.5f, 0.0f);
+    0.008f, 0.02f, 0.5f, 0.0f, right_volt_factor, right_volt_min);
 
 // 两个定位轮均已接入底盘里程计；reverse 标志若与实际滚动方向不符，试车时在此翻转。
 static vex::rotation forward_tracking_sensor(vex::PORT6, true);         // 当前已经前进++

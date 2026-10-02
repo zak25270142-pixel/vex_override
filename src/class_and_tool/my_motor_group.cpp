@@ -2,7 +2,9 @@
 
 MyMotorGroup::MyMotorGroup(vex::motor &m1, vex::motor &m2,
                            vex::motor &m3, vex::motor &m4,
-                           float f, float p, float i, float d)
+                           float f, float p, float i, float d,
+                           const float vf[4] = (float[]){1.0f, 1.0f, 1.0f, 1.0f},
+                           const float vmin[4] = (float[]){0.5f, 0.5f, 0.5f, 0.5f})
 {
     // 传入增益按秒量纲标定（误差单位 pct），内部统一换算到 us 时基。
     kf = f;
@@ -13,6 +15,11 @@ MyMotorGroup::MyMotorGroup(vex::motor &m1, vex::motor &m2,
     motors[1] = &m2;
     motors[2] = &m3;
     motors[3] = &m4;
+    for (uint8_t j = 0; j < 4; j++)
+    {
+        volt_factor[j] = vf[j];
+        volt_min[j] = vmin[j];
+    }
 }
 
 void MyMotorGroup::setStopping(vex::brakeType brake)
