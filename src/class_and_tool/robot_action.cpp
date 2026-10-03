@@ -2,10 +2,10 @@
 #include "Control_func.h" // 仅本文件需要访问 Remote_Control 成员，头文件不暴露此依赖
 
 RobotAction::RobotAction(Chassis &chassis_ref,
-                         Remote_Control *left_axis,
-                         Remote_Control *right_axis)
-    : manual_left_axis(left_axis),
-      manual_right_axis(right_axis),
+                         int32_t *move,
+                         int32_t *turn)
+    : move_axis(move),
+      turn_axis(turn),
       chassis(chassis_ref),
       // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
       // ki、kd 按秒计（kp 无量纲）：(kp, ki, kd[, output_limit])
@@ -176,38 +176,20 @@ float RobotAction::square_map_axis(int v)
 {
     // 保留符号的平方：把摇杆小值压低、大值保留，低速更可控。
     // 输入 -127~127，输出 -100~100。
-    // 输入绝对值小于 manual_deadzone 时输出 0；
+    // 输入平方小于 manual_deadzone 时输出 0；
     // 否则把 [deadzone^2, 127^2] 线性映射到 [0, 100]，再加符号。
-    // 平方后的有效范围即 [-(127*127)+deadzone^2, 127*127-deadzone^2]。
-    constexpr int input_max = 127;
-    constexpr int output_max = 100;
-    int abs_v = v < 0 ? -v : v;
-    if (abs_v < manual_deadzone)
-        return 0.0f;
+    // 平方后的有效范围即 [-(127*127)+deadzone, 127*127-deadzone]。
     int sign = v < 0 ? -1 : 1;
-    int squared = abs_v * abs_v;
-    int squared_dz = manual_deadzone * manual_deadzone;
-    int max_squared = input_max * input_max;
-    float out = (float)(squared - squared_dz) / (max_squared - squared_dz) * output_max;
-    return sign * out;
+    int v2 = v * v;
+    if (v2 < manual_deadzone)
+        return 0.0f;
+    return (float)sign * (v2 - manual_deadzone) / (16129 - manual_deadzone) * 100;
 }
 
 void RobotAction::update_manual(uint32_t now)
 {
-    // 手动模式不使用动作 PID，now 仅为统一接力指针签名保留。
-    // 摇杆未注入则无法手动，直接停车回到空闲。
-    if (manual_left_axis == nullptr)
-    {
-        stop_move();
-        return;
-    }
-
-    // Arcade：只用左手摇杆。value_y 为前后、value_x 为左右（见 key_init1 的轴绑定）。
-    int forward_raw = manual_left_axis->value[manual_left_axis->value_p].value_y;
-    int turn_raw = manual_left_axis->value[manual_left_axis->value_p].value_x;
-
-    float forward = square_map_axis(forward_raw);
-    float turn = square_map_axis(turn_raw);
+    float forward = square_map_axis(*move_axis);
+    float turn = square_map_axis(*turn_axis);
 
     // Arcade 合成左右轮指令，square_map_axis 的输出范围为 ±100。
     float left_cmd = forward + turn;
@@ -297,11 +279,6 @@ void RobotAction::stop_move()
 
 void RobotAction::manual()
 {
-    // 进入手动模式：把手柄轴设为 only_value（不触发方向键），
-    // 接力指针指向 update_manual，refresh() 每轮自动执行手动控制。
-    // is_busy() 此后为真，调用方可据此挡住自动动作。
-    manual_left_axis->state = Remote_Control::only_value;
-    if (manual_right_axis != nullptr)
-        manual_right_axis->state = Remote_Control::only_value;
+    // 建议外部手动设置only_value状态,避免误触
     chassis_task_ptr = &RobotAction::update_manual;
 }

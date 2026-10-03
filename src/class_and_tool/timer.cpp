@@ -2,10 +2,6 @@
 
 uint32_t get_time_ms();
 
-void Timer_init()
-{
-}
-
 void Delay(double time)
 { // 延时，单位ms
     vex::wait(time, vex::msec);

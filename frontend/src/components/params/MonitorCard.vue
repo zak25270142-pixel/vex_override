@@ -3,15 +3,15 @@
        曲线在实参标签页选中后的详情页（MonitorDetail）里 -->
   <section class="mon-card">
     <header class="mon-card__head">
-      <span class="mon-card__name">{{ item.name }}</span>
-      <span class="mon-card__idx">#{{ item.index }}</span>
+      <span class="mon-card__name">{{ item!.name }}</span>
+      <span class="mon-card__idx">#{{ item!.index }}</span>
       <button class="mon-card__close" title="关闭" @click="selectMonitor(null)">×</button>
     </header>
 
     <div class="mon-card__body">
       <div class="live">
-        <span class="live__num">{{ formatValue(item, liveValue) }}</span>
-        <i v-if="item.unit" class="live__unit">{{ item.unit }}</i>
+        <span class="live__num">{{ formatValue(item!, liveValue) }}</span>
+        <i v-if="item!.unit" class="live__unit">{{ item!.unit }}</i>
       </div>
 
       <div class="sub">

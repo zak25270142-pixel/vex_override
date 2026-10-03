@@ -70,11 +70,15 @@ import { serialClient } from '@/services/serialClient'
 
 onMounted(() => {
   window.addEventListener('beforeunload', onBeforeUnload)
+  window.addEventListener('pointermove', onPointerMove)
+  window.addEventListener('pointerup', onPointerUp)
   void startup()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', onBeforeUnload)
+  window.removeEventListener('pointermove', onPointerMove)
+  window.removeEventListener('pointerup', onPointerUp)
 })
 
 async function startup(): Promise<void> {
@@ -126,16 +130,6 @@ function onPointerUp(): void {
   document.body.style.cursor = ''
   document.body.style.userSelect = ''
 }
-
-onMounted(() => {
-  window.addEventListener('pointermove', onPointerMove)
-  window.addEventListener('pointerup', onPointerUp)
-})
-
-onBeforeUnmount(() => {
-  window.removeEventListener('pointermove', onPointerMove)
-  window.removeEventListener('pointerup', onPointerUp)
-})
 </script>
 
 <style scoped>

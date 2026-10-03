@@ -48,8 +48,7 @@ Chassis chassis(left_motors, right_motors,
                 inertial_sensor);
 
 // 整机动作实例：main 与自动流程通过它发布任务并周期推进。
-// 手柄摇杆在此绑定，手动控制由 RobotAction 经这两个指针操作。
-RobotAction robot_action(chassis, &left_axis, &right_axis);
+RobotAction robot_action(chassis, &left_axis.value[left_axis.value_p].value_x, &left_axis.value[left_axis.value_p].value_y);
 
 // ===== USB上位机动作命令（0x80~0x86）的薄封装 =====
 // 这些函数在通信rx线程里被直接调用：只做一次memcpy取参+发起动作（动作本体
@@ -145,12 +144,12 @@ static const VALUE_TYPE cmd_ui8_f_type[] = {type_uint8_t, type_float};
 // 本车的动作命令总表：非static供外部链接，LCD_menu.cpp构造comm时整张传入，
 // 与tunable/monitor两张MENU表的注入方式保持一致。
 const CMD_ITEM robot_cmds[] = {
-    {cmd_stop, 0x80, nullptr, nullptr, 0, "停止运动"},
-    {cmd_turn, 0x81, cmd_f_type, (const char *[]){"角度(度)"}, 1, "原地转向"},
-    {cmd_move, 0x82, cmd_f_type, (const char *[]){"距离(米)"}, 1, "直行"},
-    {cmd_goto, 0x83, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, 3, "局部移动"},
-    {cmd_set_volt, 0x84, cmd_ui8_f_type, (const char *[]){"编号(0-3左1-4,4-7右1-4)", "电压(伏)"}, 2, "设置电机电压"},
-    {cmd_set_spin, 0x85, cmd_2f_type, (const char *[]){"左目标速度", "右目标速度"}, 2, "设置底盘目标速度"},
-    {cmd_reset_pos, 0x86, cmd_3f_type, (const char *[]){"坐标x", "坐标y", "航向yaw"}, 3, "重置底盘位置"},
+    {cmd_stop, nullptr, nullptr, 0, "停止运动"},
+    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, 1, "原地转向"},
+    {cmd_move, cmd_f_type, (const char *[]){"距离(米)"}, 1, "直行"},
+    {cmd_goto, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, 3, "局部移动"},
+    {cmd_set_volt, cmd_ui8_f_type, (const char *[]){"编号(0-3左1-4,4-7右1-4)", "电压(伏)"}, 2, "设置电机电压"},
+    {cmd_set_spin, cmd_2f_type, (const char *[]){"左目标速度", "右目标速度"}, 2, "设置底盘目标速度"},
+    {cmd_reset_pos, cmd_3f_type, (const char *[]){"坐标x", "坐标y", "航向yaw"}, 3, "重置底盘位置"},
 };
 const uint8_t robot_cmd_count = sizeof(robot_cmds) / sizeof(robot_cmds[0]);

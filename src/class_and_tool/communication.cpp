@@ -31,16 +31,12 @@ uint8_t USB_Comm::cmd_payload_len(uint8_t cmd)
     return len;
 }
 
-// 命令字必须整段落进0x80~0x9F（不能只看低5位，否则0x00也会误命中），
 // 再在外部传入的命令表里线性找同index项。表最多32条，每帧只查一次，遍历成本可忽略。
 const CMD_ITEM *USB_Comm::find_cmd(uint8_t cmd) const
 {
-    if (cmd < CMD_BASE || cmd >= CMD_BASE + CMD_SLOT_MAX)
+    if (cmd < CMD_BASE || cmd >= CMD_BASE + cmd_count)
         return nullptr;
-    for (uint8_t i = 0; i < cmd_count; i++)
-        if (cmd_items[i].index == cmd)
-            return &cmd_items[i];
-    return nullptr;
+    return &cmd_items[cmd - CMD_BASE];
 }
 
 // 其余成员都在头文件声明处用类内初始化给了初值，构造函数只剩三张表的指针/项数
@@ -242,7 +238,7 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
         const CMD_ITEM *item = &cmd_items[start + k];
 
         uint8_t pos = 2; // payload从tx_frame[2]起拼，最后pos-2就是payload总长
-        tx_frame[pos++] = item->index;
+        tx_frame[pos++] = CMD_BASE + k;
 
         uint8_t name_len = (uint8_t)strlen(item->name);
         if (name_len > CMD_NAME_MAX)

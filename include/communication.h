@@ -40,7 +40,6 @@ typedef void (*CmdFunc)(const uint8_t *p);
 struct CMD_ITEM
 {
     CmdFunc func;                  // 处理函数指针
-    uint8_t index;                 // 命令字，范围0x80~0x9F
     const VALUE_TYPE *data_type;   // 输入字段类型表（无参时可为nullptr）
     const char *const *field_name; // 输入字段中文名表（无参时可为nullptr）
     uint8_t input_num;             // 输入字段数量，上限6
@@ -97,8 +96,8 @@ private:
     static constexpr uint8_t CMD_BASE = 0x80;    // 用户命令段起点，0x80~0x9F共32个合法命令字
     static constexpr uint8_t CMD_SLOT_MAX = 32;  // 合法命令字个数，仅用于收帧时的范围校验
     static constexpr uint8_t CMD_DIR_BATCH = 4;  // 命令目录每拍最多发4条
-    static constexpr uint8_t CMD_NAME_MAX = 24;  // 命令名截断长度（字节）
-    static constexpr uint8_t CMD_FIELD_MAX = 10; // 单个字段名截断长度（字节）
+    static constexpr uint8_t CMD_NAME_MAX = 32;  // 命令名截断长度（字节）
+    static constexpr uint8_t CMD_FIELD_MAX = 24; // 单个字段名截断长度（字节）
     static constexpr uint8_t CMD_INPUT_MAX = 6;  // 单命令参数个数上限
 
     RxState rx_state = WAIT_HEAD;    // 当前处在接收的哪个阶段

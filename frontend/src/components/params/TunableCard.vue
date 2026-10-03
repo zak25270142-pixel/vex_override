@@ -3,8 +3,8 @@
        与任务下发/曲线设置/场景数据同时可见，减少切回参数表 -->
   <section class="tun-card">
     <header class="tun-card__head">
-      <span class="tun-card__name">{{ item.name }}</span>
-      <span class="tun-card__idx">#{{ item.index }}</span>
+      <span class="tun-card__name">{{ item!.name }}</span>
+      <span class="tun-card__idx">#{{ item!.index }}</span>
       <button class="tun-card__close" title="关闭" @click="selectTunable(null)">×</button>
     </header>
 
@@ -13,13 +13,13 @@
       <div class="current">
         <span class="current__label">当前值</span>
         <span class="current__value">
-          {{ formatValue(item, item.value) }}
-          <i v-if="item.unit">{{ item.unit }}</i>
+          {{ formatValue(item!, item!.value) }}
+          <i v-if="item!.unit">{{ item!.unit }}</i>
         </span>
       </div>
 
       <!-- str/other 只读 -->
-      <template v-if="valueSize(item.type) > 0">
+      <template v-if="valueSize(item!.type) > 0">
         <div class="edit-row">
           <!-- 布尔 -->
           <label v-if="isBool" class="bool-row">
@@ -28,7 +28,7 @@
           </label>
 
           <!-- 颜色 -->
-          <div v-else-if="item.type === ValueType.Color" class="color-row">
+          <div v-else-if="item!.type === ValueType.Color" class="color-row">
             <input v-model="draftColor" class="color-edit" type="color" :disabled="waiting" />
             <span class="color-hex">{{ draftColor.toUpperCase() }}</span>
           </div>
@@ -44,7 +44,7 @@
               @input="errorMsg = ''"
               @keyup.enter="onSubmit"
             />
-            <span v-if="item.unit" class="num-suffix">{{ item.unit }}</span>
+            <span v-if="item!.unit" class="num-suffix">{{ item!.unit }}</span>
           </div>
 
           <button class="submit-btn" :disabled="waiting || !connected" @click="onSubmit">
