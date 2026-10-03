@@ -238,7 +238,7 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
         const CMD_ITEM *item = &cmd_items[start + k];
 
         uint8_t pos = 2; // payload从tx_frame[2]起拼，最后pos-2就是payload总长
-        tx_frame[pos++] = CMD_BASE + k;
+        tx_frame[pos++] = static_cast<uint8_t>(CMD_BASE + start + k);
 
         uint8_t name_len = (uint8_t)strlen(item->name);
         if (name_len > CMD_NAME_MAX)

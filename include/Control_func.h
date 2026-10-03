@@ -86,14 +86,6 @@ public:
 // 手柄摇杆类
 class Remote_Control
 {
-private:
-    struct t_v_list
-    {
-        uint32_t time;   // ms级时间
-        int32_t value_x; // 按杆x轴值
-        int32_t value_y; // 按杆y轴值
-    };
-
 public:
     enum STATE
     {
@@ -110,11 +102,13 @@ public:
     Control_key *left_state = nullptr;
     Control_key *right_state = nullptr;
     Remote_Control() {}
-    t_v_list value[8] = {0};
-    uint8_t value_p = 0;         // t_v_list[p]返回最新一次记录的摇杆x与y
+    // 最新摇杆值，refresh每拍写入。地址稳定，需要注入指针的地方
+    // （如RobotAction手动控制、监控菜单）直接绑这两个变量。
+    int32_t now_x = 0;
+    int32_t now_y = 0;
     STATE state = middle;        // only_value时，不触发按键，仅存储value用于底盘控制
     void (*changed)() = nullptr; // 数据更新回调，refresh 写入新值后若非空则调用
-    void refresh(int32_t current_value, int32_t current_value_y);
+    void refresh(int32_t current_value_x, int32_t current_value_y);
     void set_state();
 };
 

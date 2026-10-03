@@ -48,7 +48,7 @@ Chassis chassis(left_motors, right_motors,
                 inertial_sensor);
 
 // 整机动作实例：main 与自动流程通过它发布任务并周期推进。
-RobotAction robot_action(chassis, &left_axis.value[left_axis.value_p].value_x, &left_axis.value[left_axis.value_p].value_y);
+RobotAction robot_action(chassis, &left_axis.now_x, &left_axis.now_y);
 
 // ===== USB上位机动作命令（0x80~0x86）的薄封装 =====
 // 这些函数在通信rx线程里被直接调用：只做一次memcpy取参+发起动作（动作本体

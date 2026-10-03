@@ -189,11 +189,11 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"R3_pos", []
          { return static_cast<float>(right_motors.motors[3]->velocity(vex::velocityUnits::pct)); }, "右3转速", "pct", monitor_tag_slow},
 
-        // 手柄（手动/Arcade 对照）
-        {"axis_Lx", type_int32_t, &left_axis.value[left_axis.value_p].value_x, "左杆X", nullptr, monitor_tag_slow},
-        {"axis_Ly", type_int32_t, &left_axis.value[left_axis.value_p].value_y, "左杆Y", nullptr, monitor_tag_slow},
-        {"axis_Rx", type_int32_t, &right_axis.value[right_axis.value_p].value_x, "右杆X", nullptr, monitor_tag_slow},
-        {"axis_Ry", type_int32_t, &right_axis.value[right_axis.value_p].value_y, "右杆Y", nullptr, monitor_tag_slow},
+        // 手柄（手动/Arcade 对照）。now_x/now_y 是稳定地址，value环形槽会轮转不能直接取地址。
+        {"axis_Lx", type_int32_t, &left_axis.now_x, "左杆X", nullptr, monitor_tag_slow},
+        {"axis_Ly", type_int32_t, &left_axis.now_y, "左杆Y", nullptr, monitor_tag_slow},
+        {"axis_Rx", type_int32_t, &right_axis.now_x, "右杆X", nullptr, monitor_tag_slow},
+        {"axis_Ry", type_int32_t, &right_axis.now_y, "右杆Y", nullptr, monitor_tag_slow},
 };
 
 MENU menu(menu_item,
