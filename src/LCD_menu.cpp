@@ -33,7 +33,8 @@ const struct MENU_ITEM menu_item[] =
         {"R_dy_dz", type_float, &right_motors.dynamic_deadzone, "右动摩擦", "V"},
 
         // ========== 电压映射（速度环归一输出 → 四路实际电压）==========
-        // V = 摩擦 + volt_min + |out|·(volt_max-摩擦-volt_min)·volt_factor
+        // V = 目标方向·(摩擦+volt_min) + out·(volt_max-摩擦-volt_min)·volt_factor
+        // 摩擦垫只认目标方向，out 是双极性连续修正，过零不再翻转摩擦电压
         {"L_vmin0", type_float, &left_motors.volt_min[0], "左0最小电压", "V"},
         {"L_vmin1", type_float, &left_motors.volt_min[1], "左1最小电压", "V"},
         {"L_vmin2", type_float, &left_motors.volt_min[2], "左2最小电压", "V"},
