@@ -26,12 +26,18 @@ static const float left_volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 static const float right_volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 static const float left_volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
 static const float right_volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+// 速度环默认增益（连续摩擦补偿+斜率限制架构下标定）：
+// kf=0.006 前馈按开环 V(tgt)≈1.15+0.065·pct 反推斜率；
+// kp=0.01 使 1pct 量化台阶只产生 ~0.1V 电压扰动；
+// ki=0.1/s 是实测安全上限（0.2 在 tgt10 已积分超调截停）；
+// kd=0 不用（量化反馈下微分只放大噪声）。
+// 摩擦垫 1.5/0.8 是低速/高速折中：3/5pct 刚好起步，20pct 欠速由慢积分补足。
 MyMotorGroup left_motors(
     left_chassis_1, left_chassis_2, left_chassis_3, left_chassis_4,
-    0.008f, 0.02f, 0.5f, 0.0f, left_volt_factor, left_volt_min);
+    0.006f, 0.01f, 0.1f, 0.0f, left_volt_factor, left_volt_min);
 MyMotorGroup right_motors(
     right_chassis_1, right_chassis_2, right_chassis_3, right_chassis_4,
-    0.008f, 0.02f, 0.5f, 0.0f, right_volt_factor, right_volt_min);
+    0.006f, 0.01f, 0.1f, 0.0f, right_volt_factor, right_volt_min);
 
 // 定位轮端口与转向取自旧车工程：PORT1 为前向轮（旧工程 RotationY），
 // PORT2 为侧向轮（旧工程 RotationX），均反转。首次试车需核对滚动方向：

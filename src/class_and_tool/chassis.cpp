@@ -31,9 +31,7 @@ void Chassis::init()
     // 初始化定位轮连的旋转传感器
     forward_tracking_sensor.resetPosition();
     left_tracking_sensor.resetPosition();
-    // 是否运动标识位
-    left_motors.is_moving = false;
-    right_motors.is_moving = false;
+    // 速度环不再用 is_moving 状态机，起步由电压斜率限制和连续摩擦补偿完成
 }
 
 // 是否校准完成(init的等待环)

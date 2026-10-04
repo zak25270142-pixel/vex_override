@@ -1,0 +1,4 @@
+﻿phase,step,L_mean,R_mean,L_std,R_std,note1,note2,note3,note4
+closed_baseline,tgt=5,4.12,4.22,3.68,2.72,err=+0.83,"Vcmd +0.99[+0.00,+3.79]",neg=0.00,flips/s=0.0
+closed_baseline,tgt=10,7.47,7.49,3.66,3.53,err=+2.52,"Vcmd +1.04[+0.00,+3.04]",neg=0.00,flips/s=0.0
+closed_baseline,tgt=20,14.88,14.85,8.80,8.31,err=+5.13,"Vcmd +1.25[+0.00,+3.73]",neg=0.00,flips/s=0.0

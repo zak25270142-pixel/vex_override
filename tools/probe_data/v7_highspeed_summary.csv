@@ -1,0 +1,4 @@
+﻿phase,step,L_mean,R_mean,L_std,R_std,note1,note2,note3,note4
+closed_cand_kf6ki01_mid,tgt=50,31.21,32.02,13.96,15.79,err=+18.38,"Vcmd +4.74[+0.00,+9.70]",neg=0.00,flips/s=0.0
+closed_cand_kf6ki01_mid,tgt=75,31.96,33.19,14.40,16.07,err=+42.43,"Vcmd +4.69[+0.00,+9.71]",neg=0.00,flips/s=0.0
+closed_cand_kf6ki01_mid,tgt=100,32.59,33.67,14.21,16.04,err=+66.87,"Vcmd +4.68[+0.00,+9.69]",neg=0.00,flips/s=0.0

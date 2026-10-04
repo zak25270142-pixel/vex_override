@@ -61,6 +61,8 @@ const struct MENU_ITEM menu_item[] =
         {"R_vf3", type_float, &right_motors.volt_factor[3], "右3电压系数", ""},
         {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
+        {"L_slew", type_float, &left_motors.slew_rate, "左电压斜率", "V/s"},
+        {"R_slew", type_float, &right_motors.slew_rate, "右电压斜率", "V/s"},
 
         // ========== 位置环 ==========
         {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},

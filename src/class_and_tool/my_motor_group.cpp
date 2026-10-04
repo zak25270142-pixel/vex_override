@@ -83,55 +83,34 @@ void MyMotorGroup::my_spin()
         for (uint8_t i = 0; i < 4; i++)
         {
             volt_output[i] = 0.0f;
+            prev_volt[i] = 0.0f;
             motors[i]->spin(vex::directionType::fwd, 0.0f, vex::voltageUnits::volt);
         }
         return;
     }
 
-    // 两个量各司其职：rpm 是编码器原生物理量，只用于运动状态迟滞判定（阈值按 rpm 标定）；
+    // 两个量各司其职：rpm 是编码器原生物理量，只用于积分冻结判定；
     // pct 与目标同口径，只用于 PID 误差。
     const float speed = filtered_speed;
     const float speed_rpm = static_cast<float>(velocity());
     const float abs_speed = fabsf(speed_rpm);
 
-    // 目标换向视同重新起步：清积分、重挂起步助力，避免旧方向积分带着车冲过零点。
+    // 目标换向视同重新起步：清积分、清电压历史，避免旧方向积分带着车冲过零点。
     const int8_t new_target_sign = target > 0.0f ? 1 : -1;
     if (target_sign != 0 && new_target_sign != target_sign)
     {
         integral = 0.0f;
-        is_moving = false;
-        boost_start_us = now_us;
-        stop_since_us = 0;
+        for (uint8_t i = 0; i < 4; i++)
+            prev_volt[i] = 0.0f;
     }
     target_sign = new_target_sign;
 
-    // ---------- 静/动摩擦：带时间迟滞的一次性起步助力 ----------
-    // 静止时挂静摩擦电压；确认转动、或静摩擦挂满 boost_max_time 仍未转，都切到动摩擦
-    // （超时未转说明静摩擦给小了，切到动摩擦基准后由积分平滑补压，而不是一直硬顶）。
-    // 运动中只有转速连续 stop_rearm_time 低于停转阈值才回切静摩擦：
-    // SDK 低速读数在 0 和量化值之间来回跳，逐样本切换会让摩擦电压以 1V 幅度抖动，
-    // 这正是低速粘滑震颤的来源之一。
-    if (is_moving)
-    {
-        if (abs_speed <= stopped_confirm_speed)
-        {
-            if (stop_since_us == 0)
-                stop_since_us = now_us;
-            else if (now_us - stop_since_us >= stop_rearm_time)
-            {
-                is_moving = false;
-                boost_start_us = now_us;
-                stop_since_us = 0;
-                integral = 0.0f;
-            }
-        }
-        else
-            stop_since_us = 0;
-    }
-    else if (abs_speed >= moving_confirm_speed || now_us - boost_start_us >= boost_max_time)
-        is_moving = true;
-
-    const float friction = is_moving ? dynamic_deadzone : static_deadzone;
+    // ---------- 连续摩擦补偿：随目标速度从 static 连续过渡到 dynamic ----------
+    // 不再用 is_moving 状态机切换：target 小→补偿接近 static（起步需要高电压），
+    // target 大→补偿接近 dynamic（高速只需要克服动摩擦），全程无电压跳变。
+    // 原来 1.0↔2.5V 的跳变恰好落在位置环末端爬行区（2~5pct），是粘滑振荡主因。
+    const float friction = dynamic_deadzone +
+                           (static_deadzone - dynamic_deadzone) * expf(-fabsf(target) / 3.0f);
 
     const float error = target - speed;
     const float derivative = (error - previous_error) / static_cast<float>(dt_us);
@@ -152,9 +131,9 @@ void MyMotorGroup::my_spin()
     // 先把本轮误差计入候选积分并算出候选输出，饱和判据直接用上面的真实电压饱和点，
     // 与最终输出限幅完全一致，不会出现“电压已被削、积分还在堆”的脱节。
     // 已饱和但误差方向能帮助退出饱和时，仍允许积分（与位置环 PositionPID 同一套规则）。
-    // 堵转（仍挂着静摩擦）期间整段冻结：突破静摩擦前误差恒为满值，积分若累积，
-    // 会在车动起来的瞬间一次性释放造成前冲；把车推离静止是静摩擦电压的职责。
-    if (is_moving)
+    // 转速极低（|rpm| < 3，即原 stopped_confirm_speed）时冻结：
+    // 起步/换向瞬间车还没动，误差恒为满值，积分若累积会在车动起来的瞬间一次性释放。
+    if (abs_speed >= 3.0f)
     {
         const float candidate_integral = integral + error * static_cast<float>(dt_us);
         const float candidate_output = feedforward + p_output + ki * candidate_integral + d_output;
@@ -181,12 +160,15 @@ void MyMotorGroup::my_spin()
     else if (output < -output_limit)
         output = -output_limit;
 
-    // ---------- 归一输出映射到四路电压：摩擦垫 + 连续修正 ----------
+    // ---------- 归一输出映射到四路电压：连续摩擦垫 + 双极性修正 + 电压斜率限制 ----------
     // 摩擦垫只认目标方向，追踪中误差过零、output 变号都不翻转它：
     // 旧映射在 output 过零时电压直接从 +(摩擦+volt_min) 跳到 -(摩擦+volt_min)，
     // 低速稳态 output 就在 0 附近，于是控制器在正负摩擦电压间来回反打（粘滑根因）。
     // output 现在是叠加在摩擦垫上的双极性连续量：变负时先减小正向电压、再降到 0V、
     // 之后才进入反向制动，摩擦电压附近的精细调节因此连续可调。
+    // 电压斜率限制：起步/换向时电压不能阶跃，只能以 slew_rate 爬升，
+    // 车被“推起来”而不是“被踢出去”。
+    const float max_dv = slew_rate * static_cast<float>(dt_us) / 1000000.0f;
     for (uint8_t i = 0; i < 4; i++)
     {
         const float base_voltage = friction + volt_min[i];
@@ -198,6 +180,14 @@ void MyMotorGroup::my_spin()
             volt = volt_max[i];
         else if (volt < -volt_max[i])
             volt = -volt_max[i];
+
+        // 斜率限制：本拍电压变化不超过 slew_rate × dt
+        if (volt > prev_volt[i] + max_dv)
+            volt = prev_volt[i] + max_dv;
+        else if (volt < prev_volt[i] - max_dv)
+            volt = prev_volt[i] - max_dv;
+        prev_volt[i] = volt;
+
         volt_output[i] = volt;
         motors[i]->spin(vex::directionType::fwd, volt, vex::voltageUnits::volt);
     }
@@ -209,10 +199,9 @@ void MyMotorGroup::my_respin()
     is_stoped = false;
     integral = 0.0f;
     previous_error = 0.0f;
-    is_moving = false;
     target_sign = 0;
-    boost_start_us = get_time_us();
-    stop_since_us = 0;
+    for (uint8_t i = 0; i < 4; i++)
+        prev_volt[i] = 0.0f;
     speed_filter_inited = false;
     last_time_us = get_time_us();
 }

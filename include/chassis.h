@@ -37,23 +37,11 @@ public:
     // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
     float volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
     float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
-    float static_deadzone = 2.0f;                    // 克服静摩擦所需电压(整车下,单位V)
-    float dynamic_deadzone = 1.0f;                   // 克服动摩擦所需电压(整车下,单位V)
-    float output_deadzone = 0.1f;                    // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
-
-    // 编码器运动状态确认阈值，直接对原生 rpm 读数判定：
-    // false=静止/起步中（挂静摩擦电压），true=已进入动摩擦。
-    // 状态只做一次性闩锁：起步后不逐样本回切，必须低速持续够久才重挂（见下方时长参数）。
-    bool is_moving = false;
-    float moving_confirm_speed = 6.0f; // 静止到运动以转速大于该值确认，单位 rpm。
-                                       // SDK 低速量化台阶约 6rpm(=1pct)，阈值必须高于台阶，
-                                       // 否则读数在0和量化值间跳动会带着摩擦电压一起抖。
-    float stopped_confirm_speed = 3.0f; // 运动回切静止的候选阈值，单位 rpm；
-                                        // 仅候选，还需连续低于它达 stop_rearm_time 才真回切。
-
-    // 起步助力与回切的时间迟滞（my_spin 内部使用，单位 us）
-    uint32_t boost_max_time = 150000;   // 静摩擦起步助力最长挂多久；到点未转也切动摩擦，交积分平滑补压
-    uint32_t stop_rearm_time = 200000;  // 运动中转速连续低于停转阈值多久，才重新挂静摩擦
+    // 摩擦补偿曲线两端：target=0 时用 static，target 很大时用 dynamic。
+    // 中间连续过渡（target 每增大 3pct，静态→动态多衰减约 63%），全程无跳变。
+    float static_deadzone = 1.5f;  // 静止时补偿电压上限(整车下,单位V)
+    float dynamic_deadzone = 0.8f; // 高速时补偿电压下限(整车下,单位V)
+    float output_deadzone = 0.1f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
 
     // pct 速度反馈一阶低通：SDK 速度约 10ms 更新一档、低速量化台阶约 1pct，
     // 5ms 环里先滤波再喂 PID。alpha 越小越平滑、滞后越大（0.2 约 20ms 时间常数）。
@@ -61,10 +49,12 @@ public:
     float filtered_speed = 0.0f;
     bool speed_filter_inited = false; // 首拍/重新起步时用原读数直接填充，避免从0拉一条假曲线
 
-    // 起步助力与时滞状态（my_spin 内部维护）
-    uint32_t boost_start_us = 0; // 本次挂静摩擦电压的起始时刻
-    uint32_t stop_since_us = 0;  // 转速开始持续低于停转阈值的时刻，0 表示当前不在计时
-    int8_t target_sign = 0;      // 上一轮目标方向，用于检测换向；0 表示起步前未知
+    // 电压斜率限制：避免起步/目标跳变时电压阶跃造成蹿冲。
+    // 8V/s 对应 5ms 步长内每路电机最多变 0.04V，静摩擦电压约 200ms 爬完，整车“被推起来”。
+    float slew_rate = 8.0f;                        // 单位 V/s
+    float prev_volt[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一拍实际输出电压，用于 slew rate
+
+    int8_t target_sign = 0; // 上一轮目标方向，用于检测换向；0 表示起步前未知
 
     float target = 0.0f; // 目标速度，单位 pct（±100）
 
