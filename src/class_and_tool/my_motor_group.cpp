@@ -127,22 +127,65 @@ void MyMotorGroup::my_spin()
             max_volt_factor = volt_factor[i];
     const float output_limit = 1.0f / max_volt_factor;
 
-    // ---------- 条件积分抗饱和 ----------
-    // 先把本轮误差计入候选积分并算出候选输出，饱和判据直接用上面的真实电压饱和点，
-    // 与最终输出限幅完全一致，不会出现“电压已被削、积分还在堆”的脱节。
-    // 已饱和但误差方向能帮助退出饱和时，仍允许积分（与位置环 PositionPID 同一套规则）。
-    // 转速极低（|rpm| < 3，即原 stopped_confirm_speed）时冻结：
-    // 起步/换向瞬间车还没动，误差恒为满值，积分若累积会在车动起来的瞬间一次性释放。
+    // 本拍 slew 允许的电压窗口（抗饱和判定和下面落库循环共用同一个窗口）。
+    const float max_dv = slew_rate * static_cast<float>(dt_us) / 1000000.0f;
+
+    // ---------- 条件积分抗饱和（以电机真正吃到的电压为准）----------
+    // 不能只盯归一 output：slew 爬坡段 output 远没到 ±1，旧判据认为“没饱和”，
+    // 可实际电压被斜率压在低位、误差仍是满格，积分照堆；等 slew 一松开，
+    // 摩擦垫+前馈+P+积分一次性砸下去，就是起步过冲（5pct 冲到 15pct 的根因）。
+    // 做法：候选输出除了查归一硬限，还要映射成每路候选电压虚走一遍硬限幅+slew，
+    // 只要有一路在“误差想推”的方向上被顶住，本拍就不积；误差方向反而帮助退出
+    // 饱和时不拦（与位置环 PositionPID 同一套规则）。
+    // 转速极低（|rpm| < 3，即原 stopped_confirm_speed）时照旧冻结：
+    // 起步/换向瞬间车还没动，误差恒为满值，积了也会在车动起来的瞬间一次性释放。
     if (abs_speed >= 3.0f)
     {
         const float candidate_integral = integral + error * static_cast<float>(dt_us);
-        const float candidate_output = feedforward + p_output + ki * candidate_integral + d_output;
-        if (fabsf(candidate_output) <= output_limit ||
-            (candidate_output > output_limit && error < 0.0f) ||
-            (candidate_output < -output_limit && error > 0.0f))
+        const float raw_candidate_output = feedforward + p_output + ki * candidate_integral + d_output;
+
+        // 归一输出硬限：误差还在往饱和方向推才拦，反方向放（帮助退饱和）。
+        bool blocked = (raw_candidate_output > output_limit && error > 0.0f) ||
+                       (raw_candidate_output < -output_limit && error < 0.0f);
+
+        // slew 虚检：候选输出限幅后映射成每路电压（映射公式与下面落库循环一致），
+        // 看它是否超出本拍 slew 窗口。只比较、不落库，prev_volt 仍是上一拍的实际值。
+        if (!blocked)
         {
-            integral = candidate_integral;
+            float candidate_output = raw_candidate_output;
+            if (candidate_output > output_limit)
+                candidate_output = output_limit;
+            else if (candidate_output < -output_limit)
+                candidate_output = -output_limit;
+
+            for (uint8_t i = 0; i < 4; i++)
+            {
+                const float base_voltage = friction + volt_min[i];
+                const float controllable_voltage = volt_max[i] - base_voltage;
+                float volt = target_sign * base_voltage +
+                             candidate_output * controllable_voltage * volt_factor[i];
+                if (volt > volt_max[i])
+                    volt = volt_max[i];
+                else if (volt < -volt_max[i])
+                    volt = -volt_max[i];
+
+                // 误差想把电压往上推、但 slew 窗口上沿够不到候选电压（反向同理），
+                // 说明执行端还没跟上指令，本拍积分先冻住。voltage_tolerance 留出
+                // 一小段容差，差距只剩每拍步长量级时不冻结，避免积分反复横跳。
+                const float slew_high = prev_volt[i] + max_dv;
+                const float slew_low = prev_volt[i] - max_dv;
+                if ((error > 0.0f && volt > slew_high + voltage_tolerance) ||
+                    (error < 0.0f && volt < slew_low - voltage_tolerance))
+                {
+                    blocked = true;
+                    break;
+                }
+            }
         }
+
+        if (!blocked)
+            integral = candidate_integral;
+
         // 积分绝对上限：积分单项不超过归一输出上限，轮子悬空/堵转时积分不会无限堆。
         if (fabsf(ki) > 1e-9f)
         {
@@ -168,7 +211,6 @@ void MyMotorGroup::my_spin()
     // 之后才进入反向制动，摩擦电压附近的精细调节因此连续可调。
     // 电压斜率限制：起步/换向时电压不能阶跃，只能以 slew_rate 爬升，
     // 车被“推起来”而不是“被踢出去”。
-    const float max_dv = slew_rate * static_cast<float>(dt_us) / 1000000.0f;
     for (uint8_t i = 0; i < 4; i++)
     {
         const float base_voltage = friction + volt_min[i];
