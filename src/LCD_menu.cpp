@@ -161,7 +161,7 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"L0_I", []
          { return static_cast<float>(left_motors.motors[0]->current(vex::currentUnits::amp)); }, "左0电流", "A", monitor_tag_slow},
         {"L0_pct", []
-         { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左0转速", "pct", monitor_tag_slow},
         {"L1_I", []
          { return static_cast<float>(left_motors.motors[1]->current(vex::currentUnits::amp)); }, "左1电流", "A", monitor_tag_slow},
         {"L1_pct", []
