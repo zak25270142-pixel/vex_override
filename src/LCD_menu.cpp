@@ -33,7 +33,8 @@ const struct MENU_ITEM menu_item[] =
         {"R_dy_dz", type_float, &right_motors.dynamic_deadzone, "右动摩擦", "V"},
 
         // ========== 电压映射（速度环归一输出 → 四路实际电压）==========
-        // V = 摩擦 + volt_min + |out|·(volt_max-摩擦-volt_min)·volt_factor
+        // V = 目标方向·(摩擦+volt_min) + out·(volt_max-摩擦-volt_min)·volt_factor
+        // 摩擦垫只认目标方向，out 是双极性连续修正，过零不再翻转摩擦电压
         {"L_vmin0", type_float, &left_motors.volt_min[0], "左0最小电压", "V"},
         {"L_vmin1", type_float, &left_motors.volt_min[1], "左1最小电压", "V"},
         {"L_vmin2", type_float, &left_motors.volt_min[2], "左2最小电压", "V"},
@@ -60,6 +61,10 @@ const struct MENU_ITEM menu_item[] =
         {"R_vf3", type_float, &right_motors.volt_factor[3], "右3电压系数", ""},
         {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
+        {"L_iSlew", type_float, &left_motors.i_slew_max, "左I速率", "out/s"},
+        {"R_iSlew", type_float, &right_motors.i_slew_max, "右I速率", "out/s"},
+        {"L_jitter", type_float, &left_motors.volt_jitter_max, "左抖动限", "V/s"},
+        {"R_jitter", type_float, &right_motors.volt_jitter_max, "右抖动限", "V/s"},
 
         // ========== 位置环 ==========
         {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},
@@ -128,14 +133,18 @@ static struct MENU_ITEM monitor_menu_item[] =
         // 指令转速：速度环目标，内存项直接读（与 L0/R0_rpm 对照即跟踪误差）
         {"L_tgt", type_float, &left_motors.target, "左指令转速", "pct", monitor_tag_fast},
         {"R_tgt", type_float, &right_motors.target, "右指令转速", "pct", monitor_tag_fast},
+        {"L_integral", type_float, &left_motors.integral, "左PID积分", "", monitor_tag_fast},
+        {"R_integral", type_float, &right_motors.integral, "右PID积分", "", monitor_tag_fast},
+        {"L_error", type_float, &left_motors.previous_error, "左PID误差", "", monitor_tag_fast},
+        {"R_error", type_float, &right_motors.previous_error, "右PID误差", "", monitor_tag_fast},
 
         // 转速/电流/编码器：无捕获 lambda 直接转 MenuFloatGetter，构造自动置 GETTER；
         // SDK 读数是 double，cast 成 float 匹配签名。加/删一项只动这一行
         // 转速只取 motors[0]（与轮轴直连，经齿轮传动的读数不代表轮速），pct 与 target 同口径
-        {"L0_rpm", []
-         { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左0转速", "pct", monitor_tag_fast},
-        {"R0_rpm", []
-         { return static_cast<float>(right_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "右0转速", "pct", monitor_tag_fast},
+        {"L_pct", type_float, &left_motors.pre_v, "左转速(慢1拍)", "pct", monitor_tag_fast},
+        {"R_pct", type_float, &right_motors.pre_v, "右转速(慢1拍)", "pct", monitor_tag_fast},
+        {"L_a", type_float, &left_motors.pre_a, "左加速度(慢1拍)", "pct", monitor_tag_fast},
+        {"R_a", type_float, &right_motors.pre_a, "右加速度(慢1拍)", "pct", monitor_tag_fast},
 
         // 实际电压：SDK 回读，与指令电压 Vcmd 对照（差距大说明被限幅/堵转）
         {"L0_Vact", []
@@ -157,43 +166,43 @@ static struct MENU_ITEM monitor_menu_item[] =
 
         {"L0_I", []
          { return static_cast<float>(left_motors.motors[0]->current(vex::currentUnits::amp)); }, "左0电流", "A", monitor_tag_slow},
-        {"L0_pos", []
+        {"L0_pct", []
          { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左0转速", "pct", monitor_tag_slow},
         {"L1_I", []
          { return static_cast<float>(left_motors.motors[1]->current(vex::currentUnits::amp)); }, "左1电流", "A", monitor_tag_slow},
-        {"L1_pos", []
+        {"L1_pct", []
          { return static_cast<float>(left_motors.motors[1]->velocity(vex::velocityUnits::pct)); }, "左1转速", "pct", monitor_tag_slow},
         {"L2_I", []
          { return static_cast<float>(left_motors.motors[2]->current(vex::currentUnits::amp)); }, "左2电流", "A", monitor_tag_slow},
-        {"L2_pos", []
+        {"L2_pct", []
          { return static_cast<float>(left_motors.motors[2]->velocity(vex::velocityUnits::pct)); }, "左2转速", "pct", monitor_tag_slow},
         {"L3_I", []
          { return static_cast<float>(left_motors.motors[3]->current(vex::currentUnits::amp)); }, "左3电流", "A", monitor_tag_slow},
-        {"L3_pos", []
+        {"L3_pct", []
          { return static_cast<float>(left_motors.motors[3]->velocity(vex::velocityUnits::pct)); }, "左3转速", "pct", monitor_tag_slow},
 
         {"R0_I", []
          { return static_cast<float>(right_motors.motors[0]->current(vex::currentUnits::amp)); }, "右0电流", "A", monitor_tag_slow},
-        {"R0_pos", []
+        {"R0_pct", []
          { return static_cast<float>(right_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "右0转速", "pct", monitor_tag_slow},
         {"R1_I", []
          { return static_cast<float>(right_motors.motors[1]->current(vex::currentUnits::amp)); }, "右1电流", "A", monitor_tag_slow},
-        {"R1_pos", []
+        {"R1_pct", []
          { return static_cast<float>(right_motors.motors[1]->velocity(vex::velocityUnits::pct)); }, "右1转速", "pct", monitor_tag_slow},
         {"R2_I", []
          { return static_cast<float>(right_motors.motors[2]->current(vex::currentUnits::amp)); }, "右2电流", "A", monitor_tag_slow},
-        {"R2_pos", []
+        {"R2_pct", []
          { return static_cast<float>(right_motors.motors[2]->velocity(vex::velocityUnits::pct)); }, "右2转速", "pct", monitor_tag_slow},
         {"R3_I", []
          { return static_cast<float>(right_motors.motors[3]->current(vex::currentUnits::amp)); }, "右3电流", "A", monitor_tag_slow},
-        {"R3_pos", []
+        {"R3_pct", []
          { return static_cast<float>(right_motors.motors[3]->velocity(vex::velocityUnits::pct)); }, "右3转速", "pct", monitor_tag_slow},
 
-        // 手柄（手动/Arcade 对照）
-        {"axis_Lx", type_int32_t, &left_axis.value[left_axis.value_p].value_x, "左杆X", nullptr, monitor_tag_slow},
-        {"axis_Ly", type_int32_t, &left_axis.value[left_axis.value_p].value_y, "左杆Y", nullptr, monitor_tag_slow},
-        {"axis_Rx", type_int32_t, &right_axis.value[right_axis.value_p].value_x, "右杆X", nullptr, monitor_tag_slow},
-        {"axis_Ry", type_int32_t, &right_axis.value[right_axis.value_p].value_y, "右杆Y", nullptr, monitor_tag_slow},
+        // 手柄（手动/Arcade 对照）。now_x/now_y 是稳定地址，value环形槽会轮转不能直接取地址。
+        {"axis_Lx", type_int32_t, &left_axis.now_x, "左杆X", nullptr, monitor_tag_slow},
+        {"axis_Ly", type_int32_t, &left_axis.now_y, "左杆Y", nullptr, monitor_tag_slow},
+        {"axis_Rx", type_int32_t, &right_axis.now_x, "右杆X", nullptr, monitor_tag_slow},
+        {"axis_Ry", type_int32_t, &right_axis.now_y, "右杆Y", nullptr, monitor_tag_slow},
 };
 
 MENU menu(menu_item,

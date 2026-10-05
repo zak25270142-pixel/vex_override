@@ -17,7 +17,12 @@ static vex::motor right_chassis_4(vex::PORT9, vex::ratio6_1, true);   // 右后�
 // 实车接线未完成，当前按电机构造时 reversed 标志推测直连/减速归属，接线后必须核对。
 // 后四个为速度环增益（秒量纲，误差单位 pct）：kf 阻力前馈(输出/pct)、kp(输出/pct)、
 // ki(输出/(pct·秒))、kd(输出·秒/pct)。
-// 当前为接通链路用的占位值，两组相同，必须在实车上重新标定后再用于比赛。
+// 速度环默认增益（连续摩擦补偿+斜率限制架构，旧车起点，本车需重标）：
+// kf=0.006 前馈按旧车开环 V(tgt)≈1.15+0.065·pct 反推斜率；
+// kp=0.01 使 1pct 量化台阶只产生 ~0.1V 电压扰动；
+// ki=0.1/s 是旧车实测安全上限（0.2 在 tgt10 已积分超调截停）；
+// kd=0 不用（量化反馈下微分只放大噪声）。
+// 摩擦垫暂 2.0/1.0（旧车标定 1.5/0.8），本车整车摩擦未标，上车先标摩擦再标增益。
 
 // volt_factor / volt_min 逐台实测值（2026-10-02 空载标定）：
 // 目标：同归一指令下各台电机输出的轮速一致。空载斜率 k(pct/V) 有个体差异，
@@ -33,10 +38,10 @@ static const float left_volt_min[4] = {0.35f, 0.49f, 0.47f, 0.47f};
 static const float right_volt_min[4] = {0.31f, 0.57f, 0.49f, 0.49f};
 MyMotorGroup left_motors(
     left_chassis_1, left_chassis_2, left_chassis_3, left_chassis_4,
-    0.008f, 0.02f, 0.5f, 0.0f, left_volt_factor, left_volt_min);
+    0.006f, 0.01f, 0.1f, 0.0f, left_volt_factor, left_volt_min);
 MyMotorGroup right_motors(
     right_chassis_1, right_chassis_2, right_chassis_3, right_chassis_4,
-    0.008f, 0.02f, 0.5f, 0.0f, right_volt_factor, right_volt_min);
+    0.006f, 0.01f, 0.1f, 0.0f, right_volt_factor, right_volt_min);
 
 // 两个定位轮均已接入底盘里程计；reverse 标志若与实际滚动方向不符，试车时在此翻转。
 static vex::rotation forward_tracking_sensor(vex::PORT6, true);         // 当前已经前进++
@@ -48,8 +53,7 @@ Chassis chassis(left_motors, right_motors,
                 inertial_sensor);
 
 // 整机动作实例：main 与自动流程通过它发布任务并周期推进。
-// 手柄摇杆在此绑定，手动控制由 RobotAction 经这两个指针操作。
-RobotAction robot_action(chassis, &left_axis, &right_axis);
+RobotAction robot_action(chassis, &left_axis.now_x, &left_axis.now_y);
 
 // ===== USB上位机动作命令（0x80~0x86）的薄封装 =====
 // 这些函数在通信rx线程里被直接调用：只做一次memcpy取参+发起动作（动作本体
@@ -145,12 +149,12 @@ static const VALUE_TYPE cmd_ui8_f_type[] = {type_uint8_t, type_float};
 // 本车的动作命令总表：非static供外部链接，LCD_menu.cpp构造comm时整张传入，
 // 与tunable/monitor两张MENU表的注入方式保持一致。
 const CMD_ITEM robot_cmds[] = {
-    {cmd_stop, 0x80, nullptr, nullptr, 0, "停止运动"},
-    {cmd_turn, 0x81, cmd_f_type, (const char *[]){"角度(度)"}, 1, "原地转向"},
-    {cmd_move, 0x82, cmd_f_type, (const char *[]){"距离(米)"}, 1, "直行"},
-    {cmd_goto, 0x83, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, 3, "局部移动"},
-    {cmd_set_volt, 0x84, cmd_ui8_f_type, (const char *[]){"编号(0-3左1-4,4-7右1-4)", "电压(伏)"}, 2, "设置电机电压"},
-    {cmd_set_spin, 0x85, cmd_2f_type, (const char *[]){"左目标速度", "右目标速度"}, 2, "设置底盘目标速度"},
-    {cmd_reset_pos, 0x86, cmd_3f_type, (const char *[]){"坐标x", "坐标y", "航向yaw"}, 3, "重置底盘位置"},
+    {cmd_stop, nullptr, nullptr, 0, "停止运动"},
+    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, 1, "原地转向"},
+    {cmd_move, cmd_f_type, (const char *[]){"距离(米)"}, 1, "直行"},
+    {cmd_goto, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, 3, "局部移动"},
+    {cmd_set_volt, cmd_ui8_f_type, (const char *[]){"编号(0-3左1-4,4-7右1-4)", "电压(伏)"}, 2, "设置电机电压"},
+    {cmd_set_spin, cmd_2f_type, (const char *[]){"左目标速度", "右目标速度"}, 2, "设置底盘目标速度"},
+    {cmd_reset_pos, cmd_3f_type, (const char *[]){"坐标x", "坐标y", "航向yaw"}, 3, "重置底盘位置"},
 };
 const uint8_t robot_cmd_count = sizeof(robot_cmds) / sizeof(robot_cmds[0]);

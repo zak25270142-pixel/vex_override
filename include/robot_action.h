@@ -45,11 +45,9 @@ private:
 
     void update_manual(uint32_t now); // 手动控制每轮执行
 
-    // 手动控制引用的手柄摇杆，由装配层（robot_and_control.cpp）在构造时注入。
-    // 工具类只存指针，不引用 left_axis/right_axis 等全局对象。
-    // Arcade 只用 manual_left_axis；manual_right_axis 预留，迁移 Tank 时使用。
-    Remote_Control *manual_left_axis = nullptr;
-    Remote_Control *manual_right_axis = nullptr;
+    // 手动控制引用的手柄摇杆数值，由装配层（robot_and_control.cpp）在构造时注入。
+    int32_t *move_axis;
+    int32_t *turn_axis;
 
     // 动作自然结束的统一收尾（含发起时已在容差内、一步未动的瞬间完成）：
     // 停车、清指针、触发 move_end_callback。
@@ -79,8 +77,8 @@ public:
     float angle_tolerance = 0.8f;          // deg，原地旋转/goto 最终朝向
     float angular_speed_tolerance = 5.0f;  // deg/s
 
-    // 底盘与手柄摇杆均在构造时注入：底盘来自本车硬件，摇杆来自装配层。
-    RobotAction(Chassis &chassis, Remote_Control *left_axis, Remote_Control *right_axis);
+    // 底盘与手柄摇杆数值均在构造时注入：底盘来自本车硬件，摇杆来自装配层。
+    RobotAction(Chassis &chassis, int32_t *move, int32_t *turn);
 
     // ---- 整机生命周期：main 在主循环前调用 ----
     void init();
@@ -101,9 +99,9 @@ public:
     // 外部主动打断：立即停车并回到空闲，不触发 move_end_callback
     void stop_move();
 
-    // ---- 手动控制（驾驶员开环）----
-    // 手动摇杆输入死区，单位为摇杆原始值（非百分比），默认 8。
-    int manual_deadzone = 8;
+    // ---- 手动控制----
+
+    int manual_deadzone = 16; // 手动摇杆输入死区
 
     // 进入手动模式：把注入的摇杆设为 only_value（不触发方向键），
     // 接力指针指向 update_manual，refresh() 每轮自动执行手动控制。

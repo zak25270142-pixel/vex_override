@@ -3,16 +3,16 @@
        未选中时不渲染（由父组件 v-if 控制） -->
   <section class="mon-detail">
     <header class="mon-detail__head">
-      <span class="mon-detail__name">{{ item.name }}</span>
-      <span class="mon-detail__idx">#{{ item.index }}</span>
+      <span class="mon-detail__name">{{ item!.name }}</span>
+      <span class="mon-detail__idx">#{{ item!.index }}</span>
       <button class="mon-detail__back" @click="selectMonitor(null)">‹ 返回</button>
     </header>
 
     <div class="mon-detail__body">
       <!-- 实时值 -->
       <div class="live">
-        <span class="live__num">{{ formatValue(item, liveValue) }}</span>
-        <i v-if="item.unit" class="live__unit">{{ item.unit }}</i>
+        <span class="live__num">{{ formatValue(item!, liveValue) }}</span>
+        <i v-if="item!.unit" class="live__unit">{{ item!.unit }}</i>
       </div>
 
       <!-- 5s 曲线 -->

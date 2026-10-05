@@ -21,7 +21,6 @@ public:
 };
 
 void Delay(double time);
-void Timer_init();
 void wait_to(uint32_t time);
 
 #endif

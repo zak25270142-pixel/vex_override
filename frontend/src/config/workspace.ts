@@ -17,7 +17,7 @@ export const CHANNELS: ChannelMeta[] = [
 
 /* ===== 场地：VEX 标准场 6×6 格、每格 60cm，边长 360cm ===== */
 export const FIELD_SIZE = 6
-export const CELL_CM = 60
+export const CELL_CM = 60.96
 export const FIELD_CM = FIELD_SIZE * CELL_CM // 360
 
 /* ===== 曲线缓冲与刷新 ===== */

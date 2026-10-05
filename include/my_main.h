@@ -16,11 +16,6 @@ struct position16t
     int16_t x;
     int16_t y;
 };
-struct vect_f
-{
-    float x;
-    float y;
-};
 struct Size16t
 {
     position16t start_p; // 标记顶点
@@ -64,17 +59,12 @@ static constexpr uint8_t MENU_TAG_KIND_POS_Y = 2u;
 static constexpr uint8_t MENU_TAG_KIND_YAW = 3u;
 
 // 表项常用默认 tag（已含 SUB；getter 构造函数会再或上 MENU_TAG_GETTER）
-static constexpr uint8_t monitor_tag_none = 0; // 不订阅
-static constexpr uint8_t monitor_tag_slow =
-    MENU_TAG_SUB; // 订阅 + 低速 + 内存指针
-static constexpr uint8_t monitor_tag_fast =
-    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST); // 订阅 + 高速 + 内存指针
-static constexpr uint8_t monitor_tag_pos_x =
-    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_POS_X);
-static constexpr uint8_t monitor_tag_pos_y =
-    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_POS_Y);
-static constexpr uint8_t monitor_tag_yaw =
-    (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_YAW);
+static constexpr uint8_t monitor_tag_none = 0;                                       // 不订阅
+static constexpr uint8_t monitor_tag_slow = MENU_TAG_SUB;                            // 订阅 + 低速 + 内存指针
+static constexpr uint8_t monitor_tag_fast = (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST); // 订阅 + 高速 + 内存指针
+static constexpr uint8_t monitor_tag_pos_x = (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_POS_X);
+static constexpr uint8_t monitor_tag_pos_y = (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_POS_Y);
+static constexpr uint8_t monitor_tag_yaw = (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAST | MENU_TAG_KIND_YAW);
 
 // 无参读函数：返回 float；监控项的 data_type 必须为 type_float 才能用此构造函数。
 // （当前协议 GETTER 项固定发 4B float；若未来需其他类型，再按 VALUE_TYPE 追加同风格 typedef。）
@@ -92,38 +82,24 @@ struct MENU_ITEM
     const char *Chinese_name;
     const char *unit;
     uint8_t tag; // 监控表用位域；调参表保持 0 即可
-
     // 内存项（可读写）：ptr 为变量地址
     MENU_ITEM(const char *name, VALUE_TYPE type, void *ptr, const char *c,
               const char *u = nullptr, uint8_t t = monitor_tag_none)
-        : item_name(name), data_type(type), data_ptr(ptr), Chinese_name(c),
-          unit(u), tag(t)
+        : item_name(name), data_type(type), data_ptr(ptr), Chinese_name(c), unit(u), tag(t)
     {
     }
-
     // getter 只读项：固定 type_float；get 无参，返回 float；tag 自动加上 MENU_TAG_GETTER
     // （构造函数不接收 VALUE_TYPE，因当前协议 GETTER 项只支持 float，避免不对称）
     MENU_ITEM(const char *name, MenuFloatGetter get, const char *c,
               const char *u, uint8_t t)
-        : item_name(name), data_type(type_float),
-          data_ptr(reinterpret_cast<void *>(get)), Chinese_name(c), unit(u),
-          tag(static_cast<uint8_t>(t | MENU_TAG_GETTER))
+        : item_name(name), data_type(type_float), data_ptr(reinterpret_cast<void *>(get)), Chinese_name(c), unit(u), tag(static_cast<uint8_t>(t | MENU_TAG_GETTER))
     {
     }
-
     bool is_getter() const { return (tag & MENU_TAG_GETTER) != 0; }
     bool is_subscribed() const { return (tag & MENU_TAG_SUB) != 0; }
     bool is_fast() const { return (tag & MENU_TAG_FAST) != 0; }
     uint8_t kind() const { return static_cast<uint8_t>(tag & MENU_TAG_KIND_MASK); }
 };
-
-// 所有周期任务共用的生命周期；每个模块分别保存自己的状态变量。
-typedef enum
-{
-    task_start,
-    task_run,
-    task_finish,
-} TASK_STATE;
 
 void my_Init();
 void my_while();

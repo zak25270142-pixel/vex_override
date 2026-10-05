@@ -194,8 +194,8 @@ void Control_key::released()
 
 void Remote_Control::set_state()
 {
-    int32_t x = value[value_p].value_x;
-    int32_t y = value[value_p].value_y;
+    int32_t x = now_x;
+    int32_t y = now_y;
     STATE last_state = state;
     if (x * x + y * y <= 10)
         state = middle;
@@ -258,16 +258,10 @@ void Remote_Control::set_state()
 
 void Remote_Control::refresh(int32_t current_value_x, int32_t current_value_y)
 {
-    uint32_t now = get_time_ms();
-    if (now - 2 >= value[value_p].time)
-    {
-        value_p = (value_p + 1) % 8;
-        value[value_p].time = now;
-        value[value_p].value_x = current_value_x;
-        value[value_p].value_y = current_value_y;
-        if (changed != nullptr)
-            changed();
-        if (state != only_value)
-            set_state();
-    }
+    now_x = current_value_x;
+    now_y = current_value_y;
+    if (changed != nullptr)
+        changed();
+    if (state != only_value)
+        set_state();
 }
