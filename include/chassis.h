@@ -34,8 +34,8 @@ public:
 
     // 摩擦补偿曲线两端：target=0 时用 static，target增大后用 dynamic。
     // 中间连续过渡（target 每增大 3pct，静态→动态多衰减约 63%），全程无跳变。
-    float static_deadzone = 1.2;   // 静止时补偿电压上限(整车下,单位V,未标定)
-    float dynamic_deadzone = 0.6f; // 高速时补偿电压下限(整车下,单位V,未标定)
+    float static_deadzone = 1.5f;  // 静止时补偿电压上限(整车下,单位V)
+    float dynamic_deadzone = 0.8f; // 高速时补偿电压下限(整车下,单位V)
     float output_deadzone = 0.1f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
 
     // ---- 提速态/稳定态判态参数 ----
@@ -50,14 +50,20 @@ public:
     // 例如 0.1 表示速度变化率 < max(|speed|, target_min_current) 的 10% 每秒。
     float speed_stable_ratio = 0.1f;
 
-    // I 项工作范围：误差小于此值时认为 I 能补，进入稳定态开始积 I。
-    float error_for_i = 10.0f; // pct
+    // I 项工作范围（稳定态误差阈值）：max(error_for_i_min, error_for_i_ratio·|target|)，单位 pct。
+    // 做成相对量，低速目标（3/5pct）也能进稳定态。
+    float error_for_i_min = 3.0f;
+    float error_for_i_ratio = 0.15f;
 
     // I 项贡献的最大变化速率：限制 I 在稳定态的步进速度。
     float i_slew_max = 5.0f; // 归一 output / s
 
     // 稳定态电压抖动上限：电压变化速率不超过此值，纯粹限稳态抖动。
     float volt_jitter_max = 8.0f; // V/s
+
+    // 提速态电压斜率上限：比稳定态宽，让电压快速跟上目标跳变，
+    // 但不能完全不限（不限就是起步踢车/换向冲击的根因）。
+    float slew_boost = 25.0f; // V/s
 
     // 历史记录（用于判态）
     float pre_v = 0.0f;   // 上一次速度
@@ -67,7 +73,7 @@ public:
 
     float prev_volt[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一拍实际输出电压
 
-    int8_t target_sign = 0; // 上一轮目标方向，用于双极性映射；0 表示起步前未知
+    int8_t target_sign = 0; // 上一轮目标方向，用于检测换向与双极性映射；0 表示起步前未知
 
     float target = 0.0f; // 目标速度，单位 pct（±100）
 

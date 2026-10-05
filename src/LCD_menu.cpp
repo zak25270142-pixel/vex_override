@@ -65,6 +65,12 @@ const struct MENU_ITEM menu_item[] =
         {"R_iSlew", type_float, &right_motors.i_slew_max, "右I速率", "out/s"},
         {"L_jitter", type_float, &left_motors.volt_jitter_max, "左抖动限", "V/s"},
         {"R_jitter", type_float, &right_motors.volt_jitter_max, "右抖动限", "V/s"},
+        {"L_slewB", type_float, &left_motors.slew_boost, "左提速斜率", "V/s"},
+        {"R_slewB", type_float, &right_motors.slew_boost, "右提速斜率", "V/s"},
+        {"L_errImin", type_float, &left_motors.error_for_i_min, "左I误差下限", "pct"},
+        {"R_errImin", type_float, &right_motors.error_for_i_min, "右I误差下限", "pct"},
+        {"L_errIratio", type_float, &left_motors.error_for_i_ratio, "左I误差比例", ""},
+        {"R_errIratio", type_float, &right_motors.error_for_i_ratio, "右I误差比例", ""},
 
         // ========== 位置环 ==========
         {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},

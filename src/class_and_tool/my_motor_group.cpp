@@ -54,7 +54,7 @@ void MyMotorGroup::stop()
 }
 
 // 速度环每短周期(5ms)调用一次，由常驻线程循环；追踪 target（pct）并用电压驱动电机。
-// 核心设计：提速态不积 I、不限电压；稳定态才积 I 并限制电压抖动。
+// 核心设计：提速态不积 I、电压斜率放宽（slew_boost）；稳定态才积 I 并限制电压抖动（volt_jitter_max）。
 // 目标为0时输出0V不刹车，制动由外界 stop() 决定。
 void MyMotorGroup::my_spin()
 {
@@ -77,17 +77,32 @@ void MyMotorGroup::my_spin()
             prev_volt[i] = 0.0f;
             motors[i]->spin(vex::directionType::fwd, 0.0f, vex::voltageUnits::volt);
         }
-        pre_v = speed;
+        // 先算 a 再更新 pre_v，顺序反了 a 恒为 0。
         pre_a = (speed - pre_v) / dt_us * 1000000.0f;
+        pre_v = speed;
         return;
     }
+
+    // ---------- 换向保护：视同重新起步 ----------
+    // 清积分、清电压历史、进提速态，避免旧方向积分带着车冲过零点。
+    const int8_t new_target_sign = target > 0.0f ? 1 : -1;
+    if (target_sign != 0 && new_target_sign != target_sign)
+    {
+        integral = 0.0f;
+        is_boost = true;
+        for (uint8_t i = 0; i < 4; i++)
+            prev_volt[i] = 0.0f;
+    }
+    target_sign = new_target_sign;
 
     // ---------- 提速态 / 稳定态 判态 ----------
     const float error = target - speed;
     const float now_a = (speed - pre_v) / dt_us * 1000000.0f;
     // 稳定条件：误差在 I 工作范围内 + 速度变化率低于阈值（pct/s，按 dt_us 归一化）。
+    // 误差阈值取相对量，低速目标也能进稳定态。
     const float speed_scale = fmaxf(fabsf(speed), target_min_current);
-    if (fabsf(error) <= error_for_i &&
+    const float err_thr = fmaxf(error_for_i_min, error_for_i_ratio * fabsf(target));
+    if (fabsf(error) <= err_thr &&
         fabsf(now_a) <= speed_scale * speed_stable_ratio &&
         fabsf(pre_a) <= speed_scale * speed_stable_ratio)
         is_boost = false;
@@ -108,7 +123,7 @@ void MyMotorGroup::my_spin()
             max_volt_factor = volt_factor[i];
     const float output_limit = 1.0f / max_volt_factor;
 
-    // ---------- I 项：只在稳定态累积，且限步长 ----------
+    // ---------- I 项：只在稳定态累积，限步长 + 方向性抗饱和 ----------
     if (!is_boost && fabsf(ki) > 1e-9f)
     {
         // I 项贡献的最大变化速率 → 每拍积分增量上限
@@ -118,7 +133,21 @@ void MyMotorGroup::my_spin()
             delta = max_delta;
         else if (delta < -max_delta)
             delta = -max_delta;
-        integral += delta;
+
+        // 方向性抗饱和：候选输出在误差想推的方向被归一硬限顶住，本拍就不积；
+        // 反方向不拦（帮助退饱和）。与位置环 PositionPID 同一套规则。
+        const float candidate_output = feedforward + p_output + ki * (integral + delta) + d_output;
+        const bool blocked = (candidate_output > output_limit && error > 0.0f) ||
+                             (candidate_output < -output_limit && error < 0.0f);
+        if (!blocked)
+            integral += delta;
+
+        // 积分绝对上限：积分单项不超过归一输出上限，轮子悬空/堵转时不会无限堆。
+        const float max_integral = output_limit / ki;
+        if (integral > max_integral)
+            integral = max_integral;
+        else if (integral < -max_integral)
+            integral = -max_integral;
     }
 
     float output = feedforward + p_output + ki * integral + d_output;
@@ -127,8 +156,10 @@ void MyMotorGroup::my_spin()
     else if (output < -output_limit)
         output = -output_limit;
 
-    // ---------- 归一输出映射到四路电压 + 稳定态抖动限制 ----------
-    target_sign = target > 0.0f ? 1 : -1;
+    // ---------- 归一输出映射到四路电压 + 分级电压斜率限制 ----------
+    // 提速态用 slew_boost（宽松但仍有上限，防踢车），稳定态用 volt_jitter_max（紧限抖）。
+    const float max_dv = (is_boost ? slew_boost : volt_jitter_max) *
+                         static_cast<float>(dt_us) / 1000000.0f;
     for (uint8_t i = 0; i < 4; i++)
     {
         const float base_voltage = friction + volt_min[i];
@@ -140,16 +171,11 @@ void MyMotorGroup::my_spin()
         else if (volt < -volt_max[i])
             volt = -volt_max[i];
 
-        // 稳定态：限制电压抖动，纯粹消抖；提速态不限，让电压自由响应 target 突变。
-        if (!is_boost)
-        {
-            const float max_dv = volt_jitter_max * static_cast<float>(dt_us) / 1000000.0f;
-            const float dv = volt - prev_volt[i];
-            if (dv > max_dv)
-                volt = prev_volt[i] + max_dv;
-            else if (dv < -max_dv)
-                volt = prev_volt[i] - max_dv;
-        }
+        const float dv = volt - prev_volt[i];
+        if (dv > max_dv)
+            volt = prev_volt[i] + max_dv;
+        else if (dv < -max_dv)
+            volt = prev_volt[i] - max_dv;
 
         prev_volt[i] = volt;
         volt_output[i] = volt;
@@ -165,6 +191,7 @@ void MyMotorGroup::my_spin()
 void MyMotorGroup::my_respin()
 {
     is_stoped = false;
+    is_boost = true; // 重新起步必走提速态：清干净积分后让电压按 slew_boost 爬，不在静止时积 I
     integral = 0.0f;
     previous_error = 0.0f;
     target_sign = 0;
