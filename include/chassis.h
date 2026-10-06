@@ -22,40 +22,58 @@ public:
     // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
     float volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
-    // 候选指令电压与 slew 后实际电压的不一致容差，单位 V：
-    // 差距超过它说明执行端被斜率限制顶住，抗饱和据此冻结本拍积分。
-    float voltage_tolerance = 0.2f;
-
-    // 关于速度环与电压控制，将在本类完成
-
-    //-----pid速度环------------------------------------
-    // 速度环全程使用 pct（±100，100 即满速）：目标来自外部指令，反馈直接读电机
     // 电压限幅与映射
     float volt_max[4] = {12.0f, 12.0f, 12.0f, 12.0f}; // 最大电压(实测，空载时)
-    // 每台电机的个体死区补偿：只要有输出就必须垫上的电压，用来对齐各轮
-    // 开始转动的起点，与整车级的 static/dynamic_deadzone 是两回事。
-    // 取值 = 该电机稳定低速运转所需的最低电压（降压扫描测停转点），
-    // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
+
+    // 每台电机的个体死区补偿：只要有输出就必须垫上的电压，用来对齐各轮开始转动的起点
+    // 取值 = 该电机空载时稳定低速运转所需的最低电压(通常在0.5V左右)
     float volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
-    float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
-    // 摩擦补偿曲线两端：target=0 时用 static，target 很大时用 dynamic。
+
+    // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
+    float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // 摩擦补偿曲线两端：target=0 时用 static，target增大后用 dynamic。
     // 中间连续过渡（target 每增大 3pct，静态→动态多衰减约 63%），全程无跳变。
     float static_deadzone = 1.5f;  // 静止时补偿电压上限(整车下,单位V)
     float dynamic_deadzone = 0.8f; // 高速时补偿电压下限(整车下,单位V)
     float output_deadzone = 0.1f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
 
-    // pct 速度反馈一阶低通：SDK 速度约 10ms 更新一档、低速量化台阶约 1pct，
-    // 5ms 环里先滤波再喂 PID。alpha 越小越平滑、滞后越大（0.2 约 20ms 时间常数）。
-    float speed_filter_alpha = 0.2f;
-    float filtered_speed = 0.0f;
-    bool speed_filter_inited = false; // 首拍/重新起步时用原读数直接填充，避免从0拉一条假曲线
+    // ---- 提速态/稳定态判态参数 ----
+    // target 跳变判定：相对变化超过此比例算大幅，强制进入提速态若干拍。
+    // 例如 0.5 表示 target 变化量超过 max(|target|, 3) 的 50% 即触发。
+    float target_jump_ratio = 0.5f;
 
-    // 电压斜率限制：避免起步/目标跳变时电压阶跃造成蹿冲。
-    // 8V/s 对应 5ms 步长内每路电机最多变 0.04V，静摩擦电压约 200ms 爬完，整车“被推起来”。
-    float slew_rate = 8.0f;                        // 单位 V/s
-    float prev_volt[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一拍实际输出电压，用于 slew rate
+    // 小 target 时基准被该值兜底，避免 1→2 这种绝对值小但比例大的误触发。
+    float target_min_current = 5.0f;
 
-    int8_t target_sign = 0; // 上一轮目标方向，用于检测换向；0 表示起步前未知
+    // 速度稳定判定：速度变化率（pct/s）相对当前速度低于此比例，认为速度已稳定。
+    // 例如 0.1 表示速度变化率 < max(|speed|, target_min_current) 的 10% 每秒。
+    float speed_stable_ratio = 0.1f;
+
+    // I 项工作范围（稳定态误差阈值）：max(error_for_i_min, error_for_i_ratio·|target|)，单位 pct。
+    // 做成相对量，低速目标（3/5pct）也能进稳定态。
+    float error_for_i_min = 3.0f;
+    float error_for_i_ratio = 0.15f;
+
+    // I 项贡献的最大变化速率：限制 I 在稳定态的步进速度。
+    float i_slew_max = 5.0f; // 归一 output / s
+
+    // 稳定态电压抖动上限：电压变化速率不超过此值，纯粹限稳态抖动。
+    float volt_jitter_max = 8.0f; // V/s
+
+    // 提速态电压斜率上限：比稳定态宽，让电压快速跟上目标跳变，
+    // 但不能完全不限（不限就是起步踢车/换向冲击的根因）。
+    float slew_boost = 25.0f; // V/s
+
+    // 历史记录（用于判态）
+    float pre_v = 0.0f;   // 上一次速度
+    float pre_a = 0.0f;   // 上一次的加速度
+    bool is_boost = true; // 当前是否提速态：true=提速态，false=稳定态。
+                          // drive() 设 target 时若跳变则置 true；my_spin() 满足稳定条件后置 false。
+
+    float prev_volt[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一拍实际输出电压
+
+    int8_t target_sign = 0; // 上一轮目标方向，用于检测换向与双极性映射；0 表示起步前未知
 
     float target = 0.0f; // 目标速度，单位 pct（±100）
 
@@ -64,10 +82,8 @@ public:
     float ki;                    // 积分项，内部单位：归一输出 / (pct·us)
     float kd;                    // 微分项，内部单位：归一输出·us / pct
     float integral = 0.0f;       // integral 保存误差累计；本类所有时间量统一使用 us。
-    float previous_error = 0.0f; // previous_error 保存上一轮误差，用于计算 D 项和判断误差是否越过零点。
+    float previous_error = 0.0f; // previous_error 保存上一轮误差，用于计算 D 项。
     uint32_t last_time_us = 0;   // 上一轮 update() 使用的 VEX 系统微秒时间戳。
-    // 其他参数待补充
-    //--------------------------------------------------------
 
     MyMotorGroup(vex::motor &m1, vex::motor &m2,
                  vex::motor &m3, vex::motor &m4,
@@ -82,7 +98,7 @@ public:
 
     double velocity(); // 读取当前转速，单位 rpm (取motors[0]的值)
 
-    // 速度环本体：追踪 target（pct），直接用电压控制电机，外界无需做摩擦补偿。
+    // 速度环全程使用 pct（±100，100 即满速）：追踪 target（pct），直接用电压控制电机，外界无需做摩擦补偿。
     void my_spin();
 
     // 给定目标速度（pct，±100）并确保速度环开始追踪。
@@ -120,11 +136,11 @@ public:
     /* 以下调参区间 */
 
     // 底盘物理参数。轮距预留。
-    float wheel_r = 0.0254f;      // 定位轮半径，单位 m（旧车定位轮直径 5.08cm，即 2 英寸）。驱动轮径待实测。
-    float track_width = 0.28694f; // 左右驱动轮接地点之间的距离，单位 m；当前为旧车实测值，本车待实测。
+    float wheel_r = 0.0254f;      // 定位轮半径，单位 m（旧车定位轮直径 5.08cm，即 2 英寸）。
+    float track_width = 0.28694f; // 左右驱动轮接地点之间的距离，单位 m，实测。
     // 速比现在恰好为1，故没写，后续若不为一需新增。
 
-    // 定位轮到车体旋转中心的有符号距离，单位 m；当前沿用旧车实测值，本车待实测。
+    // 定位轮到车体旋转中心的有符号距离，单位 m，实测。
     // 前向轮读数只受其右向偏移影响：偏右为正（其偏前 74.315mm 不影响前向读数，无需参数）。
     float forward_tracking_offset = 0.012434f; // 前向定位轮偏右 12.434mm。
     // 侧向轮读数只受其前向偏移影响：偏前为正、偏后为负（其左右居中，无侧向偏移）。
@@ -173,8 +189,8 @@ public:
     float local_forward_change = 0.0f; // 本轮车体中心沿自身前方的位移，单位 m。
     float local_side_change = 0.0f;    // 本轮车体中心沿自身右方的位移，单位 m。
     float heading_change = 0.0f;       // 本轮 update() 中的航向角变化，单位 deg。
-    float x_change = 0.0f;             // 本轮在全局坐标系中的 x 位移，单位 m。
-    float y_change = 0.0f;             // 本轮在全局坐标系中的 y 位移，单位 m。
+    float x_change = 0.0f;             // 本轮在全局坐标系中的 x 位移。
+    float y_change = 0.0f;             // 本轮在全局坐标系中的 y 位移。
 
     // 编码器里程已废弃（恢复点：打滑检测）。
     // float left_distance_change = 0.0f;

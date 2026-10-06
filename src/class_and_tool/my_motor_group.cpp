@@ -48,11 +48,13 @@ double MyMotorGroup::velocity()
 void MyMotorGroup::stop()
 {
     is_stoped = true;
+    target = 0.0f;
     for (uint8_t i = 0; i < 4; i++)
         motors[i]->stop();
 }
 
 // 速度环每短周期(5ms)调用一次，由常驻线程循环；追踪 target（pct）并用电压驱动电机。
+// 核心设计：提速态不积 I、电压斜率放宽（slew_boost）；稳定态才积 I 并限制电压抖动（volt_jitter_max）。
 // 目标为0时输出0V不刹车，制动由外界 stop() 决定。
 void MyMotorGroup::my_spin()
 {
@@ -62,139 +64,90 @@ void MyMotorGroup::my_spin()
     uint32_t dt_us = now_us - last_time_us;
     last_time_us = now_us;
 
-    // SDK 速度约 10ms 更新一档，低速量化台阶约 1pct，先对 pct 反馈做一阶低通再喂 PID，
-    // 避免量化噪声在比例项上变成电压抖动（首拍直接用原读数填充，不从 0 拉一条假曲线）。
-    const float raw_speed = static_cast<float>(motors[0]->velocity(vex::velocityUnits::pct));
-    if (speed_filter_inited)
-        filtered_speed += speed_filter_alpha * (raw_speed - filtered_speed);
-    else
-    {
-        filtered_speed = raw_speed;
-        speed_filter_inited = true;
-    }
+    // 直接读 SDK 速度，不做滤波（kd≈0 且增益小，滤波无意义；量化根因在摩擦标定）。
+    const float speed = static_cast<float>(motors[0]->velocity(vex::velocityUnits::pct));
 
-    // 目标速度接近0：输出0V惰行，专供目标连续过零的场景。
-    // 注意整车“停车”统一走 stop()（brake 制动，再次 drive 时 my_respin 清积分起步），
-    // 当前接线链路下停车即 is_stoped=true，正常不会停在本分支。
+    // 目标速度接近0：输出0V惰行。
     if (fabsf(target) <= output_deadzone)
     {
-        // 只断电不改变任何环内状态，previous_error 按零目标对齐，重新给目标时无冲击。
-        previous_error = -filtered_speed;
+        previous_error = -speed;
         for (uint8_t i = 0; i < 4; i++)
         {
             volt_output[i] = 0.0f;
             prev_volt[i] = 0.0f;
             motors[i]->spin(vex::directionType::fwd, 0.0f, vex::voltageUnits::volt);
         }
+        // 先算 a 再更新 pre_v，顺序反了 a 恒为 0。
+        pre_a = (speed - pre_v) / dt_us * 1000000.0f;
+        pre_v = speed;
         return;
     }
 
-    // 两个量各司其职：rpm 是编码器原生物理量，只用于积分冻结判定；
-    // pct 与目标同口径，只用于 PID 误差。
-    const float speed = filtered_speed;
-    const float speed_rpm = static_cast<float>(velocity());
-    const float abs_speed = fabsf(speed_rpm);
-
-    // 目标换向视同重新起步：清积分、清电压历史，避免旧方向积分带着车冲过零点。
+    // ---------- 换向保护：视同重新起步 ----------
+    // 清积分、清电压历史、进提速态，避免旧方向积分带着车冲过零点。
     const int8_t new_target_sign = target > 0.0f ? 1 : -1;
     if (target_sign != 0 && new_target_sign != target_sign)
     {
         integral = 0.0f;
+        is_boost = true;
         for (uint8_t i = 0; i < 4; i++)
             prev_volt[i] = 0.0f;
     }
     target_sign = new_target_sign;
 
-    // ---------- 连续摩擦补偿：随目标速度从 static 连续过渡到 dynamic ----------
-    // 不再用 is_moving 状态机切换：target 小→补偿接近 static（起步需要高电压），
-    // target 大→补偿接近 dynamic（高速只需要克服动摩擦），全程无电压跳变。
-    // 原来 1.0↔2.5V 的跳变恰好落在位置环末端爬行区（2~5pct），是粘滑振荡主因。
-    const float friction = dynamic_deadzone +
-                           (static_deadzone - dynamic_deadzone) * expf(-fabsf(target) / 3.0f);
-
+    // ---------- 提速态 / 稳定态 判态 ----------
     const float error = target - speed;
+    const float now_a = (speed - pre_v) / dt_us * 1000000.0f;
+    // 稳定条件：误差在 I 工作范围内 + 速度变化率低于阈值（pct/s，按 dt_us 归一化）。
+    // 误差阈值取相对量，低速目标也能进稳定态。
+    const float speed_scale = fmaxf(fabsf(speed), target_min_current);
+    const float err_thr = fmaxf(error_for_i_min, error_for_i_ratio * fabsf(target));
+    if (fabsf(error) <= err_thr &&
+        fabsf(now_a) <= speed_scale * speed_stable_ratio &&
+        fabsf(pre_a) <= speed_scale * speed_stable_ratio)
+        is_boost = false;
+
+    // ---------- 连续摩擦补偿 ----------
+    const float friction = dynamic_deadzone + (static_deadzone - dynamic_deadzone) * expf(-fabsf(target) / 3.0f);
+
+    // ---------- PID ----------
     const float derivative = (error - previous_error) / static_cast<float>(dt_us);
     const float p_output = kp * error;
     const float d_output = kd * derivative;
     const float feedforward = kf * target;
 
-    // 组内归一输出上限：电压映射为 摩擦垫 + output·可控电压·volt_factor，
-    // 不超过 volt_max 要求 |output| ≤ 1/volt_factor；volt_factor 最大的电机最先到顶，
-    // 由它决定整组上限（各台 factor 均为 1 时上限就是 1）。
+    // ------- 组内归一输出上限 ----------
     float max_volt_factor = volt_factor[0];
     for (uint8_t i = 1; i < 4; i++)
         if (volt_factor[i] > max_volt_factor)
             max_volt_factor = volt_factor[i];
     const float output_limit = 1.0f / max_volt_factor;
 
-    // 本拍 slew 允许的电压窗口（抗饱和判定和下面落库循环共用同一个窗口）。
-    const float max_dv = slew_rate * static_cast<float>(dt_us) / 1000000.0f;
-
-    // ---------- 条件积分抗饱和（以电机真正吃到的电压为准）----------
-    // 不能只盯归一 output：slew 爬坡段 output 远没到 ±1，旧判据认为“没饱和”，
-    // 可实际电压被斜率压在低位、误差仍是满格，积分照堆；等 slew 一松开，
-    // 摩擦垫+前馈+P+积分一次性砸下去，就是起步过冲（5pct 冲到 15pct 的根因）。
-    // 做法：候选输出除了查归一硬限，还要映射成每路候选电压虚走一遍硬限幅+slew，
-    // 只要有一路在“误差想推”的方向上被顶住，本拍就不积；误差方向反而帮助退出
-    // 饱和时不拦（与位置环 PositionPID 同一套规则）。
-    // 转速极低（|rpm| < 3，即原 stopped_confirm_speed）时照旧冻结：
-    // 起步/换向瞬间车还没动，误差恒为满值，积了也会在车动起来的瞬间一次性释放。
-    if (abs_speed >= 3.0f)
+    // ---------- I 项：只在稳定态累积，限步长 + 方向性抗饱和 ----------
+    if (!is_boost && fabsf(ki) > 1e-9f)
     {
-        const float candidate_integral = integral + error * static_cast<float>(dt_us);
-        const float raw_candidate_output = feedforward + p_output + ki * candidate_integral + d_output;
+        // I 项贡献的最大变化速率 → 每拍积分增量上限
+        const float max_delta = (i_slew_max / ki) * static_cast<float>(dt_us);
+        float delta = error * static_cast<float>(dt_us);
+        if (delta > max_delta)
+            delta = max_delta;
+        else if (delta < -max_delta)
+            delta = -max_delta;
 
-        // 归一输出硬限：误差还在往饱和方向推才拦，反方向放（帮助退饱和）。
-        bool blocked = (raw_candidate_output > output_limit && error > 0.0f) ||
-                       (raw_candidate_output < -output_limit && error < 0.0f);
-
-        // slew 虚检：候选输出限幅后映射成每路电压（映射公式与下面落库循环一致），
-        // 看它是否超出本拍 slew 窗口。只比较、不落库，prev_volt 仍是上一拍的实际值。
+        // 方向性抗饱和：候选输出在误差想推的方向被归一硬限顶住，本拍就不积；
+        // 反方向不拦（帮助退饱和）。与位置环 PositionPID 同一套规则。
+        const float candidate_output = feedforward + p_output + ki * (integral + delta) + d_output;
+        const bool blocked = (candidate_output > output_limit && error > 0.0f) ||
+                             (candidate_output < -output_limit && error < 0.0f);
         if (!blocked)
-        {
-            float candidate_output = raw_candidate_output;
-            if (candidate_output > output_limit)
-                candidate_output = output_limit;
-            else if (candidate_output < -output_limit)
-                candidate_output = -output_limit;
+            integral += delta;
 
-            for (uint8_t i = 0; i < 4; i++)
-            {
-                const float base_voltage = friction + volt_min[i];
-                const float controllable_voltage = volt_max[i] - base_voltage;
-                float volt = target_sign * base_voltage +
-                             candidate_output * controllable_voltage * volt_factor[i];
-                if (volt > volt_max[i])
-                    volt = volt_max[i];
-                else if (volt < -volt_max[i])
-                    volt = -volt_max[i];
-
-                // 误差想把电压往上推、但 slew 窗口上沿够不到候选电压（反向同理），
-                // 说明执行端还没跟上指令，本拍积分先冻住。voltage_tolerance 留出
-                // 一小段容差，差距只剩每拍步长量级时不冻结，避免积分反复横跳。
-                const float slew_high = prev_volt[i] + max_dv;
-                const float slew_low = prev_volt[i] - max_dv;
-                if ((error > 0.0f && volt > slew_high + voltage_tolerance) ||
-                    (error < 0.0f && volt < slew_low - voltage_tolerance))
-                {
-                    blocked = true;
-                    break;
-                }
-            }
-        }
-
-        if (!blocked)
-            integral = candidate_integral;
-
-        // 积分绝对上限：积分单项不超过归一输出上限，轮子悬空/堵转时积分不会无限堆。
-        if (fabsf(ki) > 1e-9f)
-        {
-            const float max_integral = output_limit / ki;
-            if (integral > max_integral)
-                integral = max_integral;
-            else if (integral < -max_integral)
-                integral = -max_integral;
-        }
+        // 积分绝对上限：积分单项不超过归一输出上限，轮子悬空/堵转时不会无限堆。
+        const float max_integral = output_limit / ki;
+        if (integral > max_integral)
+            integral = max_integral;
+        else if (integral < -max_integral)
+            integral = -max_integral;
     }
 
     float output = feedforward + p_output + ki * integral + d_output;
@@ -203,48 +156,52 @@ void MyMotorGroup::my_spin()
     else if (output < -output_limit)
         output = -output_limit;
 
-    // ---------- 归一输出映射到四路电压：连续摩擦垫 + 双极性修正 + 电压斜率限制 ----------
-    // 摩擦垫只认目标方向，追踪中误差过零、output 变号都不翻转它：
-    // 旧映射在 output 过零时电压直接从 +(摩擦+volt_min) 跳到 -(摩擦+volt_min)，
-    // 低速稳态 output 就在 0 附近，于是控制器在正负摩擦电压间来回反打（粘滑根因）。
-    // output 现在是叠加在摩擦垫上的双极性连续量：变负时先减小正向电压、再降到 0V、
-    // 之后才进入反向制动，摩擦电压附近的精细调节因此连续可调。
-    // 电压斜率限制：起步/换向时电压不能阶跃，只能以 slew_rate 爬升，
-    // 车被“推起来”而不是“被踢出去”。
+    // ---------- 归一输出映射到四路电压 + 分级电压斜率限制 ----------
+    // 提速态用 slew_boost（宽松但仍有上限，防踢车），稳定态用 volt_jitter_max（紧限抖）。
+    const float max_dv = (is_boost ? slew_boost : volt_jitter_max) *
+                         static_cast<float>(dt_us) / 1000000.0f;
     for (uint8_t i = 0; i < 4; i++)
     {
         const float base_voltage = friction + volt_min[i];
         const float controllable_voltage = volt_max[i] - base_voltage;
         float volt = target_sign * base_voltage +
                      output * controllable_voltage * volt_factor[i];
-        // factor 被误调到 >1 等异常情况下保证不超硬件电压上限。
         if (volt > volt_max[i])
             volt = volt_max[i];
         else if (volt < -volt_max[i])
             volt = -volt_max[i];
 
-        // 斜率限制：本拍电压变化不超过 slew_rate × dt
-        if (volt > prev_volt[i] + max_dv)
+        const float dv = volt - prev_volt[i];
+        if (dv > max_dv)
             volt = prev_volt[i] + max_dv;
-        else if (volt < prev_volt[i] - max_dv)
+        else if (dv < -max_dv)
             volt = prev_volt[i] - max_dv;
-        prev_volt[i] = volt;
 
+        prev_volt[i] = volt;
         volt_output[i] = volt;
         motors[i]->spin(vex::directionType::fwd, volt, vex::voltageUnits::volt);
     }
 
+    // 更新历史
     previous_error = error;
+    pre_v = speed;
+    pre_a = now_a;
 }
+
 void MyMotorGroup::my_respin()
 {
     is_stoped = false;
+    is_boost = true; // 重新起步必走提速态：清干净积分后让电压按 slew_boost 爬，不在静止时积 I
     integral = 0.0f;
     previous_error = 0.0f;
     target_sign = 0;
     for (uint8_t i = 0; i < 4; i++)
+    {
         prev_volt[i] = 0.0f;
-    speed_filter_inited = false;
+        volt_output[i] = 0.0f;
+    }
+    pre_v = 0.0f;
+    pre_a = 0.0f;
     last_time_us = get_time_us();
 }
 
@@ -254,5 +211,12 @@ void MyMotorGroup::drive(float target)
     // 运行中再次调用只改目标，不清任何环内状态。
     if (is_stoped)
         my_respin();
+
+    // target 相对跳变：进入提速态的唯一入口。
+    // 变化量超过 max(|new_target|, 3) 的一定比例即触发。
+    const float target_scale = fmaxf(fabsf(target), target_min_current);
+    if (fabsf(target - this->target) > target_scale * target_jump_ratio)
+        is_boost = true;
+
     this->target = target;
 }

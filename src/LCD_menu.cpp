@@ -61,8 +61,16 @@ const struct MENU_ITEM menu_item[] =
         {"R_vf3", type_float, &right_motors.volt_factor[3], "右3电压系数", ""},
         {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
-        {"L_slew", type_float, &left_motors.slew_rate, "左电压斜率", "V/s"},
-        {"R_slew", type_float, &right_motors.slew_rate, "右电压斜率", "V/s"},
+        {"L_iSlew", type_float, &left_motors.i_slew_max, "左I速率", "out/s"},
+        {"R_iSlew", type_float, &right_motors.i_slew_max, "右I速率", "out/s"},
+        {"L_jitter", type_float, &left_motors.volt_jitter_max, "左抖动限", "V/s"},
+        {"R_jitter", type_float, &right_motors.volt_jitter_max, "右抖动限", "V/s"},
+        {"L_slewB", type_float, &left_motors.slew_boost, "左提速斜率", "V/s"},
+        {"R_slewB", type_float, &right_motors.slew_boost, "右提速斜率", "V/s"},
+        {"L_errImin", type_float, &left_motors.error_for_i_min, "左I误差下限", "pct"},
+        {"R_errImin", type_float, &right_motors.error_for_i_min, "右I误差下限", "pct"},
+        {"L_errIratio", type_float, &left_motors.error_for_i_ratio, "左I误差比例", ""},
+        {"R_errIratio", type_float, &right_motors.error_for_i_ratio, "右I误差比例", ""},
 
         // ========== 位置环 ==========
         {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},
@@ -131,14 +139,18 @@ static struct MENU_ITEM monitor_menu_item[] =
         // 指令转速：速度环目标，内存项直接读（与 L0/R0_rpm 对照即跟踪误差）
         {"L_tgt", type_float, &left_motors.target, "左指令转速", "pct", monitor_tag_fast},
         {"R_tgt", type_float, &right_motors.target, "右指令转速", "pct", monitor_tag_fast},
+        {"L_integral", type_float, &left_motors.integral, "左PID积分", "", monitor_tag_fast},
+        {"R_integral", type_float, &right_motors.integral, "右PID积分", "", monitor_tag_fast},
+        {"L_error", type_float, &left_motors.previous_error, "左PID误差", "", monitor_tag_fast},
+        {"R_error", type_float, &right_motors.previous_error, "右PID误差", "", monitor_tag_fast},
 
         // 转速/电流/编码器：无捕获 lambda 直接转 MenuFloatGetter，构造自动置 GETTER；
         // SDK 读数是 double，cast 成 float 匹配签名。加/删一项只动这一行
         // 转速只取 motors[0]（与轮轴直连，经齿轮传动的读数不代表轮速），pct 与 target 同口径
-        {"L_pct", []
-         { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左转速", "pct", monitor_tag_fast},
-        {"R_pct", []
-         { return static_cast<float>(right_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "右转速", "pct", monitor_tag_fast},
+        {"L_pct", type_float, &left_motors.pre_v, "左转速(慢1拍)", "pct", monitor_tag_fast},
+        {"R_pct", type_float, &right_motors.pre_v, "右转速(慢1拍)", "pct", monitor_tag_fast},
+        {"L_a", type_float, &left_motors.pre_a, "左加速度(慢1拍)", "pct", monitor_tag_fast},
+        {"R_a", type_float, &right_motors.pre_a, "右加速度(慢1拍)", "pct", monitor_tag_fast},
 
         // 实际电压：SDK 回读，与指令电压 Vcmd 对照（差距大说明被限幅/堵转）
         {"L0_Vact", []
