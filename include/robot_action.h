@@ -100,7 +100,7 @@ public:
     void stop_move();
 
     // ---- 手动控制----
-
+    float turn_atten = 0.5f;  // 转向衰减系数，0=无衰减，1=全衰减
     int manual_deadzone = 16; // 手动摇杆输入死区
 
     // 进入手动模式：把注入的摇杆设为 only_value（不触发方向键），

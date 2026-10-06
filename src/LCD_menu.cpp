@@ -72,36 +72,32 @@ const struct MENU_ITEM menu_item[] =
         {"L_errIratio", type_float, &left_motors.error_for_i_ratio, "左I误差比例", ""},
         {"R_errIratio", type_float, &right_motors.error_for_i_ratio, "右I误差比例", ""},
 
-        // ========== 位置环 ==========
-        {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},
-        {"d_ki", type_float, &robot_action.distance_pid.ki, "距离ki内部÷1e6", ""},
-        {"d_kd", type_float, &robot_action.distance_pid.kd, "距离kd内部×1e6", ""},
-        {"d_max", type_float, &robot_action.distance_pid.max_output, "距离环限速", "pct"},
+        // // ========== 位置环 ==========
+        // {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},
+        // {"d_ki", type_float, &robot_action.distance_pid.ki, "距离ki内部÷1e6", ""},
+        // {"d_kd", type_float, &robot_action.distance_pid.kd, "距离kd内部×1e6", ""},
+        // {"d_max", type_float, &robot_action.distance_pid.max_output, "距离环限速", "pct"},
 
-        {"h_kp", type_float, &robot_action.heading_pid.kp, "纠偏kp 输出/误差", ""},
-        {"h_ki", type_float, &robot_action.heading_pid.ki, "纠偏ki内部÷1e6", ""},
-        {"h_kd", type_float, &robot_action.heading_pid.kd, "纠偏kd内部×1e6", ""},
-        {"h_max", type_float, &robot_action.heading_pid.max_output, "纠偏限速", "pct"},
+        // {"h_kp", type_float, &robot_action.heading_pid.kp, "纠偏kp 输出/误差", ""},
+        // {"h_ki", type_float, &robot_action.heading_pid.ki, "纠偏ki内部÷1e6", ""},
+        // {"h_kd", type_float, &robot_action.heading_pid.kd, "纠偏kd内部×1e6", ""},
+        // {"h_max", type_float, &robot_action.heading_pid.max_output, "纠偏限速", "pct"},
 
-        {"t_kp", type_float, &robot_action.turn_pid.kp, "转向kp 输出/误差", ""},
-        {"t_ki", type_float, &robot_action.turn_pid.ki, "转向ki内部÷1e6", ""},
-        {"t_kd", type_float, &robot_action.turn_pid.kd, "转向kd内部×1e6", ""},
-        {"t_max", type_float, &robot_action.turn_pid.max_output, "转向限速", "pct"},
+        // {"t_kp", type_float, &robot_action.turn_pid.kp, "转向kp 输出/误差", ""},
+        // {"t_ki", type_float, &robot_action.turn_pid.ki, "转向ki内部÷1e6", ""},
+        // {"t_kd", type_float, &robot_action.turn_pid.kd, "转向kd内部×1e6", ""},
+        // {"t_max", type_float, &robot_action.turn_pid.max_output, "转向限速", "pct"},
 
-        // ========== 几何 / 满速 / 容差 ==========
-        {"wheel_r", type_float, &chassis.wheel_r, "轮半径", "m"},
-        {"track_w", type_float, &chassis.track_width, "轮距", "m"},
-        {"fwd_off", type_float, &chassis.forward_tracking_offset, "前向轮偏右", "m"},
-        {"side_off", type_float, &chassis.side_tracking_offset, "侧向轮偏后", "m"},
-        {"L_max", type_float, &chassis.left_max_speed, "左满速", "pct"},
-        {"R_max", type_float, &chassis.right_max_speed, "右满速", "pct"},
+        // // ========== 满速 / 容差 ==========
+        // {"L_max", type_float, &chassis.left_max_speed, "左满速", "pct"},
+        // {"R_max", type_float, &chassis.right_max_speed, "右满速", "pct"},
 
-        {"dist_tol", type_float, &robot_action.distance_tolerance, "距离容差", "m"},
-        {"v_tol", type_float, &robot_action.linear_speed_tolerance, "线速度容差", "m/s"},
-        {"head_tol", type_float, &robot_action.heading_tolerance, "直线航向容差", "deg"},
-        {"ang_tol", type_float, &robot_action.angle_tolerance, "转角容差", "deg"},
-        {"w_tol", type_float, &robot_action.angular_speed_tolerance, "角速度容差", "deg/s"},
-        {"man_dz", type_int32_t, &robot_action.manual_deadzone, "摇杆死区", ""},
+        // {"dist_tol", type_float, &robot_action.distance_tolerance, "距离容差", "m"},
+        // {"v_tol", type_float, &robot_action.linear_speed_tolerance, "线速度容差", "m/s"},
+        // {"head_tol", type_float, &robot_action.heading_tolerance, "直线航向容差", "deg"},
+        // {"ang_tol", type_float, &robot_action.angle_tolerance, "转角容差", "deg"},
+        // {"w_tol", type_float, &robot_action.angular_speed_tolerance, "角速度容差", "deg/s"},
+        // {"man_dz", type_int32_t, &robot_action.manual_deadzone, "摇杆死区", ""},
 };
 
 // 监控表要在运行时被通信模块改订阅档位（改tag字段），不能加const。
@@ -143,6 +139,8 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"R_integral", type_float, &right_motors.integral, "右PID积分", "", monitor_tag_fast},
         {"L_error", type_float, &left_motors.previous_error, "左PID误差", "", monitor_tag_fast},
         {"R_error", type_float, &right_motors.previous_error, "右PID误差", "", monitor_tag_fast},
+        {"L_boost", type_bool, &left_motors.is_boost, "左是否增速模式", "", monitor_tag_fast},
+        {"R_boost", type_bool, &right_motors.is_boost, "右是否增速模式", "", monitor_tag_fast},
 
         // 转速/电流/编码器：无捕获 lambda 直接转 MenuFloatGetter，构造自动置 GETTER；
         // SDK 读数是 double，cast 成 float 匹配签名。加/删一项只动这一行

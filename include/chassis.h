@@ -23,7 +23,7 @@ public:
     float volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
     // 电压限幅与映射
-    float volt_max[4] = {12.0f, 12.0f, 12.0f, 12.0f}; // 最大电压(实测，空载时)
+    float volt_max[4] = {10.0f, 10.0f, 10.0f, 10.0f}; // 最大电压(实测，空载时)
 
     // 每台电机的个体死区补偿：只要有输出就必须垫上的电压，用来对齐各轮开始转动的起点
     // 取值 = 该电机空载时稳定低速运转所需的最低电压(通常在0.5V左右)
@@ -65,17 +65,15 @@ public:
     // 但不能完全不限（不限就是起步踢车/换向冲击的根因）。
     float slew_boost = 25.0f; // V/s
 
-    // 历史记录（用于判态）
-    float pre_v = 0.0f;   // 上一次速度
-    float pre_a = 0.0f;   // 上一次的加速度
-    bool is_boost = true; // 当前是否提速态：true=提速态，false=稳定态。
-                          // drive() 设 target 时若跳变则置 true；my_spin() 满足稳定条件后置 false。
+    // 当前是否提速态：true=提速态，false=稳定态。
+    // drive() 设 target 时若跳变则置 true；my_spin() 满足稳定条件后置 false。
+    bool is_boost = true;
 
-    float prev_volt[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一拍实际输出电压
+    float pre_output_volt[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一拍实际输出电压
 
     int8_t target_sign = 0; // 上一轮目标方向，用于检测换向与双极性映射；0 表示起步前未知
 
-    float target = 0.0f; // 目标速度，单位 pct（±100）
+    float target = 0.0f; // 目标速度，单位 pct（±100）,外界禁止直接修改
 
     float kf;                    // 阻力前馈，单位：归一输出 / pct
     float kp;                    // 比例项，单位：归一输出 / pct
@@ -83,7 +81,10 @@ public:
     float kd;                    // 微分项，内部单位：归一输出·us / pct
     float integral = 0.0f;       // integral 保存误差累计；本类所有时间量统一使用 us。
     float previous_error = 0.0f; // previous_error 保存上一轮误差，用于计算 D 项。
-    uint32_t last_time_us = 0;   // 上一轮 update() 使用的 VEX 系统微秒时间戳。
+    float pre_v = 0.0f;          // 上一次速度
+    float pre_a = 0.0f;          // 上一次的加速度
+
+    uint32_t last_time_us = 0; // 上一轮 update() 使用的 VEX 系统微秒时间戳。
 
     MyMotorGroup(vex::motor &m1, vex::motor &m2,
                  vex::motor &m3, vex::motor &m4,
@@ -102,12 +103,11 @@ public:
     void my_spin();
 
     // 给定目标速度（pct，±100）并确保速度环开始追踪。
-    // 停车后首次调用会自动 my_respin() 清积分起步；持续运行期间只更新目标。
+    // 外界唯一修改target 入口 禁止直接赋值
     void drive(float target);
 
+    // 停车后会自动 清积分
     void stop();
-
-    void my_respin();
 };
 
 class Chassis

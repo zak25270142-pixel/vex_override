@@ -188,21 +188,32 @@ float RobotAction::square_map_axis(int v)
 
 void RobotAction::update_manual(uint32_t now)
 {
+    // square_map_axis 已把单轴做成低速更细（死区 + 平方映射），输出约 ±100
     float forward = square_map_axis(*move_axis);
     float turn = square_map_axis(*turn_axis);
 
-    // Arcade 合成左右轮指令，square_map_axis 的输出范围为 ±100。
-    float left_cmd = forward + turn;
-    float right_cmd = forward - turn;
-
-    // 两杆回中：松杆即刹车。stop() 制动并停掉速度环，下次推杆时 drive 自动清积分起步。
-    if (left_cmd == 0.0f && right_cmd == 0.0f)
+    // 两杆都回中 → 停车（清积分由 chassis.stop → MyMotorGroup::stop 完成）
+    if (forward == 0.0f && turn == 0.0f)
     {
         chassis.stop();
         return;
     }
 
-    // output 入参即速度环目标，超满速叠加的等比缩回也在其中处理。
+    // 摇杆合成半径 r ∈ [0, 1]（用原始轴值算，避免 square_map 二次非线性）
+    float r = sqrtf(static_cast<float>((*move_axis) * (*move_axis) + (*turn_axis) * (*turn_axis))) / 127.0f;
+
+    float turn_scaled = turn * (1.0f - turn_atten * r);
+
+    float left_cmd = forward + turn_scaled;
+    float right_cmd = forward - turn_scaled;
+
+    float max_abs = fmaxf(fabsf(left_cmd), fabsf(right_cmd));
+    if (max_abs > 1e-3f)
+    {
+        float scale = r * 100 / max_abs;
+        left_cmd *= scale;
+        right_cmd *= scale;
+    }
     chassis.output(left_cmd, right_cmd);
 }
 

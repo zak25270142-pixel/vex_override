@@ -2,11 +2,11 @@
 #include <cmath>
 
 PositionPID::PositionPID(float p, float i, float d, float output_limit)
-    : kp(p),
+    : last_time_us(0), kp(p),
       ki(i / 1000000.0f),
       kd(d * 1000000.0f),
       integral(0.0f), previous_error(0.0f),
-      last_time_us(0), max_output(output_limit) {}
+      max_output(output_limit) {}
 
 float PositionPID::reset(float error, uint32_t current_time_us)
 {
