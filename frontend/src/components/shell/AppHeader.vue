@@ -9,9 +9,21 @@
     </div>
 
     <!-- 接入方式 -->
-    <div class="access" :class="demoMode ? 'access--demo' : 'access--real'" title="当前数据接入方式">
+    <div
+      class="access"
+      :class="demoMode || backendMode ? 'access--demo' : 'access--real'"
+      title="当前数据接入方式"
+    >
       <span class="access__dot" />
-      {{ demoMode ? '演示数据源' : serialSupported ? 'WEB SERIAL 实机' : '串口不可用' }}
+      {{
+        demoMode
+          ? '演示数据源'
+          : backendMode
+            ? 'PYTHON 后端'
+            : serialSupported
+              ? 'WEB SERIAL 实机'
+              : '串口不可用'
+      }}
     </div>
 
     <!-- 取表请求：连上才可用，随时点可重新拉取 -->
@@ -45,6 +57,12 @@
       <span>演示</span>
     </label>
 
+    <!-- 后端开关：经本机 Python backend(ws://127.0.0.1:8000) 中转，可与测试脚本共存 -->
+    <label class="demo-switch" title="连接本机 Python backend：脚本可同时跑，停车始终优先">
+      <input type="checkbox" :checked="backendMode" @change="onBackendChange" />
+      <span>后端</span>
+    </label>
+
     <!-- 自动连接：打开页面 / 断线后自动重连已授权的串口设备 -->
     <label class="demo-switch" title="打开页面或断线后自动重连已授权串口（首次需手动选口授权）">
       <input type="checkbox" :checked="autoConnect" @change="onAutoConnectChange" />
@@ -54,7 +72,7 @@
     <!-- 连接链路：未选口时可先选口，再连接；已连接可断开 -->
     <div class="conn-group">
       <button
-        v-if="!demoMode"
+        v-if="!demoMode && !backendMode"
         class="btn btn--ghost"
         :disabled="connected || connState === 'connecting'"
         title="选择 V5 User 口对应的串口"
@@ -65,7 +83,7 @@
       <button
         class="btn"
         :class="connected ? 'btn--danger' : 'btn--accent'"
-        :disabled="connState === 'connecting' || (!demoMode && !serialSupported)"
+        :disabled="connState === 'connecting' || (!demoMode && !backendMode && !serialSupported)"
         @click="toggleConnect"
       >
         {{ connState === 'connecting' ? '连接中…' : connected ? '断开' : '连接' }}
@@ -77,6 +95,7 @@
 <script setup lang="ts">
 import {
   autoConnect,
+  backendMode,
   commStats,
   connState,
   connected,
@@ -87,6 +106,7 @@ import {
   pickPort,
   serialSupported,
   setAutoConnect,
+  setBackendMode,
   setDemoMode,
   statusText,
   toggleConnect,
@@ -95,6 +115,10 @@ import DiagnosticsDialog from '@/components/shell/DiagnosticsDialog.vue'
 
 function onDemoChange(e: Event): void {
   void setDemoMode((e.target as HTMLInputElement).checked)
+}
+
+function onBackendChange(e: Event): void {
+  void setBackendMode((e.target as HTMLInputElement).checked)
 }
 
 function onAutoConnectChange(e: Event): void {

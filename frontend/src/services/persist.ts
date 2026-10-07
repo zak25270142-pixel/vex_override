@@ -45,6 +45,8 @@ export interface LayoutPrefs {
 export interface Prefs {
   autoConnect: boolean
   demo: boolean
+  /** 后端模式：经本机 Python backend(ws://127.0.0.1:8000) 中转，与 demo 互斥 */
+  backend: boolean
   port: PortIdentity | null
   /** monitor index → 订阅档位（含退订，用于对抗主控默认订阅位） */
   subs: Record<number, SubEntry>
@@ -74,6 +76,7 @@ export function defaultPrefs(): Prefs {
   return {
     autoConnect: true,
     demo: false,
+    backend: false,
     port: null,
     subs: {},
     chart: defaultChart(),
@@ -178,6 +181,7 @@ function readPrefs(): Prefs {
   return {
     autoConnect: asBool(raw.autoConnect, def.autoConnect),
     demo: asBool(raw.demo, def.demo),
+    backend: asBool(raw.backend, def.backend),
     port: readPort(raw.port),
     subs: readSubs(raw.subs),
     chart: readChart(raw.chart),

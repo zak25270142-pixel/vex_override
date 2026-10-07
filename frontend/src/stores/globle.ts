@@ -42,6 +42,8 @@ import type { WorkView } from '@/config/workspace'
 export const serialSupported = ref(serialClient.supported)
 /** 演示模式（持久化：下次打开沿用上次的选择） */
 export const demoMode = ref(loadPrefs().demo)
+/** 后端模式：经本机 Python backend 中转，可与测试脚本共存（持久化） */
+export const backendMode = ref(loadPrefs().backend)
 export const connState = ref(serialClient.state)
 export const connected = computed(() => connState.value === 'connected')
 export const statusText = ref(
@@ -812,10 +814,24 @@ export async function toggleConnect(): Promise<void> {
 }
 
 export async function setDemoMode(on: boolean): Promise<void> {
+  // 演示与后端互斥：开演示先把后端模式撤掉
+  if (on && backendMode.value) await serialClient.setBackendMode(false)
   await serialClient.setDemoMode(on)
   demoMode.value = on
+  backendMode.value = serialClient.isBackend
   connState.value = serialClient.state
-  savePrefs({ demo: on })
+  savePrefs({ demo: on, backend: serialClient.isBackend })
+}
+
+/** 顶栏「后端」开关：切到本机 Python backend（ws://127.0.0.1:8000），与演示互斥 */
+export async function setBackendMode(on: boolean): Promise<void> {
+  if (on && demoMode.value) await serialClient.setDemoMode(false)
+  await serialClient.setBackendMode(on)
+  backendMode.value = serialClient.isBackend
+  demoMode.value = serialClient.isDemo
+  connState.value = serialClient.state
+  savePrefs({ backend: serialClient.isBackend, demo: serialClient.isDemo })
+  if (on && autoConnect.value) void serialClient.autoConnect(baud)
 }
 
 /** 顶栏"自动连接"开关：落盘并联动串口客户端的重连开关 */

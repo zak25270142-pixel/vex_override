@@ -2,6 +2,7 @@
 
 import type { ConnState, PortProbe, SerialTransport, TransportCallbacks } from './transport'
 import { ConnectError, WebSerialTransport } from './webSerialTransport'
+import { WsTransport } from './wsTransport'
 import { MockTransport } from './mockTransport'
 import { loadPrefs, savePrefs } from './persist'
 import { FRAME_HEAD, ping } from './protocol'
@@ -47,6 +48,8 @@ class SerialClient {
   state: ConnState = 'idle'
   private transport: SerialTransport | null = null
   private demo = false
+  /** 后端模式：传输走 WsTransport，与 demo/直连串口互斥 */
+  private backend = false
   /** 用户是否希望保持连接（手动连接或自动连接过，断开则清零） */
   private wantConnected = false
   /** 自动重连开关（顶栏"自动连接"勾选项）；关闭后不再重试 */
@@ -78,6 +81,10 @@ class SerialClient {
 
   get isDemo(): boolean {
     return this.demo
+  }
+
+  get isBackend(): boolean {
+    return this.backend
   }
 
   get connected(): boolean {
@@ -124,13 +131,20 @@ class SerialClient {
     onData: (data) => this.onData?.(data),
   }
 
-  /** 应用启动：预选已授权设备（优先持久化记住的那台） */
+  /** 应用启动：按持久化接入方式预选传输（直连串口预选已授权设备，后端模式无需选口） */
   async init(): Promise<void> {
+    const prefs = loadPrefs()
+    this.backend = prefs.backend
+    this.demo = false
+    this.autoConnectEnabled = prefs.autoConnect
+    if (prefs.backend) {
+      this.transport = new WsTransport(this.cb)
+      return
+    }
     if (!this.supported) return
-    this.autoConnectEnabled = loadPrefs().autoConnect
     const transport = new WebSerialTransport(this.cb)
     this.transport = transport
-    transport.setIdentity(loadPrefs().port)
+    transport.setIdentity(prefs.port)
     if (await transport.preselect()) {
       const tip = transport.hasAmbiguousPort
         ? '（检测到多台同型设备，可点「选口」指定）'
@@ -164,9 +178,9 @@ class SerialClient {
     await this.attempt(baudRate)
   }
 
-  /** 用户手势触发选口 */
+  /** 用户手势触发选口（后端模式无口可选） */
   async pickPort(): Promise<void> {
-    if (this.demo) return
+    if (this.backend || this.demo) return
     if (!this.supported) throw new Error('当前浏览器不支持 Web Serial，请使用 Chrome 或 Edge')
     let t: WebSerialTransport
     if (this.transport instanceof WebSerialTransport) {
@@ -200,6 +214,28 @@ class SerialClient {
 
   async send(data: Uint8Array): Promise<void> {
     await this.transport?.send(data)
+  }
+
+  /** 切换后端模式；与演示模式互斥（调用方 store 负责把另一者关掉）。
+      切回直连串口时恢复持久化端口预选 */
+  async setBackendMode(on: boolean): Promise<void> {
+    if (this.backend === on && this.transport?.kind === (on ? 'ws' : 'webserial')) return
+    if (this.connected) await this.disconnect()
+    this.wantConnected = false
+    this.gestureBlocked = false
+    this.clearRetry()
+    this.backend = on
+    this.demo = false
+    if (on) {
+      this.transport = new WsTransport(this.cb)
+      this.cb.onStatus('idle', '后端模式（未连接）')
+      return
+    }
+    const t = new WebSerialTransport(this.cb)
+    this.transport = t
+    t.setIdentity(loadPrefs().port)
+    await t.preselect()
+    this.cb.onStatus('idle', '未连接')
   }
 
   /** 切换演示模式；若已连接先断开，避免串口占用。

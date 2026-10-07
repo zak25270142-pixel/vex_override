@@ -22,3 +22,8 @@ Thumbs.db
 AGENTS.md
 .trae/
 docs/
+
+# Python backend
+backend/.venv/
+backend/**/__pycache__/
+backend/pytest/log_*
