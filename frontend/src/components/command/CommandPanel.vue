@@ -7,65 +7,77 @@
     </div>
 
     <div class="cmd-panel__body">
-      <!-- 空态 -->
-      <div v-if="commands.length === 0" class="empty">
-        <template v-if="!connected">连接后自动获取命令表</template>
-        <template v-else>命令表为空，请点标题栏重新获取</template>
+      <div class="cmd-panel__form">
+        <!-- 空态 -->
+        <div v-if="commands.length === 0" class="empty">
+          <template v-if="!connected">连接后自动获取命令表</template>
+          <template v-else>命令表为空，请点标题栏重新获取</template>
+        </div>
+
+        <template v-else>
+          <!-- 第一步：选命令 -->
+          <label class="field">
+            <span class="field__label">选择命令</span>
+            <select v-model.number="selected" class="cmd-select">
+              <option :value="-1">— 请选择 —</option>
+              <option v-for="c in commands" :key="c.index" :value="c.index">
+                0x{{ c.index.toString(16).toUpperCase() }} {{ c.name }}
+              </option>
+            </select>
+          </label>
+
+          <!-- 第二步：按目录里的字段描述动态渲染输入项 -->
+          <template v-if="sel">
+            <div v-for="(f, i) in sel.fields" :key="i" class="field">
+              <span class="field__label">
+                {{ f.name }}
+                <em class="field__type">{{ typeName(f.type) }}</em>
+                <em v-if="f.min !== undefined" class="field__type field__range">
+                  {{ f.min }}~{{ f.max }}
+                </em>
+              </span>
+
+              <input
+                v-if="isBool(f.type)"
+                v-model="drafts[i].check"
+                class="switch"
+                type="checkbox"
+                title="勾选=开"
+              />
+              <input
+                v-else-if="f.type === ValueType.Color"
+                v-model="drafts[i].text"
+                class="color-edit"
+                type="color"
+              />
+              <input
+                v-else
+                v-model="drafts[i].text"
+                class="num-edit"
+                type="number"
+                step="any"
+                :min="f.min"
+                :max="f.max"
+                :placeholder="'输入' + f.name"
+              />
+            </div>
+
+            <!-- 无参命令的提示 -->
+            <p v-if="sel.fields.length === 0" class="no-arg">该命令无需参数</p>
+
+            <!-- 第三步：确认下发 -->
+            <button class="send-btn" :disabled="!canSend" @click="onSend">
+              下发「{{ sel.name }}」
+            </button>
+            <p v-if="!canSend && sel.fields.length > 0" class="hint">请把参数填成范围内的有效数字</p>
+          </template>
+        </template>
       </div>
 
-      <template v-else>
-        <!-- 第一步：选命令 -->
-        <label class="field">
-          <span class="field__label">选择命令</span>
-          <select v-model.number="selected" class="cmd-select">
-            <option :value="-1">— 请选择 —</option>
-            <option v-for="c in commands" :key="c.index" :value="c.index">
-              0x{{ c.index.toString(16).toUpperCase() }} {{ c.name }}
-            </option>
-          </select>
-        </label>
-
-        <!-- 第二步：按目录里的字段描述动态渲染输入项 -->
-        <template v-if="sel">
-          <div v-for="(f, i) in sel.fields" :key="i" class="field">
-            <span class="field__label">
-              {{ f.name }}
-              <em class="field__type">{{ typeName(f.type) }}</em>
-            </span>
-
-            <input
-              v-if="isBool(f.type)"
-              v-model="drafts[i].check"
-              class="switch"
-              type="checkbox"
-              title="勾选=开"
-            />
-            <input
-              v-else-if="f.type === ValueType.Color"
-              v-model="drafts[i].text"
-              class="color-edit"
-              type="color"
-            />
-            <input
-              v-else
-              v-model="drafts[i].text"
-              class="num-edit"
-              type="number"
-              step="any"
-              :placeholder="'输入' + f.name"
-            />
-          </div>
-
-          <!-- 无参命令的提示 -->
-          <p v-if="sel.fields.length === 0" class="no-arg">该命令无需参数</p>
-
-          <!-- 第三步：确认下发 -->
-          <button class="send-btn" :disabled="!canSend" @click="onSend">
-            下发「{{ sel.name }}」
-          </button>
-          <p v-if="!canSend && sel.fields.length > 0" class="hint">请把参数填成有效数字</p>
-        </template>
-      </template>
+      <!-- 底部常驻停车条：不走表单，选中任何命令时都可用 -->
+      <div class="cmd-panel__footer">
+        <button class="stop-btn" :disabled="!connected" @click="onStop">停 车</button>
+      </div>
     </div>
   </aside>
 </template>
@@ -75,17 +87,20 @@ import { computed, reactive, ref, watch } from 'vue'
 import {
   ValueType,
   typeName,
+  cmdSpec,
+  CmdSpec,
   type CellValue,
   type CmdField,
 } from '@/services/protocol'
 import { commandMap, connected, sendCommand } from '@/stores/globle'
 
-/** 命令按命令字升序排列（注册表下发顺序可能乱） */
+/** 命令按命令字升序排列（注册表下发顺序可能乱）；停车是特化命令，不走表单，见底部停车按钮 */
 const commands = computed(() =>
   Object.keys(commandMap)
     .map(Number)
     .sort((a, b) => a - b)
-    .map((k) => commandMap[k]!),
+    .map((k) => commandMap[k]!)
+    .filter((c) => cmdSpec(c.tag) !== CmdSpec.Stop),
 )
 
 const selected = ref(-1)
@@ -117,13 +132,17 @@ function isBool(type: ValueType): boolean {
   return type === ValueType.Bool || type === ValueType.OnOff
 }
 
-/** 单个字段当前是否已填成合法值 */
+/** 单个字段当前是否已填成合法值（下发了取值范围时还要落在min~max内） */
 function fieldValid(f: CmdField, d: Draft): boolean {
   if (isBool(f.type)) return true // 复选框不存在非法输入
   // number框v-model可能给出数字，统一转字符串再判断
   const text = String(d.text ?? '')
   if (f.type === ValueType.Color) return /^#[0-9a-f]{6}$/i.test(text)
-  return text.trim() !== '' && Number.isFinite(Number(text))
+  const n = Number(text)
+  if (text.trim() === '' || !Number.isFinite(n)) return false
+  if (f.min !== undefined && n < f.min) return false
+  if (f.max !== undefined && n > f.max) return false
+  return true
 }
 
 const canSend = computed(() => {
@@ -140,6 +159,13 @@ async function onSend(): Promise<void> {
     return Number(d.text)
   })
   await sendCommand(sel.value.index, values)
+}
+
+/** 一键停车：按目录 tag 的特化位找停车命令直发（无参），不依赖表单当前选中项 */
+async function onStop(): Promise<void> {
+  if (!connected.value) return
+  const stop = Object.values(commandMap).find((c) => cmdSpec(c.tag) === CmdSpec.Stop)
+  if (stop) await sendCommand(stop.index, [])
 }
 </script>
 
@@ -177,11 +203,48 @@ async function onSend(): Promise<void> {
 .cmd-panel__body {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 表单滚动区：内容多时自己滚，不把底部停车条顶出去 */
+.cmd-panel__form {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 14px;
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.cmd-panel__footer {
+  flex-shrink: 0;
+  padding: 12px 14px;
+  border-top: var(--border-panel);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.stop-btn {
+  height: 40px;
+  min-width: 104px;
+  font-size: 15px;
+  font-family: inherit;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #fff;
+  background: var(--status-danger);
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  box-shadow: var(--glow-danger);
+}
+
+.stop-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .empty {
@@ -214,6 +277,12 @@ async function onSend(): Promise<void> {
   border: var(--border-subtle);
   border-radius: 4px;
   padding: 0 5px;
+}
+
+/* 取值范围徽标：与类型徽标同款式，用主题色区分 */
+.field__range {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .cmd-select,

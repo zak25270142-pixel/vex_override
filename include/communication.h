@@ -16,7 +16,7 @@
 //   A5 | Cmd | Payload... | XOR
 //     A5      固定帧头，每一帧都以它开头，收信方靠它在乱码的字节流里找到帧的起点
 //     Cmd     1B命令字，说明这帧是干什么的（见下面两个枚举）
-//     Payload 0~255B数据，有些命令没有数据
+//     Payload 0~445B数据，有些命令没有数据
 //     XOR     1B校验，把Cmd和Payload每个字节依次异或得到；传错一个字节就对不上
 //
 // 订阅档位存在每个监控项的 tag 字段里（见 MENU_ITEM / my_main.h 位域说明）：
@@ -34,16 +34,42 @@
 // p指向payload首字节（各输入字段紧凑排列），长度由命令表按类型累加可知。
 typedef void (*CmdFunc)(const uint8_t *p);
 
+// 动作命令 tag：单字节位域（风格与 my_main.h 的 MENU_TAG_* 一致）
+//   bit7 (0x80) CMD_TAG_RANGE  是否带取值范围：1=目录帧字段描述后跟{min,max}数组
+//   bit6~4      CMD_TAG_ARGC_* 参数个数0~7（上限7，参数个数的唯一来源）
+//   bit3~0      CMD_TAG_SPEC_* 特化命令：0普通 1停车，其余暂未定义
+static constexpr uint8_t CMD_TAG_RANGE = 0x80u;
+static constexpr uint8_t CMD_TAG_ARGC_MASK = 0x70u;
+static constexpr uint8_t CMD_TAG_ARGC_SHIFT = 4;
+static constexpr uint8_t CMD_TAG_SPEC_MASK = 0x0Fu;
+static constexpr uint8_t CMD_SPEC_NORMAL = 0u;
+static constexpr uint8_t CMD_SPEC_STOP = 1u;
+
+// 拼一条命令的tag：has_range=是否带取值范围，argc=参数个数(0~7)，spec=特化类型
+static inline uint8_t cmd_tag_make(bool has_range, uint8_t argc, uint8_t spec)
+{
+    return static_cast<uint8_t>((has_range ? CMD_TAG_RANGE : 0u) |
+                                ((argc & 0x07u) << CMD_TAG_ARGC_SHIFT) |
+                                (spec & CMD_TAG_SPEC_MASK));
+}
+
+// 读一条命令tag里的参数个数（bit6~4）
+static inline uint8_t cmd_tag_argc(uint8_t tag)
+{
+    return static_cast<uint8_t>((tag & CMD_TAG_ARGC_MASK) >> CMD_TAG_ARGC_SHIFT);
+}
+
 // 一条动作命令的登记表项，全部为const静态描述，各子系统在自己文件里写成
 // const数组，构造USB_Comm时整张表传入。payload长度不存：收帧时按data_type
-// 逐字段value_size累加即可，避免表项与真实字段两处不一致。
+// 逐字段value_size累加即可；参数个数也不单存，tag的bit6~4就是（上限7）。
 struct CMD_ITEM
 {
     CmdFunc func;                  // 处理函数指针
     const VALUE_TYPE *data_type;   // 输入字段类型表（无参时可为nullptr）
     const char *const *field_name; // 输入字段中文名表（无参时可为nullptr）
-    uint8_t input_num;             // 输入字段数量，上限6
     const char *name;              // 命令中文名，目录帧与诊断用
+    uint8_t tag;                   // tag位域：bit7带范围 bit6~4参数个数 bit3~0特化命令
+    const float *ranges;           // 取值范围表{min1,max1,min2,max2,...}：bit7=1时随目录下发，无范围填nullptr
 };
 
 class USB_Comm
@@ -57,7 +83,7 @@ private:
         Post_Monitor_Directory, // 监控目录；其中 tag 为位域字节（见 my_main.h）
         Monitor_Post,           // 有内容命令 [CMD 1B][index索引1B][当前数值?B取决于type][XOR]
         Tunable_Echo,           // 有内容命令 [CMD 1B][index索引1B][实际生效值?B取决于type][XOR]
-        Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][名长][名][参数量][每参:类型+字段名长+字段名]，一命令一帧
+        Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][tag 1B][名长][名][参数量][每参:类型+字段名长+字段名][bit7=1时:每参min/max]，一命令一帧
         Pong = 0xFF,
     };
     enum Cmd_Get
@@ -86,9 +112,8 @@ private:
     };
 
     static constexpr uint8_t FRAME_HEAD = 0xA5; // 固定帧头
-    // Payload上限取uint8能表达的最大值：命令帧多参数时余量充足。
-    // 整帧最长258B(A5+Cmd+255+XOR)，仍小于USB单包512B，一帧不会被USB拆开。
-    static constexpr uint16_t MAX_PAYLOAD = 255;
+    // Payload上限445B：整帧最长448B(A5+Cmd+445+XOR)，仍小于USB单包512B，一帧不会被USB拆开。
+    static constexpr uint16_t MAX_PAYLOAD = 445;
     static constexpr uint8_t SLOW_PHASES = 8; // 低速项轮转相数：单项刷新周期=8×10ms=80ms
     static constexpr uint8_t DIR_BATCH = 8;   // 调参/监控目录分批：每个10ms拍最多连续发8项
     static constexpr uint8_t UNIT_MAX = 8;    // 目录帧单位名截断长度（字节），如 m/s、deg/s
@@ -98,13 +123,13 @@ private:
     static constexpr uint8_t CMD_DIR_BATCH = 4;  // 命令目录每拍最多发4条
     static constexpr uint8_t CMD_NAME_MAX = 32;  // 命令名截断长度（字节）
     static constexpr uint8_t CMD_FIELD_MAX = 24; // 单个字段名截断长度（字节）
-    static constexpr uint8_t CMD_INPUT_MAX = 6;  // 单命令参数个数上限
+    static constexpr uint8_t CMD_INPUT_MAX = 7;  // 单命令参数个数上限（tag bit6~4能表达0~7）
 
     RxState rx_state = WAIT_HEAD;    // 当前处在接收的哪个阶段
     uint8_t rx_cmd = 0;              // 本帧收到的命令字，执行命令时用它判断要做什么
     uint8_t rx_payload[MAX_PAYLOAD]; // 本帧已收到的Payload
-    uint8_t rx_len = 0;              // Payload已经收了几个字节
-    uint8_t rx_expect = 0;           // 本帧Payload总共该收几个字节（由命令字查表得到）
+    uint16_t rx_len = 0;             // Payload已经收了几个字节（上限445超出uint8，用16位）
+    uint16_t rx_expect = 0;          // 本帧Payload总共该收几个字节（由命令字查表得到）
     uint8_t rx_xor = 0;              // 从命令字开始逐字节累计的异或值，最后和收到的校验字节比
 
     // 三张表都在构造时由外部传入，指向各子系统写好的数组，本类只借用不拥有。
@@ -140,7 +165,8 @@ private:
 
     // 内建命令返回固定长度（static，无表可查）；动作命令长度查注册表，
     // 所以整体不是static——rx_task收到命令字时调用它决定再收几字节。
-    uint8_t cmd_payload_len(uint8_t cmd);
+    // 返回0xFFFF表示不认识的命令：445超出uint8，未知哨兵不能用0xFF了。
+    uint16_t cmd_payload_len(uint8_t cmd);
     static uint8_t value_size(VALUE_TYPE type);
 
     // 命令字落在0x80~0x9F且外部表里存在同index项时返回表项，否则nullptr
@@ -155,7 +181,7 @@ private:
     void write_value(const uint8_t *in, const MENU_ITEM &item);
 
     // payload已直接拼在tx_frame[2]起时调用：补帧头、命令、校验后整帧发出，len是payload字节数
-    void send_frame(uint8_t cmd, uint8_t len);
+    void send_frame(uint8_t cmd, uint16_t len);
 
     // 发目录的第batch批（下标连续的DIR_BATCH项），一项一帧，str/other跳过
     void send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, uint8_t batch);

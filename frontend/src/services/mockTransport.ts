@@ -11,6 +11,9 @@ import {
   MONITOR_TAG_SUB,
   MonitorKind,
   ValueType,
+  CmdSpec,
+  CMD_TAG_ARGC_SHIFT,
+  CMD_TAG_RANGE,
   tagFast,
   tagSubscribed,
 } from './protocol'
@@ -128,31 +131,37 @@ function appendValue(p: number[], type: ValueType, v: number): number {
 /** 演示用动作命令目录项（字段定义与固件 robot_and_control.cpp 的登记表一致） */
 interface MockCmd {
   index: number
+  tag: number
   name: string
   fields: { type: ValueType; name: string }[]
+  /** tag bit7=1 时下发的取值范围数组[min1,max1,...]，与字段顺序配对 */
+  ranges?: number[]
 }
 
 const mockCommands: MockCmd[] = [
-  { index: 0x80, name: '停止运动', fields: [] },
-  { index: 0x81, name: '原地转向', fields: [{ type: ValueType.Float, name: '角度(度)' }] },
-  { index: 0x82, name: '直行', fields: [{ type: ValueType.Float, name: '距离(米)' }] },
-  { index: 0x83, name: '局部移动', fields: [
+  { index: 0x80, tag: (0 << CMD_TAG_ARGC_SHIFT) | CmdSpec.Stop, name: '停止运动', fields: [] },
+  { index: 0x81, tag: (1 << CMD_TAG_ARGC_SHIFT) | CMD_TAG_RANGE, name: '原地转向', fields: [{ type: ValueType.Float, name: '角度(度)' }], ranges: [-360, 360] },
+  { index: 0x82, tag: (1 << CMD_TAG_ARGC_SHIFT) | CMD_TAG_RANGE, name: '直行', fields: [{ type: ValueType.Float, name: '距离(米)' }], ranges: [-10, 10] },
+  { index: 0x83, tag: (3 << CMD_TAG_ARGC_SHIFT) | CMD_TAG_RANGE, name: '局部移动', fields: [
     { type: ValueType.Float, name: 'x前(米)' },
     { type: ValueType.Float, name: 'y右(米)' },
     { type: ValueType.Float, name: '航向(度)' },
-  ] },
+  ], ranges: [-10, -10, -10, 10, -360, 360] },
 ]
 
-/** 拼动作命令目录帧：[命令字][名长][名][参数量]([类型][字段名长][字段名])×N */
+/** 拼动作命令目录帧：[命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×参数量] */
 function cmdDirectoryFrame(c: MockCmd): Uint8Array {
   const enc = new TextEncoder()
-  const payload: number[] = [c.index]
+  const payload: number[] = [c.index, c.tag]
   const nameBytes = [...enc.encode(c.name)]
   payload.push(nameBytes.length, ...nameBytes, c.fields.length)
   for (const f of c.fields) {
     const fb = [...enc.encode(f.name)]
     payload.push(f.type, fb.length, ...fb)
   }
+  // tag bit7=1：字段后跟每字段一对min/max（float小端各4B）
+  if (c.tag & CMD_TAG_RANGE)
+    for (const v of c.ranges ?? []) appendValue(payload, ValueType.Float, v)
   return frame(CmdPost.CMDDirectory, payload)
 }
 

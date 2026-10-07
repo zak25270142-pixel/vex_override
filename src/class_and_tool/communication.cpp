@@ -5,8 +5,9 @@
 
 // 查下发命令的Payload固定长度。
 // 接收状态机收到命令字后要靠这个数字知道"后面再收几个字节是Payload、
-// 再下一个字节就是校验"。不认识的命令返回0xFF，调用方据此放弃整帧。
-uint8_t USB_Comm::cmd_payload_len(uint8_t cmd)
+// 再下一个字节就是校验"。不认识的命令返回0xFFFF，调用方据此放弃整帧
+// （上限445超出uint8，未知哨兵不能用0xFF）。
+uint16_t USB_Comm::cmd_payload_len(uint8_t cmd)
 {
     switch (cmd)
     {
@@ -24,9 +25,9 @@ uint8_t USB_Comm::cmd_payload_len(uint8_t cmd)
     // 动作命令：payload长度=各字段类型宽度之和（紧凑排列，无填充）
     const CMD_ITEM *item = find_cmd(cmd);
     if (item == nullptr)
-        return 0xFF; // 既不是内建命令表里也没有：无法定位校验位，整帧放弃
-    uint8_t len = 0;
-    for (uint8_t i = 0; i < item->input_num; i++)
+        return 0xFFFF; // 既不是内建命令表里也没有：无法定位校验位，整帧放弃
+    uint16_t len = 0;
+    for (uint8_t i = 0; i < cmd_tag_argc(item->tag); i++)
         len += value_size(item->data_type[i]);
     return len;
 }
@@ -160,12 +161,12 @@ void USB_Comm::write_value(const uint8_t *in, const MENU_ITEM &item)
 
 // 封帧发出：调用方已把payload直接拼在成员缓冲tx_frame[2]开始的位置，
 // 这里只补帧头、命令字和校验，再整帧write到/dev/serial1（USB User Port）。
-void USB_Comm::send_frame(uint8_t cmd, uint8_t len)
+void USB_Comm::send_frame(uint8_t cmd, uint16_t len)
 {
     tx_frame[0] = FRAME_HEAD;
     tx_frame[1] = cmd;
     uint8_t xor_sum = cmd; // 校验从命令字开始算，帧头A5不参与
-    for (uint8_t i = 0; i < len; i++)
+    for (uint16_t i = 0; i < len; i++)
         xor_sum ^= tx_frame[2 + i]; // 每来一个数据字节就异或进去
     tx_frame[2 + len] = xor_sum;    // payload后面紧跟校验
     if (usb_fd >= 0)
@@ -223,7 +224,7 @@ void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd
 
 // 发动作命令目录的一批：直接取外部表下标 [batch*CMD_DIR_BATCH, +CMD_DIR_BATCH)
 // 这连续几条，一条拼一帧。
-// 帧payload: [命令字][命令名长][命令名][参数量]([字段类型][字段名长][字段名])×N
+// 帧payload: [命令字][tag][命令名长][命令名][参数量]([字段类型][字段名长][字段名])×N[bit7=1时:(min,max)×参数量]
 void USB_Comm::send_cmd_dir_batch(uint8_t batch)
 {
     uint8_t start = batch * CMD_DIR_BATCH;
@@ -239,6 +240,7 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
 
         uint8_t pos = 2; // payload从tx_frame[2]起拼，最后pos-2就是payload总长
         tx_frame[pos++] = static_cast<uint8_t>(CMD_BASE + start + k);
+        tx_frame[pos++] = item->tag; // 位域：bit7带范围 bit6~4参数个数 bit3~0特化命令
 
         uint8_t name_len = (uint8_t)strlen(item->name);
         if (name_len > CMD_NAME_MAX)
@@ -247,8 +249,8 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
         memcpy(&tx_frame[pos], item->name, name_len);
         pos += name_len;
 
-        tx_frame[pos++] = item->input_num;
-        for (uint8_t f = 0; f < item->input_num; f++)
+        tx_frame[pos++] = cmd_tag_argc(item->tag); // 参数量取tag bit6~4
+        for (uint8_t f = 0; f < cmd_tag_argc(item->tag); f++)
         {
             tx_frame[pos++] = (uint8_t)item->data_type[f];
             uint8_t flen = (uint8_t)strlen(item->field_name[f]);
@@ -257,6 +259,17 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
             tx_frame[pos++] = flen;
             memcpy(&tx_frame[pos], item->field_name[f], flen);
             pos += flen;
+        }
+        // tag bit7=1：字段描述后紧跟取值范围数组[min1,max1,min2,max2,...]，float小端各4B
+        if (item->tag & CMD_TAG_RANGE)
+        {
+            for (uint8_t f = 0; f < cmd_tag_argc(item->tag); f++)
+            {
+                memcpy(&tx_frame[pos], &item->ranges[2 * f], 4);
+                pos += 4;
+                memcpy(&tx_frame[pos], &item->ranges[2 * f + 1], 4);
+                pos += 4;
+            }
         }
         send_frame(Post_CMD_Directory, pos - 2);
     }
@@ -475,8 +488,8 @@ void USB_Comm::rx_task()
         case RX_CMD:
         {
             // 帧头后的第一个字节是命令字，先查它该带几字节Payload
-            uint8_t expect = cmd_payload_len(ch);
-            if (expect == 0xFF)
+            uint16_t expect = cmd_payload_len(ch);
+            if (expect == 0xFFFF)
             {
                 // 未知命令：我们连校验位在哪都不知道，没法继续收，
                 // 只能回到等帧头状态。极端情况下Payload里恰好有0xA5也没关系，

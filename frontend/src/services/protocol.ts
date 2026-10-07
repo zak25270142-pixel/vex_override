@@ -15,7 +15,7 @@ export const enum CmdPost {
   MonitorValue = 2,
   /** 调参回显：[index][实际生效值]，收到 SetTunable 后下一拍回 */
   TunableEcho = 3,
-  /** 动作命令目录：[命令字][名长][名][参数量][字段描述...]，一条命令一帧 */
+  /** 动作命令目录：[命令字][tag][名长][名][参数量][字段描述...]，一条命令一帧 */
   CMDDirectory = 4,
   /** 心跳回应：收到 Ping 后下一拍回，无 payload，整帧 A5 FF FF */
   Pong = 0xff,
@@ -77,8 +77,28 @@ export function tagKind(tag: number): MonitorKind {
   return (tag & MONITOR_TAG_KIND_MASK) as MonitorKind
 }
 
-/** 单帧 payload 上限（uint8 长度的天然最大值；整帧 258B < USB 单包 512B） */
-export const MAX_PAYLOAD = 255
+/** 动作命令 tag 单字节位域，与 communication.h 的 CMD_TAG_* 常量一一对应 */
+export const CMD_TAG_RANGE = 0x80 // bit7：是否带取值范围（预留）
+export const CMD_TAG_ARGC_MASK = 0x70 // bit6~4：参数个数 0~7
+export const CMD_TAG_ARGC_SHIFT = 4
+export const CMD_TAG_SPEC_MASK = 0x0f // bit3~0：特化命令
+/** 特化命令类型（tag & SPEC_MASK）：0 普通，1 停车，其余暂未定义 */
+export const enum CmdSpec {
+  Normal = 0,
+  Stop = 1,
+}
+export function cmdSpec(tag: number): CmdSpec {
+  return (tag & CMD_TAG_SPEC_MASK) as CmdSpec
+}
+export function cmdArgc(tag: number): number {
+  return (tag & CMD_TAG_ARGC_MASK) >> CMD_TAG_ARGC_SHIFT
+}
+export function cmdHasRange(tag: number): boolean {
+  return (tag & CMD_TAG_RANGE) !== 0
+}
+
+/** 单帧 payload 上限（整帧 448B < USB 单包 512B） */
+export const MAX_PAYLOAD = 445
 
 /** 各类型在帧里占的字节数；str/other 不上报，返回 0 */
 export function valueSize(type: ValueType): number {
@@ -139,15 +159,24 @@ export interface DirItem {
   value: CellValue
 }
 
-/** 动作命令的一个输入字段（类型用于渲染控件和编码，name 是字段中文标签） */
+/**
+ * 动作命令的一个输入字段（类型用于渲染控件和编码，name 是字段中文标签）。
+ * min/max：目录 tag bit7=1 时下发的取值范围（float），未下发时为 undefined
+ */
 export interface CmdField {
   type: ValueType
   name: string
+  min?: number
+  max?: number
 }
 
-/** 动作命令目录项：index 就是下发时用的命令字（0x80~0x9F） */
+/**
+ * 动作命令目录项：index 就是下发时用的命令字（0x80~0x9F）；
+ * tag 为位域字节，用 cmdSpec/cmdArgc/cmdHasRange 解读特化类型与参数个数
+ */
 export interface CmdDirItem {
   index: number
+  tag: number
   name: string
   fields: CmdField[]
 }
@@ -374,12 +403,12 @@ function dirLen(p: Uint8Array, len: number): number {
 
 /**
  * 试算动作命令目录帧的 payload 总长：
- *   [命令字][名长][名][参数量]([类型][字段名长][字段名])×N
+ *   [命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[tag bit7=1时:(min,max)×参数量]
  * 当前已收字节不足以走查完全部字段时返回 -1（继续等），走查完返回总长。
  */
 function cmdDirLen(p: Uint8Array, len: number): number {
-  if (len < 2) return -1
-  let off = 2 + p[1]! // 越过 命令字 + 名长 + 名字
+  if (len < 3) return -1
+  let off = 3 + p[2]! // 越过 命令字 + tag + 名长 + 名字
   if (len < off + 1) return -1
   const fieldNum = p[off]!
   off++
@@ -387,6 +416,8 @@ function cmdDirLen(p: Uint8Array, len: number): number {
     if (len < off + 2) return -1 // 类型+字段名长还没收齐
     off += 2 + p[off + 1]!
   }
+  // tag bit7=1：字段后还有每字段一对min/max（float各4B）
+  if (p[1]! & CMD_TAG_RANGE) off += 8 * fieldNum
   return off
 }
 
@@ -562,14 +593,15 @@ export class FrameParser {
         break
       }
       case CmdPost.CMDDirectory: {
-        // [命令字][名长][名][参数量]([类型][字段名长][字段名])×N
-        if (this.len < 2) return
+        // [命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[tag bit7=1时:(min,max)×参数量]
+        if (this.len < 3) return
         const index = p[0]!
-        const nameLen = p[1]!
-        if (this.len < 2 + nameLen + 1) return
+        const tag = p[1]!
+        const nameLen = p[2]!
+        if (this.len < 3 + nameLen + 1) return
         const decoder = new TextDecoder('utf-8')
-        const name = decoder.decode(p.subarray(2, 2 + nameLen))
-        let off = 2 + nameLen
+        const name = decoder.decode(p.subarray(3, 3 + nameLen))
+        let off = 3 + nameLen
         const fieldNum = p[off]!
         off++
         const fields: CmdField[] = []
@@ -582,7 +614,16 @@ export class FrameParser {
           fields.push({ type, name: decoder.decode(p.subarray(off, off + flen)) })
           off += flen
         }
-        onEvent({ kind: 'cmdDirectory', item: { index, name, fields } })
+        // tag bit7=1：读取每字段一对min/max（float小端各4B），按字段顺序配对
+        if (tag & CMD_TAG_RANGE) {
+          for (let i = 0; i < fieldNum && off + 8 <= this.len; i++) {
+            const d = new DataView(p.buffer, p.byteOffset + off)
+            fields[i]!.min = d.getFloat32(0, true)
+            fields[i]!.max = d.getFloat32(4, true)
+            off += 8
+          }
+        }
+        onEvent({ kind: 'cmdDirectory', item: { index, tag, name, fields } })
         break
       }
       case CmdPost.Pong:
