@@ -8,9 +8,26 @@
 class MyMotorGroup
 {
 private:
-    bool is_stoped = true;
-
 public:
+    enum SpinState
+    {
+        Stopped, // 停车或目标死区：0V，环休眠
+        Transit, // 目标事件窗：起步 / 换向 / target 大跳，I 不工作   特征:error大且加速度较大
+        Track,   // 正常跟踪：I 工作                               特征:error(较)小或加速度(较)小
+        Stable,  // 目标稳定：I 大砍,尽量保持稳定                    特征:error小且加速度小
+        Recover  // 目标未大跳，但 error 被拉大：负载或跟不上，I 工作  特征:error大且加速度小->突然大->小(经常会推到100%电压)
+        // other -> Stopped 仅手动停车 (0pct target不算Stopped)
+        // Stop -> Transit  启动
+        // Transit -> Track  error小到一定程度 或加速度小到一定程度(加速度小了还没进入小error区间说明缺I不够，得加上I进行追踪)
+        // Track -> Stable  在不断追踪后error小且加速度小(说明稳定了,砍kI减小震荡)
+        // Other -> Transit  targrt突变，需先等kf释放完
+        // Track/Stable -> Recover  负载突变导致转速突变导致error(不符合预期地)突变,需要P和I回馈补偿
+        // Track 与 Recover似乎有点模糊
+        // 加速度不能丢，加速度是非常重要的判断依据
+    };
+
+    SpinState spin_state = Stopped;
+
     // 绑定构造传入的四台电机（public：监控 getter 模板直接调 motors[i] 的 SDK 读数）
     vex::motor *motors[4];
 
@@ -21,14 +38,10 @@ public:
     // 组内输出上限 1/max(factor) 才不损失极速。
     // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
     float volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-
     // 电压限幅与映射
     float volt_max[4] = {12.0f, 12.0f, 12.0f, 12.0f}; // 最大电压(实测，空载时)
-
-    // 每台电机的个体死区补偿：只要有输出就必须垫上的电压，用来对齐各轮开始转动的起点
-    // 取值 = 该电机空载时稳定低速运转所需的最低电压(通常在0.5V左右)
+    // 每台电机的个体死区补偿：用来对齐各轮开始转动的起点;取值 = 该电机空载时稳定低速运转所需的最低电压(通常在0.5V左右)
     float volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
-
     // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
     float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -36,15 +49,19 @@ public:
     // 中间连续过渡（target 每增大 3pct，静态→动态多衰减约 63%），全程无跳变。
     float static_deadzone = 1.5f;  // 静止时补偿电压上限(整车下,单位V)
     float dynamic_deadzone = 0.8f; // 高速时补偿电压下限(整车下,单位V)
-    float output_deadzone = 0.1f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
+    float output_deadzone = 0.5f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
 
-    // ---- 提速态/稳定态判态参数 ----
+    // ---- target突变进入 Transit 状态的判态参数 ----
     // target 跳变判定：相对变化超过此比例算大幅，强制进入提速态若干拍。
-    // 例如 0.5 表示 target 变化量超过 max(|target|, 3) 的 50% 即触发。
+    // 例如 0.5 表示 target 变化量超过 max(|target|, target_min_current) * 0.5 即触发。
     float target_jump_ratio = 0.5f;
-
     // 小 target 时基准被该值兜底，避免 1→2 这种绝对值小但比例大的误触发。
     float target_min_current = 5.0f;
+    // ---- 稳定态判态参数 ----
+    float speed_stable = 50.0f; // Transit->Track加速度阈值，单位 pct/s方
+    float err_dead = 1.0f;      // Track->Stable 误差死区，进入该范围内后，I 大砍，减少震荡
+
+    float i_stable_k = 0.5f; // Stable模式下 I项系数为原先多少
 
     // 速度稳定判定：速度变化率（pct/s）相对当前速度低于此比例，认为速度已稳定。
     // 例如 0.1 表示速度变化率 < max(|speed|, target_min_current) 的 10% 每秒。
@@ -58,14 +75,8 @@ public:
     // I 项贡献的步长限幅
     float i_slew = 5.0f; // 5.0代表每次 ki* error 时 error只计算 不超过 5.0的部分
 
-    // 稳定态电压抖动上限：电压变化速率不超过此值。
-    float volt_jitter_max = 8.0f; // V/s
     // 提速态电压斜率上限：比稳定态宽，让电压快速跟上目标跳变，
     float slew_boost = 25.0f; // V/s
-
-    // 当前是否提速态：true=提速态，false=稳定态。
-    // drive() 设 target 时若跳变则置 true；my_spin() 满足稳定条件后置 false。
-    bool is_boost = true;
 
     int8_t target_sign = 0; // 上一轮目标方向，用于检测换向与双极性映射；0 表示起步前未知
     float target = 0.0f;    // 目标速度，单位 pct（±100）,外界禁止直接修改

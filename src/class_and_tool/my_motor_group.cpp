@@ -47,7 +47,7 @@ double MyMotorGroup::velocity()
 
 void MyMotorGroup::stop()
 {
-    is_stoped = true;
+    spin_state = Stopped;
     target = 0.0f;
     integral = 0.0f;
     previous_error = 0.0f;
@@ -61,19 +61,18 @@ void MyMotorGroup::stop()
     }
 }
 
-// 核心设计：提速态不积 I、电压斜率放宽（slew_boost）；稳定态才积 I 并限制电压抖动（volt_jitter_max）。
 // 目标为0时输出0V不刹车，制动由外界 stop() 决定。
 void MyMotorGroup::my_spin()
 {
-    if (is_stoped)
+    if (spin_state == Stopped)
         return;
     uint32_t now_us = get_time_us();
     uint32_t dt_us = now_us - last_time_us;
-
-    if (dt_us < 1000) // drive 与my_spin 想撞后 dt容易很小，给个1ms最小值
+    if (dt_us < 1000) // drive 与my_spin 撞后 dt容易很小，给个1ms最小值
         dt_us = 1000;
     else if (dt_us > 20000)
         dt_us = 20000;
+    float dt_s = static_cast<float>(dt_us) / 1000000.0f;
 
     last_time_us = now_us;
 
@@ -89,21 +88,19 @@ void MyMotorGroup::my_spin()
             volt_output[i] = 0.0f;
             motors[i]->spin(vex::directionType::fwd, 0.0f, vex::voltageUnits::volt);
         }
-        pre_a = (speed - pre_v) / dt_us * 1000000.0f;
+        pre_a = (speed - pre_v) / dt_s;
         pre_v = speed;
         return;
     }
 
     // ---------- 提速态 / 稳定态 判态 ----------
     const float error = target - speed;
-    const float now_a = (speed - pre_v) / dt_us * 1000000.0f;
-    // 稳定条件：误差在 I 工作范围内 + 速度变化率低于阈值（pct/s，按 dt_us 归一化）。
-    const float speed_stable = fmaxf(fabsf(speed), target_min_current) * speed_stable_ratio;
+    const float now_a = (speed - pre_v) / dt_s;
 
     // 误差小时需稳定态微操 加速度小时也放开i积分
     if (fabsf(error) <= fmaxf(error_for_i_min, error_for_i_ratio * fabs_target) ||
         (fabsf(now_a) <= speed_stable && fabsf(pre_a) <= speed_stable))
-        is_boost = false;
+        spin_state = Track;
 
     // ---------- 连续摩擦补偿 ----------
     const float friction = dynamic_deadzone + (static_deadzone - dynamic_deadzone) * expf(-fabs_target / 3.0f);
@@ -115,7 +112,7 @@ void MyMotorGroup::my_spin()
     const float feedforward = kf * target;
 
     // ---------- I 项：只在稳定态累积，限步长 + 方向性抗饱和 ---------
-    if (!is_boost)
+    if (spin_state == Track)
     {
         float delta;
         // 仅在同向增加积分（加速充能）时限制步长；反向退积分（泄能）时放开限制
@@ -142,7 +139,7 @@ void MyMotorGroup::my_spin()
 
     // ---------- 归一输出映射到四路电压 + 分级电压斜率限制 ----------
     // 提速态用 slew_boost（宽松但仍有上限，防踢车），稳定态用 volt_jitter_max（紧限抖）。
-    const float max_dv = (is_boost ? slew_boost : volt_jitter_max) * static_cast<float>(dt_us) / 1000000.0f;
+    const float max_dv = slew_boost * output * dt_s;
     for (uint8_t i = 0; i < 4; i++)
     {
         const float base_voltage = friction + volt_min[i];
@@ -171,13 +168,11 @@ void MyMotorGroup::drive(float target)
         fabs_target = 0.0f;
     }
     // 运行中再次调用只改目标，不清任何环内状态。
-    if (is_stoped)
+    if (spin_state == Stopped)
     {
         last_time_us = get_time_us();
-        is_stoped = false;
-        is_boost = true; // 重新起步必走提速态
+        spin_state = Transit;
     }
-
     // 清积分、清电压历史、进提速态，避免旧方向积分带着车冲过零点。
     // 必要性存疑，与下面那个的职责划分也不太清晰
     const int8_t new_target_sign = target > 0.0f ? 1 : (target < 0.0f ? -1 : 0);
@@ -186,7 +181,7 @@ void MyMotorGroup::drive(float target)
         if (target_sign != 0 && new_target_sign != target_sign)
         {
             integral = 0.0f;
-            is_boost = true;
+            spin_state = Transit;
         }
         target_sign = new_target_sign;
     }
@@ -197,7 +192,7 @@ void MyMotorGroup::drive(float target)
     // 在速度环与手柄操控中，target的突变幅度又是多大呢?
     const float target_scale = fmaxf(fabs_target, target_min_current);
     if (fabsf(target - this->target) > target_scale * target_jump_ratio)
-        is_boost = true;
+        spin_state = Transit;
 
     this->target = target;
 }

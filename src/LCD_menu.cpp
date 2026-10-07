@@ -63,8 +63,6 @@ const struct MENU_ITEM menu_item[] =
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
         {"L_iSlew", type_float, &left_motors.i_slew, "左I速率", "out/s"},
         {"R_iSlew", type_float, &right_motors.i_slew, "右I速率", "out/s"},
-        {"L_jitter", type_float, &left_motors.volt_jitter_max, "左抖动限", "V/s"},
-        {"R_jitter", type_float, &right_motors.volt_jitter_max, "右抖动限", "V/s"},
         {"L_slewB", type_float, &left_motors.slew_boost, "左提速斜率", "V/s"},
         {"R_slewB", type_float, &right_motors.slew_boost, "右提速斜率", "V/s"},
         {"L_errImin", type_float, &left_motors.error_for_i_min, "左I误差下限", "pct"},
@@ -139,8 +137,8 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"R_integral", type_float, &right_motors.integral, "右PID积分", "", monitor_tag_fast},
         {"L_error", type_float, &left_motors.previous_error, "左PID误差", "", monitor_tag_fast},
         {"R_error", type_float, &right_motors.previous_error, "右PID误差", "", monitor_tag_fast},
-        {"L_boost", type_bool, &left_motors.is_boost, "左是否增速模式", "", monitor_tag_fast},
-        {"R_boost", type_bool, &right_motors.is_boost, "右是否增速模式", "", monitor_tag_fast},
+        {"L_boost", type_bool, &left_motors.spin_state, "左模式", "", monitor_tag_fast},
+        {"R_boost", type_bool, &right_motors.spin_state, "右模式", "", monitor_tag_fast},
 
         // 转速/电流/编码器：无捕获 lambda 直接转 MenuFloatGetter，构造自动置 GETTER；
         // SDK 读数是 double，cast 成 float 匹配签名。加/删一项只动这一行
