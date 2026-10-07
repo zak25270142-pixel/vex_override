@@ -221,13 +221,12 @@ void RobotAction::refresh()
 {
     // 周期统一时间戳（us）
     uint32_t now = get_time_us();
-
     // 每轮首先更新里程、速度和航向。
     chassis.update(now);
-
     // 指针为空即空闲。
     if (chassis_task_ptr != nullptr)
         (this->*chassis_task_ptr)(now);
+    chassis.speed_tick(); // 任务计算完下达完后，更新速度环
 }
 
 void RobotAction::turn(float angle)

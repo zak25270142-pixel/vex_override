@@ -40,17 +40,6 @@ static void ai_vision_task()
 }
 static vex::event ai_vision_event(ai_vision_task);
 
-static void fast_thread()
-{
-    CycleTimer speed_timer(5);
-    while (true)
-    {
-        speed_timer.cycle();
-        chassis.speed_tick();
-    }
-}
-static vex::event fast_thread_event(fast_thread);
-
 // 心跳掉线 failsafe（作为回调注入 comm，检测与处置解耦）：
 // 上位机断线时只在底盘空闲态替它收车；
 static void comm_link_lost_handler()
@@ -79,8 +68,7 @@ void my_Init()
 
     ai_vision_event.broadcast();
     screen_refresh_event.broadcast();
-    comm_rx_event.broadcast();     // 接收任务：调度器就绪后启动
-    fast_thread_event.broadcast(); // 5ms速度环任务
+    comm_rx_event.broadcast(); // 接收任务：调度器就绪后启动
 
     robot_action.manual();
     left_axis.state = Remote_Control::only_value;
@@ -89,8 +77,7 @@ void my_Init()
 void my_while()
 { // main.cpp while 区 10ms标准任务频率区
     main_timer.cycle();
-    robot_action.refresh();
+    robot_action.refresh(); // 先更新状态
     // 通信收/发都在独立的comm_rx_task、comm_tx_task里，不能在主循环再调用
-
-    comm.tx_tick();
+    comm.tx_tick(); // 最后通信
 }

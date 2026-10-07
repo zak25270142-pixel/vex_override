@@ -14,16 +14,16 @@ public:
     // 绑定构造传入的四台电机（public：监控 getter 模板直接调 motors[i] 的 SDK 读数）
     vex::motor *motors[4];
 
-    // 电压缩放因子：让组内四台电机同指令下输出的轮速一致。空载实测（2026-10-02）
+    // 电压缩放因子：让组内四台电机同指令下输出的轮速一致。
     // 各台斜率 k(pct/V) 有个体差异，且 motor2/3(48齿)经齿轮后轮速 = 轴速/1.2，
-    // 等效轮速斜率 = k/r（r=1直连 / 1.2齿轮）。只能削峰填谷——以全局最慢
+    // 等效轮速斜率 = k/r（r=1直连 / 1.25齿轮）。只能削峰填谷——以全局最慢
     // 等效轮速为基准，factor = k_min_等效 / (k_i/r_i)，全部 ≤1，
     // 组内输出上限 1/max(factor) 才不损失极速。
     // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
     float volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
     // 电压限幅与映射
-    float volt_max[4] = {10.0f, 10.0f, 10.0f, 10.0f}; // 最大电压(实测，空载时)
+    float volt_max[4] = {12.0f, 12.0f, 12.0f, 12.0f}; // 最大电压(实测，空载时)
 
     // 每台电机的个体死区补偿：只要有输出就必须垫上的电压，用来对齐各轮开始转动的起点
     // 取值 = 该电机空载时稳定低速运转所需的最低电压(通常在0.5V左右)
@@ -53,27 +53,23 @@ public:
     // I 项工作范围（稳定态误差阈值）：max(error_for_i_min, error_for_i_ratio·|target|)，单位 pct。
     // 做成相对量，低速目标（3/5pct）也能进稳定态。
     float error_for_i_min = 3.0f;
-    float error_for_i_ratio = 0.15f;
+    float error_for_i_ratio = 0.2f;
 
-    // I 项贡献的最大变化速率：限制 I 在稳定态的步进速度。
-    float i_slew_max = 5.0f; // 归一 output / s
+    // I 项贡献的步长限幅
+    float i_slew = 5.0f; // 5.0代表每次 ki* error 时 error只计算 不超过 5.0的部分
 
-    // 稳定态电压抖动上限：电压变化速率不超过此值，纯粹限稳态抖动。
+    // 稳定态电压抖动上限：电压变化速率不超过此值。
     float volt_jitter_max = 8.0f; // V/s
-
     // 提速态电压斜率上限：比稳定态宽，让电压快速跟上目标跳变，
-    // 但不能完全不限（不限就是起步踢车/换向冲击的根因）。
     float slew_boost = 25.0f; // V/s
 
     // 当前是否提速态：true=提速态，false=稳定态。
     // drive() 设 target 时若跳变则置 true；my_spin() 满足稳定条件后置 false。
     bool is_boost = true;
 
-    float pre_output_volt[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // 上一拍实际输出电压
-
     int8_t target_sign = 0; // 上一轮目标方向，用于检测换向与双极性映射；0 表示起步前未知
-
-    float target = 0.0f; // 目标速度，单位 pct（±100）,外界禁止直接修改
+    float target = 0.0f;    // 目标速度，单位 pct（±100）,外界禁止直接修改
+    float fabs_target = 0.0f;
 
     float kf;                    // 阻力前馈，单位：归一输出 / pct
     float kp;                    // 比例项，单位：归一输出 / pct
