@@ -151,19 +151,20 @@ static const VALUE_TYPE cmd_ui8_f_type[] = {type_uint8_t, type_float};
 // 本车的动作命令总表：非static供外部链接，LCD_menu.cpp构造comm时整张传入，
 // 与tunable/monitor两张MENU表的注入方式保持一致。
 // tag末位由cmd_tag_make拼出：bit6~4参数个数（上限7）；停车命令特化位=1。
-// 带取值范围的命令：cmd_tag_make第一参传true，ranges提供每字段一对{min,max}（顺序同字段表）。
-static const float range_turn[] = {-360, 360};                   // 原地转向：角度
-static const float range_move[] = {-10, 10};                     // 直行：距离
+// 带取值范围的命令：ranges填非空数组（每字段一对{min,max}，顺序同字段表）即可，
+// 目录发送时自动按它置位tag bit7并追加min/max，tag里不用手填范围位。
+static const float range_turn[] = {-360, 360};                  // 原地转向：角度
+static const float range_move[] = {-10, 10};                    // 直行：距离
 static const float range_goto[] = {-10, 10, -10, 10, -360, 360}; // 局部移动：x、y、航向
-static const float range_volt[] = {0, 7, 0, 12};                 // 电机电压：编号、电压
-static const float range_spin[] = {-100, 100, -100, 100};        // 底盘目标速度：左、右
+static const float range_volt[] = {0, 7, 0, 12};                // 电机电压：编号、电压
+static const float range_spin[] = {-100, 100, -100, 100};       // 底盘目标速度：左、右
 const CMD_ITEM robot_cmds[] = {
-    {cmd_stop, nullptr, nullptr, "停止运动", cmd_tag_make(false, 0, CMD_SPEC_STOP), nullptr},
-    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, "原地转向", cmd_tag_make(true, 1, CMD_SPEC_NORMAL), range_turn},
-    {cmd_move, cmd_f_type, (const char *[]){"距离(米)"}, "直行", cmd_tag_make(true, 1, CMD_SPEC_NORMAL), range_move},
-    {cmd_goto, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, "局部移动", cmd_tag_make(true, 3, CMD_SPEC_NORMAL), range_goto},
-    {cmd_set_volt, cmd_ui8_f_type, (const char *[]){"编号(0-3左1-4,4-7右1-4)", "电压(伏)"}, "设置电机电压", cmd_tag_make(true, 2, CMD_SPEC_NORMAL), range_volt},
-    {cmd_set_spin, cmd_2f_type, (const char *[]){"左目标速度", "右目标速度"}, "设置底盘目标速度", cmd_tag_make(true, 2, CMD_SPEC_NORMAL), range_spin},
-    {cmd_reset_pos, cmd_3f_type, (const char *[]){"坐标x", "坐标y", "航向yaw"}, "重置底盘位置", cmd_tag_make(false, 3, CMD_SPEC_NORMAL), nullptr},
+    {cmd_stop, nullptr, nullptr, "停止运动", cmd_tag_make(0, CMD_SPEC_STOP), nullptr},
+    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, "原地转向", cmd_tag_make(1, CMD_SPEC_NORMAL), range_turn},
+    {cmd_move, cmd_f_type, (const char *[]){"距离(米)"}, "直行", cmd_tag_make(1, CMD_SPEC_NORMAL), range_move},
+    {cmd_goto, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, "局部移动", cmd_tag_make(3, CMD_SPEC_NORMAL), range_goto},
+    {cmd_set_volt, cmd_ui8_f_type, (const char *[]){"编号(0-3左1-4,4-7右1-4)", "电压(伏)"}, "设置电机电压", cmd_tag_make(2, CMD_SPEC_NORMAL), range_volt},
+    {cmd_set_spin, cmd_2f_type, (const char *[]){"左目标速度", "右目标速度"}, "设置底盘目标速度", cmd_tag_make(2, CMD_SPEC_NORMAL), range_spin},
+    {cmd_reset_pos, cmd_3f_type, (const char *[]){"坐标x", "坐标y", "航向yaw"}, "重置底盘位置", cmd_tag_make(3, CMD_SPEC_NORMAL), nullptr},
 };
 const uint8_t robot_cmd_count = sizeof(robot_cmds) / sizeof(robot_cmds[0]);

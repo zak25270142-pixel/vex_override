@@ -35,7 +35,7 @@
 typedef void (*CmdFunc)(const uint8_t *p);
 
 // 动作命令 tag：单字节位域（风格与 my_main.h 的 MENU_TAG_* 一致）
-//   bit7 (0x80) CMD_TAG_RANGE  是否带取值范围：1=目录帧字段描述后跟{min,max}数组
+//   bit7 (0x80) CMD_TAG_RANGE  是否带取值范围：发送目录时按ranges指针是否为空自动置位，表项里不用填
 //   bit6~4      CMD_TAG_ARGC_* 参数个数0~7（上限7，参数个数的唯一来源）
 //   bit3~0      CMD_TAG_SPEC_* 特化命令：0普通 1停车，其余暂未定义
 static constexpr uint8_t CMD_TAG_RANGE = 0x80u;
@@ -45,11 +45,11 @@ static constexpr uint8_t CMD_TAG_SPEC_MASK = 0x0Fu;
 static constexpr uint8_t CMD_SPEC_NORMAL = 0u;
 static constexpr uint8_t CMD_SPEC_STOP = 1u;
 
-// 拼一条命令的tag：has_range=是否带取值范围，argc=参数个数(0~7)，spec=特化类型
-static inline uint8_t cmd_tag_make(bool has_range, uint8_t argc, uint8_t spec)
+// 拼一条命令的tag：argc=参数个数(0~7)，spec=特化类型。
+// bit7不用手填：发送目录时按ranges是否为空自动置位，表项不会两处不一致。
+static inline uint8_t cmd_tag_make(uint8_t argc, uint8_t spec)
 {
-    return static_cast<uint8_t>((has_range ? CMD_TAG_RANGE : 0u) |
-                                ((argc & 0x07u) << CMD_TAG_ARGC_SHIFT) |
+    return static_cast<uint8_t>(((argc & 0x07u) << CMD_TAG_ARGC_SHIFT) |
                                 (spec & CMD_TAG_SPEC_MASK));
 }
 
@@ -68,8 +68,8 @@ struct CMD_ITEM
     const VALUE_TYPE *data_type;   // 输入字段类型表（无参时可为nullptr）
     const char *const *field_name; // 输入字段中文名表（无参时可为nullptr）
     const char *name;              // 命令中文名，目录帧与诊断用
-    uint8_t tag;                   // tag位域：bit7带范围 bit6~4参数个数 bit3~0特化命令
-    const float *ranges;           // 取值范围表{min1,max1,min2,max2,...}：bit7=1时随目录下发，无范围填nullptr
+    uint8_t tag;                   // tag位域：bit6~4参数个数 bit3~0特化命令（bit7恒0，发送时自动置位）
+    const float *ranges;           // 取值范围表{min1,max1,min2,max2,...}：非空时目录帧自动追加min/max并置tag bit7
 };
 
 class USB_Comm
