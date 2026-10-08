@@ -50,6 +50,9 @@ class SerialBridge:
         self._stop = threading.Event()
         self._connected = False
         self._last_pong = 0.0
+        # 心跳单例：重连叠调 start_heartbeat 时先停旧线程，避免多路 Ping 打架
+        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_stop = threading.Event()
 
     @property
     def connected(self) -> bool:
@@ -184,6 +187,7 @@ class SerialBridge:
         return False
 
     def disconnect(self) -> None:
+        self.stop_heartbeat()
         self._stop.set()
         self._connected = False
         if self._rx_thread and self._rx_thread.is_alive():
@@ -201,6 +205,7 @@ class SerialBridge:
         """掉线善后（拔线/读异常/心跳超时）：关口并发 disconnected，由 Hub 决定重连。"""
         if not self._connected and self._ser is None:
             return  # 已经断过了，不重复上报
+        self.stop_heartbeat()
         self._stop.set()
         self._connected = False
         if self._rx_thread and self._rx_thread.is_alive() and threading.current_thread() is not self._rx_thread:
@@ -255,16 +260,30 @@ class SerialBridge:
     # 心跳 1s 一发，超过 5s 没收到 Pong 判定下位机程序已死（USB 还连着但链路没意义）
     PONG_TIMEOUT_S = 5.0
 
+    def stop_heartbeat(self) -> None:
+        """停心跳线程并等它退出；从心跳线程自己调 _lost 进来时不 join（等自己无意义）。"""
+        self._hb_stop.set()
+        t = self._hb_thread
+        if t and t.is_alive() and threading.current_thread() is not t:
+            t.join(timeout=1.5)
+        self._hb_thread = None
+
     def start_heartbeat(self, interval: float = 1.0) -> threading.Thread:
+        """单例心跳：重复调用先停旧线程再启，避免重连后叠出多个 Ping 源。"""
+        self.stop_heartbeat()
+        self._hb_stop.clear()
+
         def _loop() -> None:
-            while not self._stop.is_set() and self.connected:
+            while not self._hb_stop.is_set() and not self._stop.is_set() and self.connected:
                 try:
                     self.send(ping())
                 except Exception as e:
                     logger.warning("心跳发送失败: %s", e)
                     self._lost(f"心跳发送失败: {e}")
                     break
-                time.sleep(interval)
+                # 可中断 sleep：stop_heartbeat 不用等满一个周期才返回
+                if self._hb_stop.wait(interval):
+                    break
                 last = self._last_pong
                 if last > 0 and time.monotonic() - last > self.PONG_TIMEOUT_S:
                     logger.warning("超过 %.0fs 未收到 Pong，判定下位机掉线", self.PONG_TIMEOUT_S)
@@ -272,5 +291,6 @@ class SerialBridge:
                     break
 
         t = threading.Thread(target=_loop, name="vex-heartbeat", daemon=True)
+        self._hb_thread = t
         t.start()
         return t

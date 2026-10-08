@@ -138,18 +138,29 @@ class VexScript:
         )
 
     def unsub(self, index_or_name, type: str = "both") -> dict:
-        """退订/取消登记（取消 log 登记不会顺带关下位机推送，以免影响上位机）。"""
+        """退订/取消登记（取消 log 登记不会顺带关下位机推送，以免影响上位机）。
+        脚本退出前若曾 sub("push"/"both") 应显式 unsub，否则后端仍保留 script 订阅意图；
+        嫌麻烦可在 finally 里调 clear_script_subs() 一键清掉。"""
         return self._post(
             "/api/sub",
             {"index_or_name": index_or_name, "type": type, "on": False},
         )
+
+    def refresh_dirs(self) -> dict:
+        """清空后端目录缓存并重新向车拉三张表（怀疑缓存过期/半表时用）。"""
+        return self._post("/api/dirs/refresh")
+
+    def clear_script_subs(self) -> dict:
+        """脚本进程结束前调用：清掉 script 侧全部订阅意图，不影响各 UI 客户端。"""
+        return self._post("/api/sub/clear_script")
 
     # ---------- 命令 ----------
 
     def cmd(self, index_or_name, *args) -> dict:
         """
         下发动作命令：index_or_name 为命令字(int)或命令目录中文名，
-        参数按目录字段顺序依次给（缺省补 0）。abort 状态下调用直接抛错。
+        参数按目录字段顺序依次给，个数必须与目录完全一致（后端严格校验，少参/多参都报错）。
+        abort 状态下调用直接抛错；停车后需先 clear_abort() 再跑。
         """
         return self._post(
             "/api/cmd",

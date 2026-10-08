@@ -79,8 +79,8 @@ class Hub:
         self._name_to_tun: Dict[str, int] = {}
         self._name_to_cmd: Dict[str, int] = {}
 
-        # 目录原始帧缓存：cmd → 完整帧列表（字节级一致，前端 FrameParser 零改动）
-        self._dir_cache: Dict[int, List[bytes]] = {}
+        # 目录原始帧缓存：cmd → {index: 完整帧}（同 index 覆盖，避免重复拉表叠帧）
+        self._dir_cache: Dict[int, Dict[int, bytes]] = {}
         # 粘包尾部：目录 burst 可能跨 chunk，保留未完整帧尾部
         self._dir_buf = bytearray()
 
@@ -144,9 +144,7 @@ class Hub:
         if self.bridge.connect():
             self.bridge.start_heartbeat(1.0)
             # 脚本没连上位机时也要有目录：连上自动拉三张表
-            self.enqueue(request_tunable(), PRI_UI)
-            self.enqueue(request_monitor(), PRI_UI)
-            self.enqueue(request_command(), PRI_UI)
+            self._request_all_dirs()
 
     def ensure_connected(self) -> None:
         """保证 Backend ↔ 下位机有连接意愿，断线由重连线程兜底。"""
@@ -165,11 +163,14 @@ class Hub:
         while self._want_connected and not self.bridge.connected:
             if self.bridge.connect():
                 self.bridge.start_heartbeat(1.0)
-                # 重连后目录缓存可能已过期，重新拉三张表
-                self._dir_cache.clear()
-                self.enqueue(request_tunable(), PRI_UI)
-                self.enqueue(request_monitor(), PRI_UI)
-                self.enqueue(request_command(), PRI_UI)
+                # 重连后目录可能已变：缓存和解析表都清掉重新拉
+                self.tunable_dir.clear()
+                self.monitor_dir.clear()
+                self.cmd_dir.clear()
+                self._name_to_mon.clear()
+                self._name_to_tun.clear()
+                self._name_to_cmd.clear()
+                self._request_all_dirs()
                 # 把聚合后的订阅意图补发给下位机（重连不丢订阅）
                 self._restore_subscriptions()
                 return
@@ -192,6 +193,39 @@ class Hub:
         any_fast = any(v[1] for v in intent.values() if v[0])
         return (any_sub, any_fast if any_sub else False)
 
+    def set_want_connected(self, want: bool) -> None:
+        """连接意愿开关：True 时掉线自动重连，False 时重连线程停手。"""
+        self._want_connected = bool(want)
+
+    # ---------- 目录缓存 ----------
+
+    def _cache_dir_frame(self, cmd: int, frame: bytes) -> None:
+        """目录一项一帧（payload[0]=index），同 cmd+index 覆盖不叠加。"""
+        if len(frame) >= 3:
+            self._dir_cache.setdefault(cmd, {})[frame[2]] = frame
+
+    def _dir_frames_list(self, post_cmd: int) -> List[bytes]:
+        """回放用：按 index 排序输出整帧列表。"""
+        bucket = self._dir_cache.get(post_cmd) or {}
+        return [bucket[k] for k in sorted(bucket.keys())]
+
+    def _request_dir(self, post_cmd: int, request_frame: bytes) -> None:
+        """主动拉某张目录前先清该表缓存，避免新旧两轮 burst 混叠成半旧半新。"""
+        self._dir_cache.pop(post_cmd, None)
+        self.enqueue(request_frame, PRI_UI)
+
+    def _request_all_dirs(self) -> None:
+        self._request_dir(CmdPost.TunableDirectory, request_tunable())
+        self._request_dir(CmdPost.MonitorDirectory, request_monitor())
+        self._request_dir(CmdPost.CMDDirectory, request_command())
+
+    def refresh_directories(self) -> dict:
+        """清空三张目录缓存并重新向车请求（表结构变更或怀疑缓存过期时用）。"""
+        self._dir_cache.clear()
+        self._dir_buf.clear()
+        self._request_all_dirs()
+        return {"ok": True}
+
     def stop(self) -> None:
         self._running = False
         self._want_connected = False
@@ -213,10 +247,7 @@ class Hub:
             self._name_to_mon.clear()
             self._name_to_tun.clear()
             self._name_to_cmd.clear()
-            self._dir_cache.clear()
-            self.enqueue(request_tunable(), PRI_UI)
-            self.enqueue(request_monitor(), PRI_UI)
-            self.enqueue(request_command(), PRI_UI)
+            self._request_all_dirs()
         return ok
 
     # ---------- 串口回调 ----------
@@ -237,7 +268,7 @@ class Hub:
         self._dir_buf.extend(chunk)
         frames, consumed = scan_dir_frames(bytes(self._dir_buf))
         for cmd, frame in frames:
-            self._dir_cache.setdefault(cmd, []).append(frame)
+            self._cache_dir_frame(cmd, frame)
         del self._dir_buf[:consumed]
         # 异常兜底：缓冲涨破两倍 burst 说明解析对不上，截掉旧数据防内存膨胀
         if len(self._dir_buf) > 8192:
@@ -372,6 +403,19 @@ class Hub:
             if changed:
                 self._recompute_and_emit(set(changed))
 
+    def clear_script_intents(self) -> None:
+        """脚本进程结束时调用：去掉 script 侧订阅意图并下发 diff，不影响各 UI 客户端。"""
+        with self._sub_lock:
+            changed = []
+            for idx, intent in list(self._sub_intent.items()):
+                if "script" in intent:
+                    del intent["script"]
+                    if not intent:
+                        del self._sub_intent[idx]
+                    changed.append(idx)
+            if changed:
+                self._recompute_and_emit(set(changed))
+
     def _recompute_and_emit(self, indices: Set[int]) -> None:
         for idx in indices:
             intent = self._sub_intent.get(idx, {})
@@ -414,7 +458,7 @@ class Hub:
         }
         if cmd in dir_map:
             post_cmd, request_fn = dir_map[cmd]
-            frames = self._dir_cache.get(post_cmd, [])
+            frames = self._dir_frames_list(post_cmd)
             if frames:
                 try:
                     loop = self._loop
@@ -424,8 +468,8 @@ class Hub:
                 except Exception as e:
                     logger.debug("目录回放失败: %s", e)
             else:
-                # 缓存空了：补一次拉取，下位机应答 burst 会经广播送达该客户端
-                self.enqueue(request_fn(), PRI_UI)
+                # 缓存空了：清表重拉一次，下位机应答 burst 会经广播送达该客户端
+                self._request_dir(post_cmd, request_fn())
             return
 
         # 3) Subscribe → 聚合处理（防多页面互相退订）

@@ -112,8 +112,21 @@ def api_connect():
 
 @app.post("/api/disconnect")
 def api_disconnect():
-    hub._want_connected = False
+    hub.set_want_connected(False)
     hub.bridge.disconnect()
+    return {"ok": True}
+
+
+@app.post("/api/dirs/refresh")
+def api_dirs_refresh():
+    """清空目录缓存并重新向 V5 拉三张表（表结构变更或怀疑缓存过期时用）。"""
+    return hub.refresh_directories()
+
+
+@app.post("/api/sub/clear_script")
+def api_clear_script_subs():
+    """脚本结束时调用：去掉 script 侧订阅意图，不影响各 UI 客户端。"""
+    hub.clear_script_intents()
     return {"ok": True}
 
 

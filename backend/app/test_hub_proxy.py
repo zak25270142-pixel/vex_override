@@ -61,7 +61,7 @@ def main() -> None:
     f0 = make_monitor_dir_frame(0, "x", "m", 1.5)
     f1 = make_monitor_dir_frame(1, "yaw", "deg", 90.0)
     hub._on_serial_raw(f0 + f1)
-    assert len(hub._dir_cache.get(CmdPost.MonitorDirectory, [])) == 2, "目录缓存应收到 2 帧"
+    assert len(hub._dir_cache.get(CmdPost.MonitorDirectory, {})) == 2, "目录缓存应收到 2 帧"
     print("[ok] 目录 burst 缓存")
 
     # --- 1. Ping 拦截：from_ui 收到 Ping 应回 Pong，且不进入下行队列 ---
@@ -81,6 +81,32 @@ def main() -> None:
     assert got == [f0, f1], f"目录回放帧不一致: {[g.hex() for g in got]}"
     assert not hub._tx_q, "缓存命中时不应转发下位机"
     print("[ok] 目录缓存回放")
+
+    # --- 2.1 同 index 再来一帧应覆盖不叠加，回放按 index 排序 ---
+    f0b = make_monitor_dir_frame(0, "x", "m", 2.5)
+    hub._on_serial_raw(f0b)
+    assert len(hub._dir_cache[CmdPost.MonitorDirectory]) == 2, "同 index 应覆盖不叠加"
+    ws.sent_bytes.clear()
+    hub.from_ui(request_monitor(), ws)  # type: ignore[arg-type]
+    hub._loop.run_until_complete(asyncio.sleep(0.01))
+    assert ws.sent_bytes == [f0b, f1], "回放应按 index 排序且用新帧"
+    hub._on_serial_raw(f0)  # 还原成 f0，方便后续用例
+    print("[ok] 同 index 覆盖 + 按 index 排序回放")
+
+    # --- 2.2 半帧跨 chunk：先到一半再补齐，缓存仍应完整 ---
+    hub._dir_cache.clear()
+    hub._dir_buf.clear()
+    hub._on_serial_raw(f0[:3])  # A5|Cmd|index 半帧
+    assert CmdPost.MonitorDirectory not in hub._dir_cache, "半帧不应入缓存"
+    hub._on_serial_raw(f0[3:] + f1)
+    assert hub._dir_frames_list(CmdPost.MonitorDirectory) == [f0, f1], "跨 chunk 应拼齐入缓存"
+    print("[ok] 半帧跨 chunk 拼接")
+
+    # --- 2.3 主动拉表应先清该表缓存，避免新旧混叠 ---
+    hub._request_dir(CmdPost.MonitorDirectory, request_monitor())
+    assert CmdPost.MonitorDirectory not in hub._dir_cache, "主动拉表应先清缓存"
+    assert drain_tx(hub) == [request_monitor()], "拉表请求应入队"
+    print("[ok] 拉表前清缓存")
 
     # --- 3. Subscribe 聚合：UI 低速 + 脚本高速 → 有效高速；UI 断开 → 保留脚本意图 ---
     drain_tx(hub)
