@@ -13,6 +13,7 @@
 import type { ConnState, PortProbe, SerialTransport, TransportCallbacks } from './transport'
 
 const DEFAULT_URL = 'ws://127.0.0.1:8000/ws'
+const API_BASE = 'http://127.0.0.1:8000'
 const CONNECT_TIMEOUT_MS = 5000
 
 export class WsTransport implements SerialTransport {
@@ -20,6 +21,8 @@ export class WsTransport implements SerialTransport {
   private ws: WebSocket | null = null
   /** CONNECTING 阶段积压的帧，onopen 时按序发出 */
   private pending: Uint8Array[] = []
+  /** 当前 WS 是否活着（无论串口状态如何），供串口掉线时本地重连判断 */
+  private wsAlive = false
 
   constructor(
     private cb: TransportCallbacks,
@@ -39,9 +42,19 @@ export class WsTransport implements SerialTransport {
     return this.url
   }
 
+  /** 让 Backend 去连下位机；串口探测阻塞交给后端重连线程，前端不等结果 */
+  private async askBackendConnect(): Promise<void> {
+    try {
+      await fetch(`${API_BASE}/api/connect`, { method: 'POST' })
+    } catch {
+      // 后端还没起来/网络闪断时静默，WS 建链失败会走正常 error 上报
+    }
+  }
+
   async connect(_baudRate: number, _probe?: PortProbe): Promise<void> {
     if (this.ws?.readyState === WebSocket.OPEN) return
     this.cb.onStatus('connecting', `连接后端 ${this.url} …`)
+    await this.askBackendConnect()
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(this.url)
       ws.binaryType = 'arraybuffer'
@@ -59,6 +72,7 @@ export class WsTransport implements SerialTransport {
         settled = true
         window.clearTimeout(timer)
         this.ws = ws
+        this.wsAlive = true
         // 连接建立前积压的请求（自动拉目录等）一次性按序补发
         for (const f of this.pending) ws.send(this.toBuffer(f))
         this.pending = []
@@ -74,6 +88,7 @@ export class WsTransport implements SerialTransport {
       }
       ws.onclose = () => {
         this.ws = null
+        this.wsAlive = false
         this.cb.onStatus('error', '后端已断开')
       }
       ws.onmessage = (ev) => {
@@ -81,9 +96,18 @@ export class WsTransport implements SerialTransport {
           try {
             const obj = JSON.parse(ev.data)
             if (obj.op === 'status') {
-              // 后端串口 idle 表示 WS 活着但车没接上，映射成连接中而不是断开
+              // 状态映射：只有串口 connected 才整体算 connected；
+              // connecting/reconnecting/disconnected 都是「链路还没好」，前端亮连接中
               const state: ConnState =
-                obj.state === 'idle' ? 'connecting' : ((obj.state as ConnState) ?? 'error')
+                obj.state === 'connected'
+                  ? 'connected'
+                  : obj.state === 'connecting' || obj.state === 'reconnecting'
+                    ? 'connecting'
+                    : obj.state === 'disconnected'
+                      ? 'connecting' // 后端正在重连，不亮红灯
+                      : obj.state === 'idle'
+                        ? 'connecting' // 串口 idle 表示 WS 活着但车没接上
+                        : 'error'
               this.cb.onStatus(state, obj.message ?? '')
             }
           } catch {
@@ -104,6 +128,7 @@ export class WsTransport implements SerialTransport {
       ws.close()
     }
     this.ws = null
+    this.wsAlive = false
     this.pending = []
     this.cb.onStatus('idle', '已断开后端')
   }

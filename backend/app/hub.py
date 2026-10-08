@@ -21,13 +21,17 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from fastapi import WebSocket
 
 from .protocol import (
+    CmdGet,
+    CmdPost,
     CmdSpec,
     build_frame,
     cmd_spec,
     command_send,
+    ping,
     request_command,
     request_monitor,
     request_tunable,
+    scan_dir_frames,
     set_tunable,
     subscribe,
     tag_fast,
@@ -38,9 +42,9 @@ from .serial_bridge import SerialBridge
 logger = logging.getLogger("vex.hub")
 
 # 命令优先级：数字越小越优先
-PRI_STOP = 0
-PRI_UI = 10
-PRI_SCRIPT = 20
+PRI_STOP = 0 # 停车帧优先级
+PRI_UI = 10 # 上位机优先级
+PRI_SCRIPT = 20 # 脚本优先级
 
 # 日志缓冲上限：高速订阅 100Hz×多项时防止脚本忘 end_log 把内存吃光，超出后丢新样本
 MAX_LOG_SAMPLES = 500_000
@@ -75,6 +79,11 @@ class Hub:
         self._name_to_tun: Dict[str, int] = {}
         self._name_to_cmd: Dict[str, int] = {}
 
+        # 目录原始帧缓存：cmd → 完整帧列表（字节级一致，前端 FrameParser 零改动）
+        self._dir_cache: Dict[int, List[bytes]] = {}
+        # 粘包尾部：目录 burst 可能跨 chunk，保留未完整帧尾部
+        self._dir_buf = bytearray()
+
         # 最新监控值快照（/api/values 用）
         self.monitor_values: Dict[int, Any] = {}
         # 每项最近一次收到推送的时刻（看门狗判断数据是否新鲜，不存历史）
@@ -83,6 +92,10 @@ class Hub:
         self.fw_sub: Dict[int, tuple] = {}
         # 后端日志登记项（脚本 sub(..., 'log'/'both') 登记）
         self.log_reg: Set[int] = set()
+
+        # 订阅聚合：index → {source: (sub, fast)}，source = ui:conn_id 或 script
+        self._sub_intent: Dict[int, Dict[str, tuple]] = {}
+        self._sub_lock = threading.Lock()
 
         # 日志记录
         self.logging = False
@@ -104,6 +117,10 @@ class Hub:
         # 紧急停车 / 脚本中止
         self.abort_event = threading.Event()
         self._stop_cmd_index: Optional[int] = None  # 从命令目录 tag spec=Stop 识别
+
+        # 自动重连（Backend ↔ 下位机）
+        self._want_connected = False
+        self._reconnect_thread: Optional[threading.Thread] = None
 
         self.status = "idle"
         self.status_msg = "未启动"
@@ -131,8 +148,53 @@ class Hub:
             self.enqueue(request_monitor(), PRI_UI)
             self.enqueue(request_command(), PRI_UI)
 
+    def ensure_connected(self) -> None:
+        """保证 Backend ↔ 下位机有连接意愿，断线由重连线程兜底。"""
+        self._want_connected = True
+        if self.bridge.connected:
+            return
+        if self._reconnect_thread and self._reconnect_thread.is_alive():
+            return
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_loop, name="vex-reconnect", daemon=True
+        )
+        self._reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        # 断线后每 2s 重试，直到连上或用户不想连了
+        while self._want_connected and not self.bridge.connected:
+            if self.bridge.connect():
+                self.bridge.start_heartbeat(1.0)
+                # 重连后目录缓存可能已过期，重新拉三张表
+                self._dir_cache.clear()
+                self.enqueue(request_tunable(), PRI_UI)
+                self.enqueue(request_monitor(), PRI_UI)
+                self.enqueue(request_command(), PRI_UI)
+                # 把聚合后的订阅意图补发给下位机（重连不丢订阅）
+                self._restore_subscriptions()
+                return
+            time.sleep(2.0)
+
+    def _restore_subscriptions(self) -> None:
+        with self._sub_lock:
+            for idx, intent in self._sub_intent.items():
+                if not intent:
+                    continue
+                sub, fast = self._aggregate(intent)
+                self.fw_sub[idx] = (sub, fast)
+                if sub:
+                    self.enqueue(subscribe(idx, True, fast), PRI_UI)
+
+    @staticmethod
+    def _aggregate(intent: Dict[str, tuple]) -> tuple:
+        """订阅取并集，fast 取已订阅者中最高档（True > False）。"""
+        any_sub = any(v[0] for v in intent.values())
+        any_fast = any(v[1] for v in intent.values() if v[0])
+        return (any_sub, any_fast if any_sub else False)
+
     def stop(self) -> None:
         self._running = False
+        self._want_connected = False
         with self._tx_cv:
             self._tx_cv.notify_all()
         self.bridge.disconnect()
@@ -141,6 +203,7 @@ class Hub:
 
     def reconnect(self) -> bool:
         self.bridge.disconnect()
+        self._dir_buf.clear()
         ok = self.bridge.connect()
         if ok:
             self.bridge.start_heartbeat(1.0)
@@ -150,6 +213,7 @@ class Hub:
             self._name_to_mon.clear()
             self._name_to_tun.clear()
             self._name_to_cmd.clear()
+            self._dir_cache.clear()
             self.enqueue(request_tunable(), PRI_UI)
             self.enqueue(request_monitor(), PRI_UI)
             self.enqueue(request_command(), PRI_UI)
@@ -162,10 +226,22 @@ class Hub:
         self.status_msg = message
         logger.info("串口状态 %s: %s", state, message)
         self._broadcast_json({"op": "status", "state": state, "message": message})
+        # 掉线了但用户还想连着 → 自动重连
+        if state == "disconnected" and self._want_connected and self._running:
+            self.ensure_connected()
 
     def _on_serial_raw(self, chunk: bytes) -> None:
         # 上位机看到的串口和脚本看到的是同一股原始字节
         self._broadcast_bytes(chunk)
+        # 从字节流里挑目录帧缓存，供目录代理回放；未收完的半帧尾巴留到下一批
+        self._dir_buf.extend(chunk)
+        frames, consumed = scan_dir_frames(bytes(self._dir_buf))
+        for cmd, frame in frames:
+            self._dir_cache.setdefault(cmd, []).append(frame)
+        del self._dir_buf[:consumed]
+        # 异常兜底：缓冲涨破两倍 burst 说明解析对不上，截掉旧数据防内存膨胀
+        if len(self._dir_buf) > 8192:
+            del self._dir_buf[:-4096]
 
     def _on_serial_event(self, event: dict) -> None:
         kind = event.get("kind")
@@ -178,8 +254,10 @@ class Hub:
                 self.monitor_dir[idx] = item
                 self._name_to_mon[item["name"]] = idx
                 self.monitor_values[idx] = item.get("value")
-                # 目录帧的 tag 反映下位机当前订阅档位，先同步一份事实
-                self.fw_sub[idx] = (tag_subscribed(item["tag"]), tag_fast(item["tag"]))
+                # 目录帧的 tag 反映下位机当前订阅档位；但已有聚合意图的项以意图为准，
+                # 否则重连补订前的目录应答会把已生效的订阅状态覆盖掉
+                if idx not in self._sub_intent:
+                    self.fw_sub[idx] = (tag_subscribed(item["tag"]), tag_fast(item["tag"]))
             elif table == "tunable":
                 self.tunable_dir[idx] = item
                 self._name_to_tun[item["name"]] = idx
@@ -235,10 +313,15 @@ class Hub:
                     break
                 if not self._tx_q:
                     continue
-                _pri, _seq, frame = self._tx_q.popleft()
+                pri, _seq, frame = self._tx_q.popleft()
             try:
                 if self.bridge.connected:
                     self.bridge.send(frame)
+                elif pri == PRI_STOP:
+                    # 停车帧在断线时不能丢：塞回队首，等重连后立刻补发
+                    with self._tx_cv:
+                        self._tx_q.appendleft((pri, _seq, frame))
+                    time.sleep(0.5)
             except Exception as e:
                 logger.error("写串口失败: %s", e)
 
@@ -258,7 +341,7 @@ class Hub:
                 if msg.get("type") == "websocket.disconnect":
                     break
                 if "bytes" in msg and msg["bytes"] is not None:
-                    self.from_ui(msg["bytes"])
+                    self.from_ui(msg["bytes"], ws)
                 elif "text" in msg and msg["text"] is not None:
                     try:
                         obj = json.loads(msg["text"])
@@ -269,17 +352,101 @@ class Hub:
                     if op == "stop":
                         self.emergency_stop()
                     elif op == "raw" and "payload" in obj:
-                        self.from_ui(bytes(obj["payload"]))
+                        self.from_ui(bytes(obj["payload"]), ws)
         finally:
             with self._ws_lock:
                 self._ws_clients.discard(ws)
+            # 该客户端断开后清掉它的订阅意图
+            self._drop_client_intent(id(ws))
 
-    def from_ui(self, data: bytes) -> None:
-        """上位机发来的原始帧：识别停车并升级，其余高优先级透传。"""
-        # 帧: A5 | Cmd | ... 停车命令插队 + 中止脚本，保证上位机随时收车
-        if len(data) >= 2 and data[0] == 0xA5 and data[1] == self._stop_index():
+    def _drop_client_intent(self, conn_id: int) -> None:
+        source = f"ui:{conn_id}"
+        with self._sub_lock:
+            changed = []
+            for idx, intent in list(self._sub_intent.items()):
+                if source in intent:
+                    del intent[source]
+                    if not intent:
+                        del self._sub_intent[idx]
+                    changed.append(idx)
+            if changed:
+                self._recompute_and_emit(set(changed))
+
+    def _recompute_and_emit(self, indices: Set[int]) -> None:
+        for idx in indices:
+            intent = self._sub_intent.get(idx, {})
+            new_sub, new_fast = self._aggregate(intent) if intent else (False, False)
+            old = self.fw_sub.get(idx, (False, False))
+            if (new_sub, new_fast) != old:
+                self.fw_sub[idx] = (new_sub, new_fast)
+                if new_sub:
+                    self.enqueue(subscribe(idx, True, new_fast), PRI_UI)
+                else:
+                    self.enqueue(subscribe(idx, False, False), PRI_UI)
+
+    def from_ui(self, data: bytes, ws: WebSocket) -> None:
+        """上位机发来的原始帧：
+        - Ping 直接回 Pong，不转发下位机
+        - 目录请求用缓存回放，不重复拉下位机
+        - Subscribe 做聚合，diff 后才发
+        - 停车命令最高优先级
+        - 其余透传
+        """
+        if len(data) < 2 or data[0] != 0xA5:
+            return
+        cmd = data[1]
+
+        # 1) Ping → 直接回 Pong，记录心跳
+        if cmd == CmdGet.Ping:
+            try:
+                loop = self._loop
+                if loop:
+                    asyncio.run_coroutine_threadsafe(ws.send_bytes(ping()), loop)
+            except Exception as e:
+                logger.debug("Ping 回复失败: %s", e)
+            return
+
+        # 2) 目录请求 → 缓存回放
+        dir_map = {
+            CmdGet.RequestTunable: (CmdPost.TunableDirectory, request_tunable),
+            CmdGet.RequestMonitor: (CmdPost.MonitorDirectory, request_monitor),
+            CmdGet.RequestCommand: (CmdPost.CMDDirectory, request_command),
+        }
+        if cmd in dir_map:
+            post_cmd, request_fn = dir_map[cmd]
+            frames = self._dir_cache.get(post_cmd, [])
+            if frames:
+                try:
+                    loop = self._loop
+                    if loop:
+                        for frame in frames:
+                            asyncio.run_coroutine_threadsafe(ws.send_bytes(frame), loop)
+                except Exception as e:
+                    logger.debug("目录回放失败: %s", e)
+            else:
+                # 缓存空了：补一次拉取，下位机应答 burst 会经广播送达该客户端
+                self.enqueue(request_fn(), PRI_UI)
+            return
+
+        # 3) Subscribe → 聚合处理（防多页面互相退订）
+        if cmd == CmdGet.Subscribe and len(data) >= 5:
+            idx = data[2]
+            tag = data[3]
+            sub = tag_subscribed(tag)
+            fast = tag_fast(tag)
+            source = f"ui:{id(ws)}"
+            with self._sub_lock:
+                intent = self._sub_intent.setdefault(idx, {})
+                intent[source] = (sub, fast)
+                self._recompute_and_emit({idx})
+            return
+
+        # 4) 停车命令：插队 + 中止脚本
+        if cmd == self._stop_index():
             self.emergency_stop()
             return
+
+        # 5) 其余透传
         self.enqueue(data, PRI_UI)
 
     def _stop_index(self) -> int:
@@ -442,8 +609,10 @@ class Hub:
 
         if kind in ("push", "both"):
             use_fast = bool(fast) if fast is not None else on
-            self.fw_sub[idx] = (on, use_fast)
-            self.enqueue(subscribe(idx, on, use_fast), PRI_SCRIPT)
+            with self._sub_lock:
+                intent = self._sub_intent.setdefault(idx, {})
+                intent["script"] = (on, use_fast)
+                self._recompute_and_emit({idx})
             result["push"] = {"sub": on, "fast": use_fast}
 
         if kind in ("log", "both"):
@@ -453,8 +622,10 @@ class Hub:
                 if kind == "log":
                     cur = self.fw_sub.get(idx, (False, False))
                     if not cur[1]:
-                        self.fw_sub[idx] = (True, True)
-                        self.enqueue(subscribe(idx, True, True), PRI_SCRIPT)
+                        with self._sub_lock:
+                            intent = self._sub_intent.setdefault(idx, {})
+                            intent["script"] = (True, True)
+                            self._recompute_and_emit({idx})
                         result["push"] = {"sub": True, "fast": True}
             else:
                 self.log_reg.discard(idx)
@@ -487,16 +658,18 @@ class Hub:
         fields = item.get("fields") or []
         types = [f["type"] for f in fields]
         values = list(args)
-        if len(values) > len(types):
-            raise ValueError(f"命令 {item['name']} 只要 {len(types)} 个参数，给了 {len(values)} 个")
-        # 缺省参数补 0，脚本里少写一个也能跑（实际范围由目录 min/max 约束，脚本自负）
-        values.extend([0] * (len(types) - len(values)))
+        # 参数个数必须和目录完全一致：少给静默补 0 可能触发未预期动作，多给更是写错
+        if len(values) != len(types):
+            raise ValueError(
+                f"命令 {item['name']} 需要 {len(types)} 个参数"
+                f"（{[f['name'] for f in fields]}），实际给了 {len(values)} 个"
+            )
         self.enqueue(command_send(item["index"], types, values), PRI_SCRIPT)
         return {
             "ok": True,
             "index": item["index"],
             "name": item["name"],
-            "args": values[: len(types)],
+            "args": values,
         }
 
     def set_tunable_value(self, index_or_name, value) -> dict:

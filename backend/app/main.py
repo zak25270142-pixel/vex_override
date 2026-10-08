@@ -103,13 +103,16 @@ def api_status():
 
 @app.post("/api/connect")
 def api_connect():
-    if not hub.reconnect():
-        raise HTTPException(503, hub.status_msg)
-    return hub.snapshot()
+    # 前端连接/重连按钮入口：标记想连并立即尝试。
+    # 串口探测本身可能阻塞数秒，不等它出结果，交给重连线程反复试；
+    # 前端看 WS 状态消息（connecting/reconnecting/connected）感知进度。
+    hub.ensure_connected()
+    return {"ok": True, "snapshot": hub.snapshot()}
 
 
 @app.post("/api/disconnect")
 def api_disconnect():
+    hub._want_connected = False
     hub.bridge.disconnect()
     return {"ok": True}
 

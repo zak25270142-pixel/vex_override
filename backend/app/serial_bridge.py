@@ -197,6 +197,23 @@ class SerialBridge:
             self._ser = None
         self.on_status("idle", "串口已断开")
 
+    def _lost(self, message: str) -> None:
+        """掉线善后（拔线/读异常/心跳超时）：关口并发 disconnected，由 Hub 决定重连。"""
+        if not self._connected and self._ser is None:
+            return  # 已经断过了，不重复上报
+        self._stop.set()
+        self._connected = False
+        if self._rx_thread and self._rx_thread.is_alive() and threading.current_thread() is not self._rx_thread:
+            self._rx_thread.join(timeout=1.0)
+        self._rx_thread = None
+        if self._ser:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+        self.on_status("disconnected", message)
+
     # ---------- 收发 ----------
 
     def send(self, data: bytes) -> None:
@@ -222,8 +239,7 @@ class SerialBridge:
             except Exception as e:
                 if not self._stop.is_set():
                     logger.error("串口读异常: %s", e)
-                    self._connected = False
-                    self.on_status("error", f"串口读取异常: {e}")
+                    self._lost(f"串口读取异常: {e}")
                 break
 
     def _on_parsed(self, event: dict) -> None:
@@ -236,6 +252,9 @@ class SerialBridge:
 
     # ---------- 心跳 ----------
 
+    # 心跳 1s 一发，超过 5s 没收到 Pong 判定下位机程序已死（USB 还连着但链路没意义）
+    PONG_TIMEOUT_S = 5.0
+
     def start_heartbeat(self, interval: float = 1.0) -> threading.Thread:
         def _loop() -> None:
             while not self._stop.is_set() and self.connected:
@@ -243,7 +262,14 @@ class SerialBridge:
                     self.send(ping())
                 except Exception as e:
                     logger.warning("心跳发送失败: %s", e)
+                    self._lost(f"心跳发送失败: {e}")
+                    break
                 time.sleep(interval)
+                last = self._last_pong
+                if last > 0 and time.monotonic() - last > self.PONG_TIMEOUT_S:
+                    logger.warning("超过 %.0fs 未收到 Pong，判定下位机掉线", self.PONG_TIMEOUT_S)
+                    self._lost("心跳超时，下位机无响应")
+                    break
 
         t = threading.Thread(target=_loop, name="vex-heartbeat", daemon=True)
         t.start()

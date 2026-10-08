@@ -12,7 +12,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable, List, Union
+from typing import Callable, List, Tuple, Union
 
 FRAME_HEAD = 0xA5
 MAX_PAYLOAD = 445
@@ -305,6 +305,44 @@ def _cmd_dir_len(p: bytes, length: int) -> int:
     if p[1] & CMD_TAG_RANGE:
         off += 8 * field_num
     return off
+
+
+def scan_dir_frames(chunk: bytes) -> Tuple[List[Tuple[int, bytes]], int]:
+    """从原始字节流里挑完整的上行目录帧。
+    返回 ([(cmd, 整帧含帧头校验)], 已安全消费的前缀长度)；
+    半帧/粘包尾巴不算已消费，由调用方保留到下一批再喂。"""
+    out: List[Tuple[int, bytes]] = []
+    i = 0
+    n = len(chunk)
+    while i + 4 <= n:
+        if chunk[i] != FRAME_HEAD:
+            i += 1
+            continue
+        cmd = chunk[i + 1]
+        if cmd == CmdPost.Pong:
+            # Pong 固定 3 字节（A5 FF FF）
+            i += 3
+            continue
+        if cmd in (CmdPost.TunableDirectory, CmdPost.MonitorDirectory):
+            total = _dir_len(chunk[i + 2 :], n - i - 2)
+        elif cmd == CmdPost.CMDDirectory:
+            total = _cmd_dir_len(chunk[i + 2 :], n - i - 2)
+        else:
+            i += 1
+            continue
+        if total < 0:
+            break  # 帧还没收全，等下一批字节
+        end = i + 2 + total + 1
+        if end > n:
+            break
+        frame = chunk[i:end]
+        xor = 0
+        for b in frame[1:-1]:
+            xor ^= b
+        if xor == frame[-1]:
+            out.append((cmd, bytes(frame)))
+        i = end
+    return out, i
 
 
 class FrameParser:
