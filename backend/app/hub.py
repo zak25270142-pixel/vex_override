@@ -17,13 +17,14 @@ from bisect import bisect_left
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any
+from collections.abc import Deque
 
 from fastapi import WebSocket
 
 from .protocol import (
-    CmdPost,
     CmdGet,
+    CmdPost,
     CmdSpec,
     build_frame,
     cmd_spec,
@@ -54,7 +55,7 @@ MAX_LOG_SAMPLES = 500_000
 DEFAULT_PYTEST_DIR = Path(__file__).resolve().parent.parent / "pytest"
 
 
-def _aggregate(vals: List[float], thresholds=(), span_ms: float = 0.0) -> dict:
+def _aggregate(vals: list[float], thresholds=(), span_ms: float = 0.0) -> dict:
     """区间样本的统计量；无样本时除 n 外全为 None。"""
     n = len(vals)
     if n == 0:
@@ -80,9 +81,9 @@ def _aggregate(vals: List[float], thresholds=(), span_ms: float = 0.0) -> dict:
 class Hub:
     def __init__(
         self,
-        port: Optional[str] = None,
+        port: str | None = None,
         baud: int = 115200,
-        pytest_dir: Optional[Path] = None,
+        pytest_dir: Path | None = None,
     ) -> None:
         self.bridge = SerialBridge(
             port=port,
@@ -95,62 +96,62 @@ class Hub:
         self.pytest_dir.mkdir(parents=True, exist_ok=True)
 
         # 三张目录缓存 index → item dict
-        self.tunable_dir: Dict[int, dict] = {}
-        self.monitor_dir: Dict[int, dict] = {}
-        self.cmd_dir: Dict[int, dict] = {}
+        self.tunable_dir: dict[int, dict] = {}
+        self.monitor_dir: dict[int, dict] = {}
+        self.cmd_dir: dict[int, dict] = {}
         # name → index 反查（脚本用中文名寻址）
-        self._name_to_mon: Dict[str, int] = {}
-        self._name_to_tun: Dict[str, int] = {}
-        self._name_to_cmd: Dict[str, int] = {}
+        self._name_to_mon: dict[str, int] = {}
+        self._name_to_tun: dict[str, int] = {}
+        self._name_to_cmd: dict[str, int] = {}
 
         # 目录原始帧缓存：cmd → {index: 完整帧}（同 index 覆盖，避免重复拉表叠帧）
-        self._dir_cache: Dict[int, Dict[int, bytes]] = {}
+        self._dir_cache: dict[int, dict[int, bytes]] = {}
         # 粘包尾部：目录 burst 可能跨 chunk，保留未完整帧尾部
         self._dir_buf = bytearray()
 
         # 最新监控值快照（/api/values 用）
-        self.monitor_values: Dict[int, Any] = {}
+        self.monitor_values: dict[int, Any] = {}
         # 每项最近一次收到推送的时刻（看门狗判断数据是否新鲜，不存历史）
-        self.monitor_time: Dict[int, float] = {}
+        self.monitor_time: dict[int, float] = {}
         # 下位机侧推送订阅意图 index → (sub, fast)
-        self.fw_sub: Dict[int, tuple] = {}
+        self.fw_sub: dict[int, tuple] = {}
         # 后端日志登记项（脚本 sub(..., 'log'/'both') 登记）
-        self.log_reg: Set[int] = set()
+        self.log_reg: set[int] = set()
 
         # 订阅聚合：index → {source: (sub, fast)}，source = ui:conn_id 或 script
-        self._sub_intent: Dict[int, Dict[str, tuple]] = {}
+        self._sub_intent: dict[int, dict[str, tuple]] = {}
         self._sub_lock = threading.Lock()
 
         # 记录会话：脚本 sub(..., 'log'/'both') 登记要记哪些项，start_log 起算时间轴
         self.logging = False
-        self.log_dir: Dict[int, List[Tuple[float, Any]]] = {}  # index -> [(t_ms, 值)]，时间升序
+        self.log_dir: dict[int, list[tuple[float, Any]]] = {}  # index -> [(t_ms, 值)]，时间升序
         self.log_dropped = 0
         self._log_t0 = 0.0
-        self._log_t_end: Optional[float] = None  # 停止记录的时刻（ms）：事后按区间查询要用
+        self._log_t_end: float | None = None  # 停止记录的时刻（ms）：事后按区间查询要用
         self._log_lock = threading.Lock()
 
         # WebSocket 上位机
-        self._ws_clients: Set[WebSocket] = set()
+        self._ws_clients: set[WebSocket] = set()
         self._ws_lock = threading.Lock()
 
         # 下行帧优先级队列 (priority, seq, frame)
-        self._tx_q: Deque[Tuple[int, int, bytes]] = deque()
+        self._tx_q: Deque[tuple[int, int, bytes]] = deque()
         self._tx_seq = 0
         self._tx_cv = threading.Condition()
-        self._tx_thread: Optional[threading.Thread] = None
+        self._tx_thread: threading.Thread | None = None
         self._running = False
 
         # 紧急停车 / 脚本中止
         self.abort_event = threading.Event()
-        self._stop_cmd_index: Optional[int] = None  # 从命令目录 tag spec=Stop 识别
+        self._stop_cmd_index: int | None = None  # 从命令目录 tag spec=Stop 识别
 
         # 自动重连（Backend ↔ 下位机）
         self._want_connected = False
-        self._reconnect_thread: Optional[threading.Thread] = None
+        self._reconnect_thread: threading.Thread | None = None
 
         self.status = "idle"
         self.status_msg = "未启动"
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # ---------- 生命周期 ----------
 
@@ -213,7 +214,7 @@ class Hub:
                     self.enqueue(subscribe(idx, True, fast), PRI_UI)
 
     @staticmethod
-    def _aggregate(intent: Dict[str, tuple]) -> tuple:
+    def _aggregate(intent: dict[str, tuple]) -> tuple:
         """订阅取并集，fast 取已订阅者中最高档（True > False）。"""
         any_sub = any(v[0] for v in intent.values())
         any_fast = any(v[1] for v in intent.values() if v[0])
@@ -230,7 +231,7 @@ class Hub:
         if len(frame) >= 3:
             self._dir_cache.setdefault(cmd, {})[frame[2]] = frame
 
-    def _dir_frames_list(self, post_cmd: int) -> List[bytes]:
+    def _dir_frames_list(self, post_cmd: int) -> list[bytes]:
         """回放用：按 index 排序输出整帧列表。"""
         bucket = self._dir_cache.get(post_cmd) or {}
         return [bucket[k] for k in sorted(bucket.keys())]
@@ -241,9 +242,9 @@ class Hub:
         self.enqueue(request_frame, PRI_UI)
 
     def _request_all_dirs(self) -> None:
-        self._request_dir(CmdGet.TunableDirectory, request_tunable())
-        self._request_dir(CmdGet.MonitorDirectory, request_monitor())
-        self._request_dir(CmdGet.CMDDirectory, request_command())
+        self._request_dir(CmdPost.TunableDirectory, request_tunable())
+        self._request_dir(CmdPost.MonitorDirectory, request_monitor())
+        self._request_dir(CmdPost.CMDDirectory, request_command())
 
     def refresh_directories(self) -> dict:
         """清空三张目录缓存并重新向车请求（表结构变更或怀疑缓存过期时用）。"""
@@ -431,7 +432,7 @@ class Hub:
             if changed:
                 self._recompute_and_emit(set(changed))
 
-    def _recompute_and_emit(self, indices: Set[int]) -> None:
+    def _recompute_and_emit(self, indices: set[int]) -> None:
         for idx in indices:
             intent = self._sub_intent.get(idx, {})
             new_sub, new_fast = self._aggregate(intent) if intent else (False, False)
@@ -456,7 +457,7 @@ class Hub:
         cmd = data[1]
 
         # 1) Ping → 直接回 Pong，记录心跳
-        if cmd == CmdPost.Ping:
+        if cmd == CmdGet.Ping:
             try:
                 loop = self._loop
                 if loop:
@@ -467,9 +468,9 @@ class Hub:
 
         # 2) 目录请求 → 缓存回放
         dir_map = {
-            CmdPost.RequestTunable: (CmdGet.TunableDirectory, request_tunable),
-            CmdPost.RequestMonitor: (CmdGet.MonitorDirectory, request_monitor),
-            CmdPost.RequestCommand: (CmdGet.CMDDirectory, request_command),
+            CmdGet.RequestTunable: (CmdPost.TunableDirectory, request_tunable),
+            CmdGet.RequestMonitor: (CmdPost.MonitorDirectory, request_monitor),
+            CmdGet.RequestCommand: (CmdPost.CMDDirectory, request_command),
         }
         if cmd in dir_map:
             post_cmd, request_fn = dir_map[cmd]
@@ -488,7 +489,7 @@ class Hub:
             return
 
         # 3) Subscribe → 聚合处理（防多页面互相退订）
-        if cmd == CmdPost.Subscribe and len(data) >= 5:
+        if cmd == CmdGet.Subscribe and len(data) >= 5:
             idx = data[2]
             tag = data[3]
             sub = tag_subscribed(tag)
@@ -605,7 +606,7 @@ class Hub:
                 return self.cmd_dir[i]
         raise KeyError(f"命令不存在: {index_or_name}")
 
-    def get_column(self, type_: str) -> List[dict]:
+    def get_column(self, type_: str) -> list[dict]:
         t = type_.lower()
         if t in ("monitor", "mon"):
             return list(self.monitor_dir.values())
@@ -631,7 +632,7 @@ class Hub:
             "age_s": round(time.monotonic() - self.monitor_time.get(idx, 0.0), 3),
         }
 
-    def read_items(self, keys: list, missing_ok: bool = False) -> List[dict]:
+    def read_items(self, keys: list, missing_ok: bool = False) -> list[dict]:
         """多项当前值，一次返回（看门狗一轮要看 x/y/yaw，避免连发三个请求）。
         missing_ok=True 时跳过还没有数据的项（不抛 404），供批量轮询用。"""
         if not missing_ok:
@@ -657,7 +658,7 @@ class Hub:
         kind: str = "both",
         *,
         on: bool = True,
-        fast: Optional[bool] = None,
+        fast: bool | None = None,
     ) -> dict:
         """
         两种订阅可叠加：
@@ -804,7 +805,7 @@ class Hub:
             return self._log_t_end
         return (time.monotonic() - self._log_t0) * 1000
 
-    def log_time(self) -> Optional[float]:
+    def log_time(self) -> float | None:
         """当前在记录时间轴上的位置（相对开始记录的秒）；没在记录时返回 None。
         命令响应里带这个 t，脚本就能"设值前后打点、之后按窗口取统计"，不用自己记时间。"""
         if not self.logging:
@@ -818,14 +819,14 @@ class Hub:
             raise RuntimeError("还没开始记录（先 start_log）")
         return {"t": t, "samples": self.log_samples()}
 
-    def _log_indices(self, names) -> List[int]:
+    def _log_indices(self, names) -> list[int]:
         if names is None:
             return sorted(self.log_dir)
         if isinstance(names, (str, int)):
             names = [names]
         return [self.resolve_monitor(n) for n in names]
 
-    def _win_ms(self, since=None, until=None, tail=None, last_frac=None) -> Tuple[float, float]:
+    def _win_ms(self, since=None, until=None, tail=None, last_frac=None) -> tuple[float, float]:
         """脚本侧的秒参数换算成内部 ms 闭区间。
         优先级：tail（最近 N 秒） > last_frac（从 since 到现在的后百分之几） > since/until > 全窗。"""
         now = self._log_now_ms()
@@ -839,7 +840,7 @@ class Hub:
             t0 = t1 - (t1 - t0) * float(last_frac)
         return t0, t1
 
-    def _slice(self, idx: int, t0: float, t1: float) -> List[Tuple[float, Any]]:
+    def _slice(self, idx: int, t0: float, t1: float) -> list[tuple[float, Any]]:
         """取某项在 [t0,t1] ms 内的样本：二分定位起点，不扫全表。"""
         with self._log_lock:
             buf = self.log_dir.get(idx)
@@ -856,7 +857,7 @@ class Hub:
         """取区间内的原始样本（长表，按时间排序），供脚本自己画图或落盘。"""
         idxs = self._log_indices(names)
         t0, t1 = self._win_ms(since, until, tail, last_frac)
-        rows: List[dict] = []
+        rows: list[dict] = []
         for idx in idxs:
             name = self.monitor_dir.get(idx, {}).get("name", str(idx))
             for t, v in self._slice(idx, t0, t1):
@@ -877,7 +878,7 @@ class Hub:
             items.append({"index": idx, "name": name, **_aggregate(vals, thresholds, t1 - t0)})
         return {"t_from": t0, "t_to": t1, "items": items}
 
-    def print_log(self, path: Optional[str] = None) -> dict:
+    def print_log(self, path: str | None = None) -> dict:
         """导出记录：JSON 全量 + CSV 长表（t_ms,index,name,value），默认落 pytest/。"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if path:

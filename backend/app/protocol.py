@@ -12,7 +12,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable, List, Tuple, Union
+from collections.abc import Callable
 
 FRAME_HEAD = 0xA5
 MAX_PAYLOAD = 445
@@ -20,8 +20,9 @@ MAX_PAYLOAD = 445
 # ---------- 命令字 ----------
 
 
-class CmdGet(IntEnum):
+class CmdPost(IntEnum):
     """主控 → 上位机"""
+
     TunableDirectory = 0
     MonitorDirectory = 1
     MonitorValue = 2
@@ -30,8 +31,9 @@ class CmdGet(IntEnum):
     Pong = 0xFF
 
 
-class CmdPost(IntEnum):
+class CmdGet(IntEnum):
     """上位机 → 主控"""
+
     RequestTunable = 0
     RequestMonitor = 1
     Subscribe = 2
@@ -60,20 +62,26 @@ class ValueType(IntEnum):
     Color = 13
     Other = 14
 
+
 # ---------- 监控 tag 位域 ----------
+
 MONITOR_TAG_SUB = 0x80
 MONITOR_TAG_FAST = 0x40
 MONITOR_TAG_GETTER = 0x20
 MONITOR_TAG_KIND_MASK = 0x07
 
+
 def tag_subscribed(tag: int) -> bool:
     return (tag & MONITOR_TAG_SUB) != 0
+
 
 def tag_fast(tag: int) -> bool:
     return (tag & MONITOR_TAG_FAST) != 0
 
+
 def tag_kind(tag: int) -> int:
     return tag & MONITOR_TAG_KIND_MASK
+
 
 # ---------- 动作命令 tag 位域 ----------
 
@@ -82,21 +90,28 @@ CMD_TAG_ARGC_MASK = 0x70
 CMD_TAG_ARGC_SHIFT = 4
 CMD_TAG_SPEC_MASK = 0x0F
 
+
 class CmdSpec(IntEnum):
     Normal = 0
     Stop = 1
 
+
 def cmd_spec(tag: int) -> int:
     return tag & CMD_TAG_SPEC_MASK
+
 
 def cmd_argc(tag: int) -> int:
     return (tag & CMD_TAG_ARGC_MASK) >> CMD_TAG_ARGC_SHIFT
 
+
 def cmd_has_range(tag: int) -> bool:
     return (tag & CMD_TAG_RANGE) != 0
 
+
 # ---------- 值编解码 ----------
-CellValue = Union[int, float, str, bool]
+
+CellValue = int | float | str | bool
+
 
 def value_size(type_: int) -> int:
     """各类型在帧里占的字节数；str/other 不上报，返回 0（与 TS valueSize 一致）"""
@@ -111,6 +126,7 @@ def value_size(type_: int) -> int:
     if type_ == ValueType.Color:
         return 3
     return 0
+
 
 def decode_value(data: bytes, off: int, type_: int) -> CellValue:
     """按类型从小端字节流解码；调用方保证剩余字节足够。"""
@@ -143,12 +159,14 @@ def decode_value(data: bytes, off: int, type_: int) -> CellValue:
         return f"#{r:02x}{g:02x}{b:02x}"
     return 0
 
+
 def encode_value(type_: int, value: CellValue) -> bytes:
     """按真实宽度编码（动作命令字段用，紧凑无填充）。"""
     size = value_size(type_)
     if size == 0:
         return b""
     return encode_value8(type_, value)[:size]
+
 
 def encode_value8(type_: int, value: CellValue) -> bytes:
     """定长 8B 小端（SetTunable 用），不足高位为 0。"""
@@ -187,55 +205,66 @@ def encode_value8(type_: int, value: CellValue) -> bytes:
             buf[2] = rgb & 0xFF
     return bytes(buf)
 
+
 # ---------- 组帧 ----------
+
+
 def build_frame(cmd: int, payload: bytes = b"") -> bytes:
     xor = cmd
     for b in payload:
         xor ^= b
     return bytes([FRAME_HEAD, cmd & 0xFF]) + payload + bytes([xor & 0xFF])
 
+
 def request_tunable() -> bytes:
-    return build_frame(CmdPost.RequestTunable)
+    return build_frame(CmdGet.RequestTunable)
+
 
 def request_monitor() -> bytes:
-    return build_frame(CmdPost.RequestMonitor)
+    return build_frame(CmdGet.RequestMonitor)
+
 
 def request_command() -> bytes:
-    return build_frame(CmdPost.RequestCommand)
+    return build_frame(CmdGet.RequestCommand)
+
 
 def subscribe(index: int, sub: bool, fast: bool) -> bytes:
     tag = (MONITOR_TAG_SUB if sub else 0) | (MONITOR_TAG_FAST if fast else 0)
-    return build_frame(CmdPost.Subscribe, bytes([index & 0xFF, tag]))
+    return build_frame(CmdGet.Subscribe, bytes([index & 0xFF, tag]))
+
 
 def ping() -> bytes:
-    return build_frame(CmdPost.Ping)
+    return build_frame(CmdGet.Ping)
+
 
 def set_tunable(index: int, type_: int, value: CellValue) -> bytes:
-    return build_frame(CmdPost.SetTunable, bytes([index & 0xFF]) + encode_value8(type_, value))
+    return build_frame(CmdGet.SetTunable, bytes([index & 0xFF]) + encode_value8(type_, value))
 
-def command_send(cmd_index: int, field_types: List[int], values: List[CellValue]) -> bytes:
+
+def command_send(cmd_index: int, field_types: list[int], values: list[CellValue]) -> bytes:
     payload = bytearray()
     for t, v in zip(field_types, values):
         payload.extend(encode_value(t, v))
     return build_frame(cmd_index, bytes(payload))
 
+
 # ---------- 目录数据结构（解析结果用 dict，JSON 直接可序列化）----------
+
 
 @dataclass
 class CmdField:
-    """动作命令字段"""
     type: int
     name: str
-    min: Union[float, None] = None
-    max: Union[float, None] = None
+    min: float | None = None
+    max: float | None = None
+
 
 @dataclass
 class CmdDirItem:
-    """动作命令目录项"""
     index: int
     tag: int
     name: str
-    fields: List[CmdField] = field(default_factory=list)
+    fields: list[CmdField] = field(default_factory=list)
 
 
 # ---------- 帧解析状态机 ----------
@@ -278,11 +307,11 @@ def _cmd_dir_len(p: bytes, length: int) -> int:
     return off
 
 
-def scan_dir_frames(chunk: bytes) -> Tuple[List[Tuple[int, bytes]], int]:
+def scan_dir_frames(chunk: bytes) -> tuple[list[tuple[int, bytes]], int]:
     """从原始字节流里挑完整的上行目录帧。
     返回 ([(cmd, 整帧含帧头校验)], 已安全消费的前缀长度)；
     半帧/粘包尾巴不算已消费，由调用方保留到下一批再喂。"""
-    out: List[Tuple[int, bytes]] = []
+    out: list[tuple[int, bytes]] = []
     i = 0
     n = len(chunk)
     while i + 4 <= n:
@@ -290,13 +319,13 @@ def scan_dir_frames(chunk: bytes) -> Tuple[List[Tuple[int, bytes]], int]:
             i += 1
             continue
         cmd = chunk[i + 1]
-        if cmd == CmdGet.Pong:
+        if cmd == CmdPost.Pong:
             # Pong 固定 3 字节（A5 FF FF）
             i += 3
             continue
-        if cmd in (CmdGet.TunableDirectory, CmdGet.MonitorDirectory):
+        if cmd in (CmdPost.TunableDirectory, CmdPost.MonitorDirectory):
             total = _dir_len(chunk[i + 2 :], n - i - 2)
-        elif cmd == CmdGet.CMDDirectory:
+        elif cmd == CmdPost.CMDDirectory:
             total = _cmd_dir_len(chunk[i + 2 :], n - i - 2)
         else:
             i += 1
@@ -344,17 +373,17 @@ class FrameParser:
                 if b == FRAME_HEAD:
                     self.state = _RxState.WaitCmd
             elif self.state == _RxState.WaitCmd:
-                if b == CmdGet.Pong:
+                if b == CmdPost.Pong:
                     self.cmd = b
                     self.len = 0
                     self.xor = b
                     self.state = _RxState.WaitXor
                 elif b in (
-                        CmdGet.TunableDirectory,
-                        CmdGet.MonitorDirectory,
-                        CmdGet.MonitorValue,
-                        CmdGet.TunableEcho,
-                        CmdGet.CMDDirectory,
+                    CmdPost.TunableDirectory,
+                    CmdPost.MonitorDirectory,
+                    CmdPost.MonitorValue,
+                    CmdPost.TunableEcho,
+                    CmdPost.CMDDirectory,
                 ):
                     self.cmd = b
                     self.expect = -1
@@ -374,15 +403,15 @@ class FrameParser:
                 self.xor ^= b
 
                 if self.expect < 0:
-                    if self.cmd in (CmdGet.MonitorValue, CmdGet.TunableEcho):
+                    if self.cmd in (CmdPost.MonitorValue, CmdPost.TunableEcho):
                         types = (
                             self.monitor_type
-                            if self.cmd == CmdGet.MonitorValue
+                            if self.cmd == CmdPost.MonitorValue
                             else self.tunable_type
                         )
                         if self.len >= 1:
                             self.expect = 1 + value_size(types[self.payload[0]])
-                    elif self.cmd == CmdGet.CMDDirectory:
+                    elif self.cmd == CmdPost.CMDDirectory:
                         total = _cmd_dir_len(bytes(self.payload[: self.len]), self.len)
                         if total >= 0:
                             self.expect = total
@@ -404,7 +433,7 @@ class FrameParser:
         p = bytes(self.payload[: self.len])
         cmd = self.cmd
 
-        if cmd in (CmdGet.TunableDirectory, CmdGet.MonitorDirectory):
+        if cmd in (CmdPost.TunableDirectory, CmdPost.MonitorDirectory):
             if self.len < 4:
                 return
             index = p[0]
@@ -421,7 +450,7 @@ class FrameParser:
             name = p[4:unit_len_at].decode("utf-8", errors="replace")
             unit = p[unit_len_at + 1 : value_at].decode("utf-8", errors="replace")
             value = decode_value(p, value_at, type_) if value_size(type_) else 0
-            table = "tunable" if cmd == CmdGet.TunableDirectory else "monitor"
+            table = "tunable" if cmd == CmdPost.TunableDirectory else "monitor"
             if table == "monitor":
                 self.monitor_type[index] = type_
             else:
@@ -442,23 +471,23 @@ class FrameParser:
             )
             return
 
-        if cmd in (CmdGet.MonitorValue, CmdGet.TunableEcho):
+        if cmd in (CmdPost.MonitorValue, CmdPost.TunableEcho):
             if self.len < 1:
                 return
             index = p[0]
-            types = self.monitor_type if cmd == CmdGet.MonitorValue else self.tunable_type
+            types = self.monitor_type if cmd == CmdPost.MonitorValue else self.tunable_type
             type_ = types[index]
             value = decode_value(p, 1, type_) if value_size(type_) else 0
             on_event(
                 {
-                    "kind": "value" if cmd == CmdGet.MonitorValue else "echo",
+                    "kind": "value" if cmd == CmdPost.MonitorValue else "echo",
                     "index": index,
                     "value": value,
                 }
             )
             return
 
-        if cmd == CmdGet.CMDDirectory:
+        if cmd == CmdPost.CMDDirectory:
             if self.len < 3:
                 return
             index = p[0]
@@ -470,7 +499,7 @@ class FrameParser:
             name = p[3:off].decode("utf-8", errors="replace")
             field_num = p[off]
             off += 1
-            fields: List[dict] = []
+            fields: list[dict] = []
             for _ in range(field_num):
                 if self.len < off + 2:
                     return
@@ -501,6 +530,6 @@ class FrameParser:
             )
             return
 
-        if cmd == CmdGet.Pong:
+        if cmd == CmdPost.Pong:
             on_event({"kind": "pong"})
             return

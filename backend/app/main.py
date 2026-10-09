@@ -11,10 +11,10 @@ FastAPI 入口：
 
 from __future__ import annotations
 
-import logging
+import logging 
 import os
 from contextlib import asynccontextmanager # 异步上下文管理器（自动收车收尾）
-from typing import Any, List, Optional 
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware # CORS 中间件（允许跨域）
@@ -77,14 +77,14 @@ class SubBody(BaseModel):
     index_or_name: Any
     kind: str = Field(default="both", alias="type")  # push | log | both（兼容 type 字段名）
     on: bool = True
-    fast: Optional[bool] = None
+    fast: bool | None = None
 
     model_config = {"populate_by_name": True}
 
 
 class CmdBody(BaseModel):
     index_or_name: Any
-    args: List[Any] = Field(default_factory=list)
+    args: list[Any] = Field(default_factory=list)
 
 
 class TunableBody(BaseModel):
@@ -93,7 +93,7 @@ class TunableBody(BaseModel):
 
 
 class PrintLogBody(BaseModel):
-    path: Optional[str] = None
+    path: str | None = None
 
 
 @app.get("/api/status")
@@ -211,12 +211,12 @@ def api_log_mark():
 
 @app.get("/api/log/stats")
 def api_log_stats(
-    index_or_name: List[Any] = Query(default=[]),
-    since: Optional[float] = None,
-    until: Optional[float] = None,
-    tail: Optional[float] = None,
-    last_frac: Optional[float] = None,
-    thresholds: List[float] = Query(default=[]),
+    index_or_name: list[Any] = Query(default=[]),
+    since: float | None = None,
+    until: float | None = None,
+    tail: float | None = None,
+    last_frac: float | None = None,
+    thresholds: list[float] = Query(default=[]),
 ):
     """区间统计，不传 index_or_name 就统计全部已记录的项。
     时间参数单位是"相对开始记录的秒"；tail=最近 N 秒，last_frac=取窗口的后百分之几。
@@ -234,11 +234,11 @@ def api_log_stats(
 
 @app.get("/api/log/window")
 def api_log_window(
-    index_or_name: List[Any] = Query(default=[]),
-    since: Optional[float] = None,
-    until: Optional[float] = None,
-    tail: Optional[float] = None,
-    last_frac: Optional[float] = None,
+    index_or_name: list[Any] = Query(default=[]),
+    since: float | None = None,
+    until: float | None = None,
+    tail: float | None = None,
+    last_frac: float | None = None,
 ):
     """区间内的原始样本长表（t_ms/index/name/value），供脚本自己画图或落盘。"""
     try:
@@ -254,7 +254,7 @@ def api_log_window(
 
 @app.get("/api/value")
 def api_value(
-    index_or_name: List[Any] = Query(default=[]),
+    index_or_name: list[Any] = Query(default=[]),
     missing_ok: bool = False,
 ):
     """读当前值（看门狗用）：?index_or_name=x 单项；多个就重复传参一次取多项。

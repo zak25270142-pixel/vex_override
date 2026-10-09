@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
 try:
     import requests
@@ -50,7 +50,7 @@ _MOTOR_CN = {"L": "左", "R": "右"}
 _MOTOR_SUFFIX = {"vact": "实际电压", "rpm": "转速", "cur": "电流"}
 
 
-def motor_names(motor: str) -> Dict[str, str]:
+def motor_names(motor: str) -> dict[str, str]:
     """'L2' → {'vact': '左2实际电压', 'rpm': '左2转速', 'cur': '左2电流'}。"""
     cn = _MOTOR_CN[motor[0].upper()]
     n = int(motor[1])
@@ -74,7 +74,7 @@ class VexScript:
             raise RuntimeError(f"{path} -> {r.status_code}: {r.text}")
         return r.json()
 
-    def _post(self, path: str, body: Optional[dict] = None):
+    def _post(self, path: str, body: dict | None = None):
         if self._sess is None:
             raise RuntimeError("请先 pip install requests")
         r = self._sess.post(f"{self.base}{path}", json=body or {}, timeout=self.timeout)
@@ -108,11 +108,11 @@ class VexScript:
             time.sleep(0.2)
         return False
 
-    def get_column(self, type: str = "monitor") -> List[dict]:
+    def get_column(self, type: str = "monitor") -> list[dict]:
         """拉目录：type = monitor(实参) | tunable(调参) | cmd(命令)，JSON。"""
         return self._get("/api/column", type=type)
 
-    def values(self) -> List[dict]:
+    def values(self) -> list[dict]:
         return self._get("/api/values")
 
     def read(self, *index_or_name):
@@ -136,7 +136,7 @@ class VexScript:
         """读单项完整信息：{index,name,value,unit,age_s}，age_s 为距上次推送秒数。"""
         return self._get("/api/value", index_or_name=index_or_name)[0]
 
-    def read_many(self, keys: List[Any], missing_ok: bool = False) -> List[dict]:
+    def read_many(self, keys: list[Any], missing_ok: bool = False) -> list[dict]:
         """一次请求读多项（key 可为 index 或中文名），返回与 read_item 同结构的信息列表。
         比 read() 多带回 index，方便按 index 建索引；missing_ok=True 时跳过还没数据的项，
         不会因为其中一项没推送就整请求 404。"""
@@ -159,7 +159,7 @@ class VexScript:
         index_or_name,
         type: str = "both",
         *,
-        fast: Optional[bool] = None,
+        fast: bool | None = None,
     ) -> dict:
         """
         订阅/登记，index_or_name 可传监控 index(int) 或目录中文名(str)：
@@ -217,7 +217,7 @@ class VexScript:
     def end_log(self) -> dict:
         return self._post("/api/log/end")
 
-    def print_log(self, path: Optional[str] = None) -> dict:
+    def print_log(self, path: str | None = None) -> dict:
         """结束后导出：JSON 全量记录 + CSV 长表写到后端 pytest/ 目录，并在本机打印摘要 JSON。"""
         info = self._post("/api/log/print", {"path": path})
         print(json.dumps(info, ensure_ascii=False, indent=2))
@@ -231,10 +231,10 @@ class VexScript:
         self,
         names=None,
         *,
-        since: Optional[float] = None,
-        until: Optional[float] = None,
-        tail: Optional[float] = None,
-        last_frac: Optional[float] = None,
+        since: float | None = None,
+        until: float | None = None,
+        tail: float | None = None,
+        last_frac: float | None = None,
         thresholds=(),
     ) -> dict:
         """区间统计（后端算好，脚本不用自己攒样本）：names 不给就统计全部已记录的项。
@@ -254,10 +254,10 @@ class VexScript:
         self,
         names=None,
         *,
-        since: Optional[float] = None,
-        until: Optional[float] = None,
-        tail: Optional[float] = None,
-        last_frac: Optional[float] = None,
+        since: float | None = None,
+        until: float | None = None,
+        tail: float | None = None,
+        last_frac: float | None = None,
     ) -> dict:
         """区间内的原始样本长表：{"t_from","t_to","rows":[{"t","index","name","value"}]}。"""
         return self._get(
@@ -316,12 +316,12 @@ class BackendLink:
         timeout: float = 5.0,
     ) -> None:
         self.v = VexScript(base, timeout=timeout)
-        self.mon_dir: Dict[str, int] = {}      # 中文名 -> index（重名保留 fast 槽）
-        self.tun_dir: Dict[str, tuple] = {}    # 中文名 -> (index, 当前值)
-        self.motors: Dict[str, dict] = {}      # 'L2' -> {'vact'/'rpm'/'cur': 中文名}，fetch_dirs 填
-        self._mon_fast: Dict[str, bool] = {}
-        self._watch: Set[int] = set()          # 最近问过值的项，一次请求批量取回
-        self._vals: Dict[int, dict] = {}
+        self.mon_dir: dict[str, int] = {}      # 中文名 -> index（重名保留 fast 槽）
+        self.tun_dir: dict[str, tuple] = {}    # 中文名 -> (index, 当前值)
+        self.motors: dict[str, dict] = {}      # 'L2' -> {'vact'/'rpm'/'cur': 中文名}，fetch_dirs 填
+        self._mon_fast: dict[str, bool] = {}
+        self._watch: set[int] = set()          # 最近问过值的项，一次请求批量取回
+        self._vals: dict[int, dict] = {}
         self._vals_at = 0.0
         self._ttl = 0.02                       # 当前值缓存 20ms：一轮问多项只发一次请求
         self._abort_val = False
@@ -330,7 +330,7 @@ class BackendLink:
         if connect:
             self.connect()
 
-    def __enter__(self) -> "BackendLink":
+    def __enter__(self) -> BackendLink:
         """用 with 写法就不用每个脚本再抄一遍 try/finally 收车：
             with BackendLink() as bl:
                 bl.sub(...); bl.start_log(); ...
@@ -369,7 +369,7 @@ class BackendLink:
         self.motors = {m: motor_names(m) for m in (f"{s}{i}" for s in "LR" for i in range(4))}
         print(f"[dir] 监控项 {len(self.mon_dir)}，调参项 {len(self.tun_dir)}")
 
-    def resolve(self, names) -> List[int]:
+    def resolve(self, names) -> list[int]:
         """中文名或 index 统一解析成 index；名字不认识就跳过并提醒。"""
         out = []
         for n in _as_list(names):
@@ -380,12 +380,12 @@ class BackendLink:
             out.append(idx)
         return out
 
-    def _idx(self, name_or_idx) -> Optional[int]:
+    def _idx(self, name_or_idx) -> int | None:
         return name_or_idx if isinstance(name_or_idx, int) else self.mon_dir.get(name_or_idx)
 
     # ---------- 订阅 / 记录登记 ----------
 
-    def sub(self, names, type: str = "both", fast: Optional[bool] = None) -> None:
+    def sub(self, names, type: str = "both", fast: bool | None = None) -> None:
         """登记要订阅/记录的项（中文名或 index 均可，一律按 index 下发，重名不会有歧义）。
         type="push" 只改下位机推送档位（砍带宽）；"log" 只在后端登记记录；"both" 两者都做。"""
         for idx in self.resolve(names):
@@ -412,7 +412,7 @@ class BackendLink:
     def end_log(self) -> dict:
         return self.v.end_log()
 
-    def print_log(self, path: Optional[str] = None) -> dict:
+    def print_log(self, path: str | None = None) -> dict:
         """导出 JSON + CSV（默认落后端 pytest/ 目录），并打印摘要。"""
         return self.v.print_log(path)
 
@@ -431,12 +431,12 @@ class BackendLink:
     def wave(self, names=None, **win) -> dict:
         """区间原始波形：{名字: [(相对开始记录的秒, 值), ...]}。
         请求了却没数据的项也会给空列表，省得脚本到处判 KeyError。"""
-        out: Dict[str, list] = {n: [] for n in _as_list(names) if isinstance(n, str)}
+        out: dict[str, list] = {n: [] for n in _as_list(names) if isinstance(n, str)}
         for r in self.v.wave(names, **win)["rows"]:
             out.setdefault(r["name"], []).append((r["t"] / 1000.0, r["value"]))
         return out
 
-    def save_csv(self, path: str, rows: List[dict], columns: Optional[List[str]] = None,
+    def save_csv(self, path: str, rows: list[dict], columns: list[str] | None = None,
                  quiet: bool = False) -> str:
         """把 rows（dict 列表）写 CSV；不给 columns 就按第一行的键序，utf-8-sig 便于 Excel。"""
         keys = list(columns or (rows[0].keys() if rows else []))

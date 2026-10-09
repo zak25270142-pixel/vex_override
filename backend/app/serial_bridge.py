@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 from .protocol import FRAME_HEAD, FrameParser, ping
 
@@ -30,11 +30,11 @@ class SerialBridge:
 
     def __init__(
         self,
-        port: Optional[str] = None,
+        port: str | None = None,
         baud: int = 115200,
-        on_event: Optional[Callable[[dict], None]] = None,
-        on_status: Optional[Callable[[str, str], None]] = None,
-        on_raw: Optional[Callable[[bytes], None]] = None,
+        on_event: Callable[[dict], None] | None = None,
+        on_status: Callable[[str, str], None] | None = None,
+        on_raw: Callable[[bytes], None] | None = None,
     ) -> None:
         self.port_name = port
         self.baud = baud
@@ -43,15 +43,18 @@ class SerialBridge:
         # 原始 chunk 回调：Hub 用它把串口字节原样广播给 WebSocket 上位机（不拆帧）
         self.on_raw = on_raw or (lambda data: None)
 
-        self._ser: Optional["serial.Serial"] = None
+        # 不加引号：本文件有 `from __future__ import annotations`，注解不求值，
+        # serial 导入失败（未装 pyserial）时也不会在定义处炸。
+        # 反之若写成 "serial.Serial" | None，求值时是 str.__or__(None) → TypeError。
+        self._ser: serial.Serial | None = None
         self._parser = FrameParser()
         self._tx_lock = threading.Lock()
-        self._rx_thread: Optional[threading.Thread] = None
+        self._rx_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._connected = False
         self._last_pong = 0.0
         # 心跳单例：重连叠调 start_heartbeat 时先停旧线程，避免多路 Ping 打架
-        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_thread: threading.Thread | None = None
         self._hb_stop = threading.Event()
 
     @property
@@ -69,7 +72,7 @@ class SerialBridge:
     # ---------- 端口枚举 ----------
 
     @staticmethod
-    def list_ports() -> List[dict]:
+    def list_ports() -> list[dict]:
         if serial is None:
             return []
         out = []
@@ -85,7 +88,7 @@ class SerialBridge:
             )
         return out
 
-    def find_candidates(self) -> List[str]:
+    def find_candidates(self) -> list[str]:
         """优先返回可能是 V5 的口；若环境变量指定了口则只试它。"""
         if self.port_name:
             return [self.port_name]
@@ -150,7 +153,7 @@ class SerialBridge:
         self.on_status("error", f"未能识别 V5 User 口: {last_err}")
         return False
 
-    def _probe(self, ser: "serial.Serial", timeout: float = 0.3) -> bool:
+    def _probe(self, ser: serial.Serial, timeout: float = 0.3) -> bool:
         """发 Ping，在 timeout 内找到完整 Pong(A5 FF FF) 才算这个口对。"""
         try:
             ser.reset_input_buffer()
