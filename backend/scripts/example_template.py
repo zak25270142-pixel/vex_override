@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-测试脚本模板：sub → start_log → 循环 cmd → end_log → print_log → stop
+测试脚本模板：sub → start_log → 循环 cmd → end_log → print_log
+
+核心约定：脚本只决定"记哪些项 / 何时开始 / 存哪里"，记录本身由后端干；
+记录期间脚本只管发命令，事后用 stats()/wave() 按区间（相对开始记录的秒）取数据。
+
+这里示范最原始的 VexScript 接口；写实车脚本更推荐用 BackendLink（构造即就绪，
+还带 set_volt/spin_target/save_csv 等语法糖与 latest() 看门狗取值）。
+
 运行前先启动后端：
     cd backend
     uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -71,6 +78,15 @@ def main() -> None:
         v.stop()
     finally:
         v.end_log()
+        # 记录结束后按区间取统计/波形：时间一律是"相对 start_log 的秒"
+        try:
+            for it in v.stats(["x"], tail=99.0, thresholds=[0.05])["items"]:
+                print(f"  {it['name']}: 样本{it['n']} 均值{it['mean']} "
+                      f"峰值{it['abs_max']} 阈值占比{it['ratio_ge']}")
+            rows = v.wave(["x", "yaw"])["rows"]  # 长表 [{t,index,name,value}]
+            print(f"  原始样本 {len(rows)} 条，前 3 条：{rows[:3]}")
+        except Exception as e:
+            print("  （取统计/波形跳过：", e, "）")
         v.print_log()  # JSON + CSV 写到 backend/pytest/
 
 

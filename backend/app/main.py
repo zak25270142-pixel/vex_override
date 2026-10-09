@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import asynccontextmanager
-from typing import Any, List, Optional
+from contextlib import asynccontextmanager # 异步上下文管理器（自动收车收尾）
+from typing import Any, List, Optional 
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware # CORS 中间件（允许跨域）
+from pydantic import BaseModel, Field 
 
 from .hub import Hub
 
@@ -200,14 +200,70 @@ def api_log_print(body: PrintLogBody = PrintLogBody()):
     return hub.print_log(body.path)
 
 
+@app.post("/api/log/mark")
+def api_log_mark():
+    """在记录时间轴上打点：返回自开始记录起的秒数，之后用 since=该值 取窗口。"""
+    try:
+        return hub.log_mark()
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/api/log/stats")
+def api_log_stats(
+    index_or_name: List[Any] = Query(default=[]),
+    since: Optional[float] = None,
+    until: Optional[float] = None,
+    tail: Optional[float] = None,
+    last_frac: Optional[float] = None,
+    thresholds: List[float] = Query(default=[]),
+):
+    """区间统计，不传 index_or_name 就统计全部已记录的项。
+    时间参数单位是"相对开始记录的秒"；tail=最近 N 秒，last_frac=取窗口的后百分之几。
+    thresholds 里每个值额外给出 ratio_ge（|值| >= 该阈值的样本占比）。"""
+    try:
+        return hub.log_stats(
+            index_or_name or None, thresholds,
+            since=since, until=until, tail=tail, last_frac=last_frac,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/log/window")
+def api_log_window(
+    index_or_name: List[Any] = Query(default=[]),
+    since: Optional[float] = None,
+    until: Optional[float] = None,
+    tail: Optional[float] = None,
+    last_frac: Optional[float] = None,
+):
+    """区间内的原始样本长表（t_ms/index/name/value），供脚本自己画图或落盘。"""
+    try:
+        return hub.log_rows(
+            index_or_name or None,
+            since=since, until=until, tail=tail, last_frac=last_frac,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/value")
-def api_value(index_or_name: List[Any] = Query(default=[])):
+def api_value(
+    index_or_name: List[Any] = Query(default=[]),
+    missing_ok: bool = False,
+):
     """读当前值（看门狗用）：?index_or_name=x 单项；多个就重复传参一次取多项。
-    每项返回 index/name/value/unit/age_s（age_s=距上次推送秒数）。"""
+    每项返回 index/name/value/unit/age_s（age_s=距上次推送秒数）。
+    missing_ok=true 时跳过还没有数据的项，不整批 404（批量轮询用）。"""
     if not index_or_name:
         raise HTTPException(400, "用法：/api/value?index_or_name=x&index_or_name=y")
     try:
-        return hub.read_items(index_or_name)
+        return hub.read_items(index_or_name, missing_ok=missing_ok)
     except KeyError as e:
         raise HTTPException(404, str(e))
 

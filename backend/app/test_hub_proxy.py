@@ -14,7 +14,7 @@ import struct
 
 from .hub import Hub
 from .protocol import (
-    CmdPost,
+    CmdGet,
     build_frame,
     encode_value,
     ping,
@@ -42,7 +42,7 @@ def make_monitor_dir_frame(index: int, name: str, unit: str, value: float) -> by
     nb = name.encode("utf-8")
     ub = unit.encode("utf-8")
     payload = bytes([index, 8, 0, len(nb)]) + nb + bytes([len(ub)]) + ub + encode_value(8, value)
-    return build_frame(CmdPost.MonitorDirectory, payload)
+    return build_frame(CmdGet.MonitorDirectory, payload)
 
 
 def drain_tx(hub: Hub) -> list[bytes]:
@@ -61,7 +61,7 @@ def main() -> None:
     f0 = make_monitor_dir_frame(0, "x", "m", 1.5)
     f1 = make_monitor_dir_frame(1, "yaw", "deg", 90.0)
     hub._on_serial_raw(f0 + f1)
-    assert len(hub._dir_cache.get(CmdPost.MonitorDirectory, {})) == 2, "目录缓存应收到 2 帧"
+    assert len(hub._dir_cache.get(CmdGet.MonitorDirectory, {})) == 2, "目录缓存应收到 2 帧"
     print("[ok] 目录 burst 缓存")
 
     # --- 1. Ping 拦截：from_ui 收到 Ping 应回 Pong，且不进入下行队列 ---
@@ -85,7 +85,7 @@ def main() -> None:
     # --- 2.1 同 index 再来一帧应覆盖不叠加，回放按 index 排序 ---
     f0b = make_monitor_dir_frame(0, "x", "m", 2.5)
     hub._on_serial_raw(f0b)
-    assert len(hub._dir_cache[CmdPost.MonitorDirectory]) == 2, "同 index 应覆盖不叠加"
+    assert len(hub._dir_cache[CmdGet.MonitorDirectory]) == 2, "同 index 应覆盖不叠加"
     ws.sent_bytes.clear()
     hub.from_ui(request_monitor(), ws)  # type: ignore[arg-type]
     hub._loop.run_until_complete(asyncio.sleep(0.01))
@@ -97,14 +97,14 @@ def main() -> None:
     hub._dir_cache.clear()
     hub._dir_buf.clear()
     hub._on_serial_raw(f0[:3])  # A5|Cmd|index 半帧
-    assert CmdPost.MonitorDirectory not in hub._dir_cache, "半帧不应入缓存"
+    assert CmdGet.MonitorDirectory not in hub._dir_cache, "半帧不应入缓存"
     hub._on_serial_raw(f0[3:] + f1)
-    assert hub._dir_frames_list(CmdPost.MonitorDirectory) == [f0, f1], "跨 chunk 应拼齐入缓存"
+    assert hub._dir_frames_list(CmdGet.MonitorDirectory) == [f0, f1], "跨 chunk 应拼齐入缓存"
     print("[ok] 半帧跨 chunk 拼接")
 
     # --- 2.3 主动拉表应先清该表缓存，避免新旧混叠 ---
-    hub._request_dir(CmdPost.MonitorDirectory, request_monitor())
-    assert CmdPost.MonitorDirectory not in hub._dir_cache, "主动拉表应先清缓存"
+    hub._request_dir(CmdGet.MonitorDirectory, request_monitor())
+    assert CmdGet.MonitorDirectory not in hub._dir_cache, "主动拉表应先清缓存"
     assert drain_tx(hub) == [request_monitor()], "拉表请求应入队"
     print("[ok] 拉表前清缓存")
 

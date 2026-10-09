@@ -13,6 +13,7 @@ import json
 import logging
 import threading
 import time
+from bisect import bisect_left
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +22,8 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from fastapi import WebSocket
 
 from .protocol import (
-    CmdGet,
     CmdPost,
+    CmdGet,
     CmdSpec,
     build_frame,
     cmd_spec,
@@ -51,6 +52,29 @@ MAX_LOG_SAMPLES = 500_000
 
 # 默认 pytest 输出目录（相对 backend/）
 DEFAULT_PYTEST_DIR = Path(__file__).resolve().parent.parent / "pytest"
+
+
+def _aggregate(vals: List[float], thresholds=(), span_ms: float = 0.0) -> dict:
+    """区间样本的统计量；无样本时除 n 外全为 None。"""
+    n = len(vals)
+    if n == 0:
+        return {
+            "n": 0, "mean": None, "abs_mean": None, "min": None, "max": None,
+            "abs_max": None, "std": None, "rate_hz": None, "ratio_ge": {},
+        }
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / n
+    return {
+        "n": n,
+        "mean": mean,
+        "abs_mean": sum(abs(v) for v in vals) / n,
+        "min": min(vals),
+        "max": max(vals),
+        "abs_max": max(abs(v) for v in vals),
+        "std": var ** 0.5,
+        "rate_hz": round(n / (span_ms / 1000.0), 2) if span_ms > 0 else None,
+        "ratio_ge": {str(th): sum(1 for v in vals if abs(v) >= th) / n for th in thresholds},
+    }
 
 
 class Hub:
@@ -97,11 +121,13 @@ class Hub:
         self._sub_intent: Dict[int, Dict[str, tuple]] = {}
         self._sub_lock = threading.Lock()
 
-        # 日志记录
+        # 记录会话：脚本 sub(..., 'log'/'both') 登记要记哪些项，start_log 起算时间轴
         self.logging = False
-        self.log_buffer: List[dict] = []
+        self.log_dir: Dict[int, List[Tuple[float, Any]]] = {}  # index -> [(t_ms, 值)]，时间升序
         self.log_dropped = 0
         self._log_t0 = 0.0
+        self._log_t_end: Optional[float] = None  # 停止记录的时刻（ms）：事后按区间查询要用
+        self._log_lock = threading.Lock()
 
         # WebSocket 上位机
         self._ws_clients: Set[WebSocket] = set()
@@ -215,9 +241,9 @@ class Hub:
         self.enqueue(request_frame, PRI_UI)
 
     def _request_all_dirs(self) -> None:
-        self._request_dir(CmdPost.TunableDirectory, request_tunable())
-        self._request_dir(CmdPost.MonitorDirectory, request_monitor())
-        self._request_dir(CmdPost.CMDDirectory, request_command())
+        self._request_dir(CmdGet.TunableDirectory, request_tunable())
+        self._request_dir(CmdGet.MonitorDirectory, request_monitor())
+        self._request_dir(CmdGet.CMDDirectory, request_command())
 
     def refresh_directories(self) -> dict:
         """清空三张目录缓存并重新向车请求（表结构变更或怀疑缓存过期时用）。"""
@@ -307,18 +333,7 @@ class Hub:
             self.monitor_values[idx] = val
             self.monitor_time[idx] = time.monotonic()
             if self.logging and idx in self.log_reg:
-                if len(self.log_buffer) >= MAX_LOG_SAMPLES:
-                    self.log_dropped += 1
-                else:
-                    name = self.monitor_dir.get(idx, {}).get("name", str(idx))
-                    self.log_buffer.append(
-                        {
-                            "t": round((time.monotonic() - self._log_t0) * 1000, 2),
-                            "index": idx,
-                            "name": name,
-                            "value": val,
-                        }
-                    )
+                self._record(idx, val)
 
         elif kind == "echo":
             idx = event["index"]
@@ -441,7 +456,7 @@ class Hub:
         cmd = data[1]
 
         # 1) Ping → 直接回 Pong，记录心跳
-        if cmd == CmdGet.Ping:
+        if cmd == CmdPost.Ping:
             try:
                 loop = self._loop
                 if loop:
@@ -452,9 +467,9 @@ class Hub:
 
         # 2) 目录请求 → 缓存回放
         dir_map = {
-            CmdGet.RequestTunable: (CmdPost.TunableDirectory, request_tunable),
-            CmdGet.RequestMonitor: (CmdPost.MonitorDirectory, request_monitor),
-            CmdGet.RequestCommand: (CmdPost.CMDDirectory, request_command),
+            CmdPost.RequestTunable: (CmdGet.TunableDirectory, request_tunable),
+            CmdPost.RequestMonitor: (CmdGet.MonitorDirectory, request_monitor),
+            CmdPost.RequestCommand: (CmdGet.CMDDirectory, request_command),
         }
         if cmd in dir_map:
             post_cmd, request_fn = dir_map[cmd]
@@ -473,7 +488,7 @@ class Hub:
             return
 
         # 3) Subscribe → 聚合处理（防多页面互相退订）
-        if cmd == CmdGet.Subscribe and len(data) >= 5:
+        if cmd == CmdPost.Subscribe and len(data) >= 5:
             idx = data[2]
             tag = data[3]
             sub = tag_subscribed(tag)
@@ -616,9 +631,18 @@ class Hub:
             "age_s": round(time.monotonic() - self.monitor_time.get(idx, 0.0), 3),
         }
 
-    def read_items(self, keys: list) -> List[dict]:
-        """多项当前值，一次返回（看门狗一轮要看 x/y/yaw，避免连发三个请求）。"""
-        return [self.read_item(k) for k in keys]
+    def read_items(self, keys: list, missing_ok: bool = False) -> List[dict]:
+        """多项当前值，一次返回（看门狗一轮要看 x/y/yaw，避免连发三个请求）。
+        missing_ok=True 时跳过还没有数据的项（不抛 404），供批量轮询用。"""
+        if not missing_ok:
+            return [self.read_item(k) for k in keys]
+        out = []
+        for k in keys:
+            try:
+                out.append(self.read_item(k))
+            except KeyError:
+                continue
+        return out
 
     def read(self, *index_or_name):
         """最便捷读法：单项直接拿数值（hub.read('x')）；
@@ -708,12 +732,22 @@ class Hub:
                 f"命令 {item['name']} 需要 {len(types)} 个参数"
                 f"（{[f['name'] for f in fields]}），实际给了 {len(values)} 个"
             )
+        # 目录里带取值范围（tag bit7）的字段顺手校验，越界直接拦，别把车开到量程外
+        for f, v in zip(fields, values):
+            lo, hi = f.get("min"), f.get("max")
+            if lo is None and hi is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"命令 {item['name']} 的参数 {f['name']} 需要数值，实际给了 {v!r}")
+            if (lo is not None and v < lo) or (hi is not None and v > hi):
+                raise ValueError(f"命令 {item['name']} 的参数 {f['name']}={v} 超出范围（{lo}~{hi}）")
         self.enqueue(command_send(item["index"], types, values), PRI_SCRIPT)
         return {
             "ok": True,
             "index": item["index"],
             "name": item["name"],
             "args": values,
+            "t": self.log_time(),
         }
 
     def set_tunable_value(self, index_or_name, value) -> dict:
@@ -721,23 +755,130 @@ class Hub:
         idx = self.resolve_tunable(index_or_name)
         item = self.tunable_dir[idx]
         self.enqueue(set_tunable(idx, item["type"], value), PRI_SCRIPT)
-        return {"ok": True, "index": idx, "value": value}
+        return {"ok": True, "index": idx, "value": value, "t": self.log_time()}
 
-    # ---------- 日志 ----------
+    # ---------- 记录会话 ----------
+    # 约定：脚本侧的时间一律是"相对开始记录的秒"，内部存毫秒（CSV 表头 t_ms 不变）
+
+    def _record(self, idx: int, value: Any) -> None:
+        """记一条样本；超上限丢新样（防脚本忘 end_log 把内存吃光）。"""
+        t = round((time.monotonic() - self._log_t0) * 1000, 2)
+        with self._log_lock:
+            if self.log_samples() >= MAX_LOG_SAMPLES:
+                self.log_dropped += 1
+                return
+            self.log_dir.setdefault(idx, []).append((t, value))
+
+    def log_samples(self) -> int:
+        return sum(len(v) for v in self.log_dir.values())
 
     def start_log(self) -> dict:
-        self.log_buffer.clear()
-        self.log_dropped = 0
-        self._log_t0 = time.monotonic()
+        """开始记录：清掉上一轮缓冲，并以此刻为时间轴零点。
+        记哪些项由脚本先用 sub(x, 'log'/'both') 登记；记录期间新登记/退订即时生效。"""
+        with self._log_lock:
+            self.log_dir.clear()
+            self.log_dropped = 0
+            self._log_t0 = time.monotonic()
+            self._log_t_end = None
         self.logging = True
-        return {"ok": True, "registered": sorted(self.log_reg)}
+        return {
+            "ok": True,
+            "t0": 0.0,
+            "registered": [
+                {"index": i, "name": self.monitor_dir.get(i, {}).get("name", str(i))}
+                for i in sorted(self.log_reg)
+            ],
+        }
 
     def end_log(self) -> dict:
+        self._log_t_end = self.log_time() * 1000 if self.logging else self._log_t_end
         self.logging = False
-        return {"ok": True, "samples": len(self.log_buffer), "dropped": self.log_dropped}
+        return {"ok": True, "samples": self.log_samples(), "dropped": self.log_dropped}
+
+    def _log_now_ms(self) -> float:
+        """记录时间轴上的"现在"（ms）。停止记录后冻结在结束时刻，
+        这样事后调 stats(tail=...) / wave(...) 拿的仍是"记录的最后 N 秒"，不会被墙上时间甩开。"""
+        if not self._log_t0:
+            return 0.0
+        if not self.logging and self._log_t_end is not None:
+            return self._log_t_end
+        return (time.monotonic() - self._log_t0) * 1000
+
+    def log_time(self) -> Optional[float]:
+        """当前在记录时间轴上的位置（相对开始记录的秒）；没在记录时返回 None。
+        命令响应里带这个 t，脚本就能"设值前后打点、之后按窗口取统计"，不用自己记时间。"""
+        if not self.logging:
+            return None
+        return round(time.monotonic() - self._log_t0, 4)
+
+    def log_mark(self) -> dict:
+        """在记录时间轴上打个点，返回"自开始记录起的秒数"。"""
+        t = self.log_time()
+        if t is None:
+            raise RuntimeError("还没开始记录（先 start_log）")
+        return {"t": t, "samples": self.log_samples()}
+
+    def _log_indices(self, names) -> List[int]:
+        if names is None:
+            return sorted(self.log_dir)
+        if isinstance(names, (str, int)):
+            names = [names]
+        return [self.resolve_monitor(n) for n in names]
+
+    def _win_ms(self, since=None, until=None, tail=None, last_frac=None) -> Tuple[float, float]:
+        """脚本侧的秒参数换算成内部 ms 闭区间。
+        优先级：tail（最近 N 秒） > last_frac（从 since 到现在的后百分之几） > since/until > 全窗。"""
+        now = self._log_now_ms()
+        if tail is not None:
+            return max(0.0, now - float(tail) * 1000), now
+        t0 = 0.0 if since is None else float(since) * 1000
+        t1 = now if until is None else float(until) * 1000
+        if last_frac is not None:
+            if not 0.0 < float(last_frac) <= 1.0:
+                raise ValueError("last_frac 必须在 0~1 之间")
+            t0 = t1 - (t1 - t0) * float(last_frac)
+        return t0, t1
+
+    def _slice(self, idx: int, t0: float, t1: float) -> List[Tuple[float, Any]]:
+        """取某项在 [t0,t1] ms 内的样本：二分定位起点，不扫全表。"""
+        with self._log_lock:
+            buf = self.log_dir.get(idx)
+            if not buf:
+                return []
+            out = []
+            for item in buf[bisect_left(buf, (t0,)):]:
+                if item[0] > t1:
+                    break
+                out.append(item)
+            return out
+
+    def log_rows(self, names=None, since=None, until=None, tail=None, last_frac=None) -> dict:
+        """取区间内的原始样本（长表，按时间排序），供脚本自己画图或落盘。"""
+        idxs = self._log_indices(names)
+        t0, t1 = self._win_ms(since, until, tail, last_frac)
+        rows: List[dict] = []
+        for idx in idxs:
+            name = self.monitor_dir.get(idx, {}).get("name", str(idx))
+            for t, v in self._slice(idx, t0, t1):
+                rows.append({"t": t, "index": idx, "name": name, "value": v})
+        rows.sort(key=lambda r: r["t"])
+        return {"t_from": t0, "t_to": t1, "rows": rows}
+
+    def log_stats(self, names=None, thresholds=(), since=None, until=None,
+                  tail=None, last_frac=None) -> dict:
+        """区间统计（后端算好，脚本不用自己攒样本）。
+        thresholds 里每个 th 额外给出 ratio_ge[th] = |值| >= th 的样本占比。"""
+        idxs = self._log_indices(names)
+        t0, t1 = self._win_ms(since, until, tail, last_frac)
+        items = []
+        for idx in idxs:
+            name = self.monitor_dir.get(idx, {}).get("name", str(idx))
+            vals = [v for _, v in self._slice(idx, t0, t1)]
+            items.append({"index": idx, "name": name, **_aggregate(vals, thresholds, t1 - t0)})
+        return {"t_from": t0, "t_to": t1, "items": items}
 
     def print_log(self, path: Optional[str] = None) -> dict:
-        """写 JSON 全量记录 + CSV 长表到 pytest/，返回文件信息。"""
+        """导出记录：JSON 全量 + CSV 长表（t_ms,index,name,value），默认落 pytest/。"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if path:
             base = Path(path)
@@ -748,15 +889,16 @@ class Hub:
             csv_path = self.pytest_dir / f"log_{ts}.csv"
         json_path.parent.mkdir(parents=True, exist_ok=True)
 
+        rows = self.log_rows()["rows"]
         meta = {
             "created": datetime.now().isoformat(timespec="seconds"),
-            "samples": len(self.log_buffer),
+            "samples": len(rows),
             "dropped": self.log_dropped,
             "registered": [
                 {"index": i, "name": self.monitor_dir.get(i, {}).get("name", str(i))}
                 for i in sorted(self.log_reg)
             ],
-            "data": self.log_buffer,
+            "data": rows,
         }
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2, default=str)
@@ -764,14 +906,14 @@ class Hub:
         # 长表：每条推送一行，Excel/pandas 直接可读
         with open(csv_path, "w", encoding="utf-8-sig") as f:
             f.write("t_ms,index,name,value\n")
-            for row in self.log_buffer:
+            for row in rows:
                 f.write(f"{row['t']},{row['index']},{row['name']},{row['value']}\n")
 
         return {
             "ok": True,
             "json": str(json_path),
             "csv": str(csv_path),
-            "samples": len(self.log_buffer),
+            "samples": len(rows),
             "dropped": self.log_dropped,
         }
 
@@ -785,7 +927,8 @@ class Hub:
             "cmd_count": len(self.cmd_dir),
             "log_reg": sorted(self.log_reg),
             "logging": self.logging,
-            "log_samples": len(self.log_buffer),
+            "log_samples": self.log_samples(),
+            "log_dropped": self.log_dropped,
             "abort": self.abort_event.is_set(),
             "stop_cmd": self._stop_cmd_index,
             "ports": SerialBridge.list_ports(),
