@@ -10,8 +10,8 @@
   一旦持续转动立刻收电压、随机化停位，开始下一次。
 最后给出每台电机启动电压的最小值/中位值/最大值分布。
 
-记录交给后端：脚本只声明"记哪些项"，逐档发命令，再按区间取统计（不用自己攒样本）。
-每轮试验开头重新 start_log()，把上一轮缓冲清掉、零点归零（长实验不会超上限）。
+记录按段进行：每档一段独立曲线（start_log → 设值 → 保持 → end_log），
+段结束后立即取本段统计做判定；原始数据需要时按段 print_log 存盘。
 
 运行前先启动后端：
     cd backend
@@ -27,8 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # backend 根，供 import app
 from app.script_api import BackendLink  # noqa: E402
-
-TAIL_FRAC = 0.7  # 每档只看后 70% 窗口，前半段是上一档的过渡
+from motor_names import motor_names  # noqa: E402
 
 
 def median(xs):
@@ -57,7 +56,7 @@ def main():
     ap.add_argument("--hold", type=float, default=0.40)
     ap.add_argument("--csv", default="pytest/motor_start_repeat.csv",
                     help="每次试验一行，空字符串跳过")
-    ap.add_argument("--log", default="", help="非空则导出全量记录到该路径")
+    ap.add_argument("--log", default="", help="非空则每段原始记录导出到该目录（每段一对 json/csv）")
     args = ap.parse_args()
 
     motors = args.motors.split(",")
@@ -68,8 +67,9 @@ def main():
     # with 退出时 __exit__ 自动收车收尾（8电机0V / 刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
         print("监控表共 %d 项" % len(bl.mon_dir))
+        alias = {m: motor_names(m) for m in motors if m[:1] in "LR" and m[1:].isdigit()}
         missing = ["%s:%s" % (m, k) for m in motors for k in ("rpm", "vact", "cur")
-                   if bl.motors[m][k] not in bl.mon_dir]
+                   if m not in alias or alias[m][k] not in bl.mon_dir]
         if missing:
             print("监控项映射不完整：%s" % missing)
             sys.exit(1)
@@ -83,7 +83,7 @@ def main():
         for motor in motors:
             side, n = motor[0], int(motor[1])
             motor_id = n if side == "L" else 4 + n
-            names = bl.motors[motor]   # {'vact'/'rpm'/'cur': 中文名}
+            names = alias[motor]   # {'vact'/'rpm'/'cur': 中文名}（脚本侧 motor_names 维护）
 
             bl.clear_subs()
             bl.sub(list(names.values()))
@@ -91,8 +91,6 @@ def main():
 
             print("\n===== %s 重复启动试验（%d 次）=====" % (motor, args.trials))
             for trial in range(1, args.trials + 1):
-                bl.start_log()  # 每轮重新开录：清缓冲、零点归零
-
                 # 随机化静止位置：短冲一下再惰行，停在哪个齿槽全凭运气
                 bl.set_volt(motor_id, 0.9)
                 bl.sleep(0.12)
@@ -102,17 +100,22 @@ def main():
                 start_v = None
                 twitch_v = None
                 vact_at_start = None
-                # 逐档爬坡：设电压 → 等 hold → 取后窗统计；sustained 命中即提前 break
-                for row in bl.sweep(voltages, lambda v: bl.set_volt(motor_id, v),
-                                    [names["rpm"], names["vact"]], args.hold,
-                                    last_frac=TAIL_FRAC, thresholds=[1.0, 3.0]):
-                    st_r = row["stats"][names["rpm"]]
-                    st_v = row["stats"][names["vact"]]
-                    # 抽动：窗内峰值过3pct（越过齿槽动了一下但没转起来）
+                # 逐档爬坡：每档一段独立记录，end_log 后取本段统计做判定；
+                # sustained 命中即提前 break
+                for v in voltages:
+                    bl.start_log()             # 每档一段：清上一段缓冲、零点归零
+                    bl.set_volt(motor_id, v)
+                    bl.sleep(args.hold)
+                    bl.end_log()
+                    if args.log:
+                        bl.print_log("%s/%s_t%d_v%.2f" % (args.log, motor, trial, v))
+                    st_r = bl.stats([names["rpm"]], thresholds=[1.0, 3.0])[names["rpm"]]
+                    st_v = bl.stats([names["vact"]])[names["vact"]]
+                    # 抽动：本段峰值过3pct（越过齿槽动了一下但没转起来）
                     if twitch_v is None and (st_r["abs_max"] or 0.0) >= 3.0:
-                        twitch_v = row["value"]
+                        twitch_v = v
                     if sustained(st_r):
-                        start_v = row["value"]
+                        start_v = v
                         vact_at_start = st_v["abs_mean"]
                         break
 
@@ -135,9 +138,6 @@ def main():
                 bl.set_volt(motor_id, 0.0)  # 本轮收电压
                 bl.sleep(0.4)
 
-        bl.end_log()
-        if args.log:
-            bl.print_log(args.log)
         if args.csv and rows:
             bl.save_csv(args.csv, rows)
 

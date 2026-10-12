@@ -16,7 +16,7 @@ speed_loop_probe.py —— 速度环低速粘滑问题的实车诊断脚本（�
     不再自己开串口，全部走后端 HTTP（backend/app/script_api.py 的 BackendLink）。
     动作/调参转发给后端；监控数据由**后端**在记录期间采样并带时间戳，
     脚本只负责"声明记哪些项 + 何时开始"，再用波/统计接口按区间取值——
-    时间轴就是"相对 start_log() 的秒数"，命令响应里直接带回打点 t，不用对齐本地时钟。
+    时间轴就是"相对 start_log() 的秒数"，命令响应里直接带回打点 t，不用对齐本地时钟（现在每个脉冲/档位各自成段，段内时间轴自成一条曲线）。
 
 安全设计（重要）：
     - 只发直线等速目标，不转向；单次动作 ≤1.0s，每次动作后滑行/刹车 0.8s 以上
@@ -347,8 +347,7 @@ class Probe:
         for v in VOLT_UP:
             self.wd.check()
             x_pre = L.latest(NAME_X)
-            L.start_log()      # 每档重新开录：记录缓冲不跨档累积，时间轴也从这里算起
-            t0 = L.mark()      # 本档打点（记录时间轴上的秒）
+            L.start_log()      # 每档一段独立记录：缓冲不跨档累积，时间轴也从这里算起
             self.wd.begin_pulse(vlim=80.0)  # 开环只防瞬间大蹿（松，允许静摩擦释放毛刺）
             try:
                 L.drive_volt(v)
@@ -356,11 +355,13 @@ class Probe:
                 self.halt()
                 self._sleep(HOME_GUARD_S)
             except RuntimeError:
-                self.save_wave("open_up_abort", L.wave(MON_OPEN, since=t0))
+                L.end_log()    # 先冻结本段，再取波形
+                self.save_wave("open_up_abort", L.wave(MON_OPEN))
                 self.wd.end_pulse()
                 raise
+            L.end_log()
             self.wd.end_pulse()
-            w = L.wave(MON_OPEN, since=t0)
+            w = L.wave(MON_OPEN)
             self.save_wave("open_up", w)
             lv = [x for _, x in w["左0转速"]][3:]
             rv = [x for _, x in w["右0转速"]][3:]
@@ -376,7 +377,6 @@ class Probe:
             self._sleep(0.25)
 
         print("\n===== 开环滚动降压：1.6V起步后连续降档，整体移出≤0.2m 后倒回 =====")
-        L.start_log()  # 降压是连续过程，整段录一次就够
         self.wd.begin_pulse(vlim=80.0, budget=0.20)
         try:
             L.drive_volt(1.6)
@@ -384,10 +384,11 @@ class Probe:
             x_scan0 = L.latest(NAME_X)
             for v in VOLT_DOWN:
                 self.wd.check()
-                t0 = L.mark()
+                L.start_log()      # 每档一段独立记录，波形按档切分
                 L.drive_volt(v)
                 self._sleep(0.3)
-                w = L.wave(MON_OPEN, since=t0)
+                L.end_log()
+                w = L.wave(MON_OPEN)
                 self.save_wave("open_down", w)
                 lv = [x for _, x in w["左0转速"]][2:]
                 rv = [x for _, x in w["右0转速"]][2:]
@@ -450,8 +451,7 @@ class Probe:
                 time.sleep(0.3)
             for pulse_i, tgt in enumerate(SPEED_TARGETS):
                 self.wd.check()
-                L.start_log()   # 每个脉冲重新开录，缓冲不累积
-                t0 = L.mark()
+                L.start_log()   # 每个脉冲一段独立记录：缓冲不累积，波形天然按脉冲切分
                 if rotate:
                     # 原地旋转：正反转交替让线缆来回解扭；脉冲级双保护（飘移+转角）
                     self.wd.begin_pulse(vlim=tgt * 1.8 + 6.0, budget=None,
@@ -471,11 +471,12 @@ class Probe:
                     self._sleep(ROTATE_SETTLE_S if rotate else HOME_GUARD_S)
                 except RuntimeError:
                     reason = self.wd.tripped or ""
-                    w = L.wave(MON_CLOSED, since=t0)
+                    L.end_log()    # 先冻结本段，再取波形
+                    w = L.wave(MON_CLOSED)
                     self.save_wave(f"closed_{gname}_t{tgt:g}_ABORT", w)
                     self.wd.end_pulse()
-                    lv2 = [abs(v) for tt, v in w["左0转速"] if tt >= t0 + 0.2]
-                    rv2 = [abs(v) for tt, v in w["右0转速"] if tt >= t0 + 0.2]
+                    lv2 = [abs(v) for tt, v in w["左0转速"] if tt >= 0.2]
+                    rv2 = [abs(v) for tt, v in w["右0转速"] if tt >= 0.2]
                     lm2, _, _, ls2 = stats(lv2)
                     rm2, _, _, rs2 = stats(rv2)
                     self.sum_rows.append([f"closed_{gname}", f"tgt={tgt:g}",
@@ -492,11 +493,13 @@ class Probe:
                     self._sleep(0.2)
                     continue
                 self.wd.end_pulse()
-                w = L.wave(MON_CLOSED, since=t0)
+                L.end_log()
+                w = L.wave(MON_CLOSED)
                 self.save_wave(f"closed_{gname}_t{tgt:g}", w)
 
                 # 指标只取后 50% 稳态窗；旋转时右轮为反转，取绝对值与目标比
-                tw = t0 + PULSE_SPIN_S * 0.5
+                # 时间轴从 start_log 起算，所以稳态窗起点就是 PULSE_SPIN_S 的一半
+                tw = PULSE_SPIN_S * 0.5
                 win_len = PULSE_SPIN_S * 0.5
                 lv = [v for t, v in w["左0转速"] if t >= tw]
                 rv = [(abs(v) if rotate else v) for t, v in w["右0转速"] if t >= tw]

@@ -78,16 +78,16 @@ def main() -> None:
         v.stop()
     finally:
         v.end_log()
-        # 记录结束后按区间取统计/波形：时间一律是"相对 start_log 的秒"
+        # 记录结束后取整段统计/波形：时间一律是"相对本段零点（start_log）的秒"
         try:
-            for it in v.stats(["x"], tail=99.0, thresholds=[0.05])["items"]:
+            for it in v.stats(["x"], thresholds=[0.05])["items"]:
                 print(f"  {it['name']}: 样本{it['n']} 均值{it['mean']} "
                       f"峰值{it['abs_max']} 阈值占比{it['ratio_ge']}")
             rows = v.wave(["x", "yaw"])["rows"]  # 长表 [{t,index,name,value}]
             print(f"  原始样本 {len(rows)} 条，前 3 条：{rows[:3]}")
         except Exception as e:
             print("  （取统计/波形跳过：", e, "）")
-        v.print_log()  # JSON + CSV 写到 backend/pytest/
+        v.print_log("pytest/example.json")  # 后缀决定格式：json/csv/png/jpg
 
 
 if __name__ == "__main__":

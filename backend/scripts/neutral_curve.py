@@ -6,8 +6,8 @@
     0x84 -> 单电机直接给电压
     监控目录 -> 读取实际电压 / 转速 / 电流
 
-记录交给后端：脚本只声明"记哪些项"，逐档发命令；每个测点开头重新 start_log()
-（清缓冲、零点归零），再按区间取统计。
+记录交给后端：脚本只声明"记哪些项"，逐档发命令；每次测量（baseline / 被测）都是一段独立记录
+（start_log → 设各电机电压 → 保持 hold → end_log），段末取本段整段统计。
 
 运行前先启动后端：
     cd backend
@@ -59,6 +59,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # backend 根，供 import app
 from app.script_api import BackendLink  # noqa: E402
+from motor_names import motor_names  # noqa: E402
 
 
 # ------------------------------------------------------------
@@ -105,10 +106,9 @@ def group_for_test(test_name: str) -> dict:
     }
 
 
-def set_voltage(link: BackendLink, mid: int, volts: float) -> Optional[float]:
-    """调用现有 0x84；返回命令响应里的记录时间刻度 t（未在记录时为 None）。"""
-    v = max(-12.0, min(12.0, float(volts)))
-    return link.set_volt(mid, v)["t"]
+def set_voltage(link: BackendLink, mid: int, volts: float) -> None:
+    """调用现有 0x84 给单台电机直接加电压（钳在 ±12V）。"""
+    link.set_volt(mid, max(-12.0, min(12.0, float(volts))))
 
 
 def all_zero(link: BackendLink) -> None:
@@ -127,12 +127,12 @@ def avg_or_none(*values: Optional[float]) -> Optional[float]:
 
 
 def build_ids(link: BackendLink, group: dict) -> dict:
-    """根据 BackendLink 建好的电机中文名，建立本测试用的 9 项监控中文名。
+    """建立本测试用的 9 项监控中文名（脚本侧 motor_names 约定的别名）。
     key 形如 driver0_rpm / test_vact / driver0_cur。"""
     out = {}
     for role in ("driver0", "driver1", "test"):
         name = side_id_name(group[role])
-        cn = link.motors[name]
+        cn = motor_names(name)
         for key in ("rpm", "vact", "cur"):
             if cn[key] not in link.mon_dir:
                 raise RuntimeError(f"监控项缺失：{name} / {key}")
@@ -152,20 +152,28 @@ def subscribe_for_group(link: BackendLink, ids: dict) -> None:
 # ------------------------------------------------------------
 
 
-def stable_sample(
+def measure_state(
     link: BackendLink,
+    group: dict,
     ids: dict,
-    t: Optional[float],
+    driver_voltage: float,
+    test_voltage: float,
     hold: float,
-    sample_ratio: float,
 ) -> dict:
-    """
-    从设电压那一刻的 t 起保持 hold 秒，取后 (1 - sample_ratio) 部分做统计。
+    """设置一个状态、保持 hold 秒后收段，取本段整段统计。
 
-    rpm 使用 |rpm| 的 mean；实际电压/current 使用 mean。
+    一段就是一次独立记录：start_log → 设 4 台电机电压 → 保持 → end_log。
+    rpm 用 |rpm| 的 mean；实际电压/电流用 mean。
     """
+    link.start_log()
+    set_voltage(link, group["driver0"], driver_voltage)
+    set_voltage(link, group["driver1"], driver_voltage)
+    set_voltage(link, group["idle"], 0.0)
+    set_voltage(link, group["test"], test_voltage)
     link.sleep(hold)
-    st = link.stats(list(ids.values()), since=t, last_frac=1.0 - sample_ratio)
+    link.end_log()
+
+    st = link.stats(list(ids.values()))
 
     def rpm_abs(key):
         return st[ids[key]]["abs_mean"]
@@ -198,24 +206,6 @@ def stable_sample(
     }
 
 
-def measure_state(
-    link: BackendLink,
-    group: dict,
-    ids: dict,
-    driver_voltage: float,
-    test_voltage: float,
-    hold: float,
-    sample_ratio: float,
-) -> dict:
-    """设置一个状态后等待稳定并采样。用最后一次设置（被测电机）返回的 t 作为打点。"""
-    set_voltage(link, group["driver0"], driver_voltage)
-    set_voltage(link, group["driver1"], driver_voltage)
-    set_voltage(link, group["idle"], 0.0)
-    t = set_voltage(link, group["test"], test_voltage)
-
-    return stable_sample(link, ids, t, hold, sample_ratio)
-
-
 def paired_point(
     link: BackendLink,
     group: dict,
@@ -229,10 +219,9 @@ def paired_point(
       A. 被测电机 0V -> baseline
       B. 被测电机 test_voltage -> test
 
-    每个 test_voltage 都重新测 baseline，减小电池和温度慢漂移影响。
+    每个 test_voltage 都重新测一次 baseline，减小电池和温度慢漂移影响。
+    A、B 各是一段独立记录（收发段在 measure_state 里）。
     """
-    link.start_log()  # 每个测点重新开录：清缓冲、零点归零（长实验不超上限）
-
     baseline = measure_state(
         link,
         group,
@@ -240,7 +229,6 @@ def paired_point(
         driver_voltage,
         0.0,
         args.hold,
-        args.sample_ratio,
     )
 
     result = measure_state(
@@ -250,7 +238,6 @@ def paired_point(
         driver_voltage,
         test_voltage,
         args.hold,
-        args.sample_ratio,
     )
 
     b = baseline["wheel_rpm"]
@@ -521,7 +508,6 @@ def scan_driver_voltage(
         driver_voltage,
         0.0,
         args.hold,
-        args.sample_ratio,
     )
 
     print(
@@ -596,12 +582,6 @@ def main():
     ap.add_argument("--fine-step", type=float, default=0.05)
     ap.add_argument("--hold", type=float, default=0.40)
     ap.add_argument(
-        "--sample-ratio",
-        type=float,
-        default=0.50,
-        help="每档只统计后百分之多少，例如 0.5=后50%%",
-    )
-    ap.add_argument(
         "--rpm-deadband",
         type=float,
         default=1.5,
@@ -610,11 +590,8 @@ def main():
     ap.add_argument("--cooldown", type=float, default=0.5)
     ap.add_argument("--csv", default="pytest/neutral_curve_raw.csv", help="原始数据 CSV，空字符串跳过")
     ap.add_argument("--summary", default="pytest/neutral_curve_summary.csv", help="曲线数据 CSV，空字符串跳过")
-    ap.add_argument("--log", default="", help="非空则导出全量记录到该路径")
     args = ap.parse_args()
 
-    if not (0.0 < args.sample_ratio < 1.0):
-        raise ValueError("--sample-ratio 必须在 0~1 之间")
     if args.hold <= 0:
         raise ValueError("--hold 必须 > 0")
     if args.test_vmax <= 0 or args.test_vmax > 12:
@@ -655,7 +632,7 @@ def main():
 
             missing = []
             for name in sorted(required_names):
-                cn = link.motors[name]
+                cn = motor_names(name)
                 for key in ("rpm", "vact", "cur"):
                     if cn[key] not in directory:
                         missing.append(f"{name}:{key}")
@@ -722,9 +699,6 @@ def main():
             print("\n用户中断，正在把全部电机收回 0V...")
 
         all_zero(link)
-        link.end_log()
-        if args.log:
-            link.print_log(args.log)
         if args.csv and raw_rows:
             link.save_csv(args.csv, raw_rows, RAW_FIELDS)
         if args.summary and summary_rows:

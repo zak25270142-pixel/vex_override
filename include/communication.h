@@ -70,6 +70,7 @@ struct CMD_ITEM
     const char *name;              // 命令中文名，目录帧与诊断用
     uint8_t tag;                   // tag位域：bit6~4参数个数 bit3~0特化命令（bit7恒0，发送时自动置位）
     const float *ranges;           // 取值范围表{min1,max1,min2,max2,...}：非空时目录帧自动追加min/max并置tag bit7
+                                   // ！！！取值范围这里用float 不正确，范围类型应和VALUE_TYPE对齐！！！
 };
 
 class USB_Comm

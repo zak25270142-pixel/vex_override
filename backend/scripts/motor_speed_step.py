@@ -11,7 +11,7 @@
   全程记录 L_tgt/R_tgt、L0_rpm/R0_rpm、L0_Vcmd/R0_Vcmd、L0_Vact/R0_Vact 八项；
   原始时序写入 CSV，结束后打印上升时间/超调/稳态误差摘要。
 
-记录交给后端：脚本只声明"记哪些项"，逐段发命令，再按区间取波形/统计。
+记录交给后端：脚本只声明"记哪些项"，逐段发命令；每段是一段独立记录（start_log → 设目标 → 保持 → end_log），段末取波形/统计。
 
 用法示例（先启动后端 uvicorn app.main:app --host 127.0.0.1 --port 8000，再运行本脚本）：
   python scripts/motor_speed_step.py --side L
@@ -109,30 +109,27 @@ def steady_metrics(
     }
 
 
-def _append_timing(all_rows: List[dict], seg: dict, t: float, side: str, target: float,
-                   mon_dir: Dict[str, int]) -> None:
-    """把本段长表（中文名 → [(秒, 值)]）换算成相对本段开始的秒，追加到汇总。"""
+def _rpm_rows(seg: dict, rpm_name: str, rpm_key: str) -> List[dict]:
+    """从本段波形里抽转速那条，做成 steady_metrics 要的 [{t, rpm_key}] 序列。"""
+    return [{"t": ts, rpm_key: val} for ts, val in seg.get(rpm_name, [])]
+
+
+def _capture(bl: BackendLink, side: str, target: float, all_rows: List[dict]) -> dict:
+    """取本段 8 项波形：追加到长表，并返回波形供算稳态/上升时间。
+
+    wave() 的 t 是"相对本段开始记录的秒"；每段都是独立记录，所以直接可用。
+    """
+    seg = bl.wave(list(MONITOR_WANT.values()))
     for name, series in seg.items():
         for ts, val in series:
             all_rows.append({
-                "t_rel_s": ts - t,
+                "t_rel_s": ts,
                 "side": side,
                 "step_target": target,
-                "index": mon_dir.get(name),
+                "index": bl.mon_dir.get(name),
                 "name": name,
                 "value": val,
             })
-
-
-def _rpm_rows(seg: dict, rpm_name: str, rpm_key: str, t: float) -> List[dict]:
-    """从本段波形里抽转速那条，做成 steady_metrics 要的 [{t, rpm_key}] 序列。"""
-    return [{"t": ts - t, rpm_key: val} for ts, val in seg.get(rpm_name, [])]
-
-
-def _capture(bl: BackendLink, t: float, side: str, target: float, all_rows: List[dict]) -> dict:
-    """取本段 8 项波形并追加到长表；返回本段波形（供算稳态/上升时间）。"""
-    seg = bl.wave(list(MONITOR_WANT.values()), since=t)
-    _append_timing(all_rows, seg, t, side, target, bl.mon_dir)
     return seg
 
 
@@ -167,16 +164,18 @@ def run_side(
             left, right = 0.0, target
 
         print("  → %s 目标 %+.1f pct（对侧 0），保持 %.2fs" % (side, target, hold))
-        t = bl.spin_target(left, right)["t"]  # 本段计时起点（记录时间轴）
+        bl.start_log()                     # 本段一段独立记录
+        bl.spin_target(left, right)
         bl.sleep(hold)
+        bl.end_log()
 
-        seg = _capture(bl, t, side, target, all_rows)  # 本段 8 项长表
+        seg = _capture(bl, side, target, all_rows)  # 本段 8 项长表
 
-        rpm_rows = _rpm_rows(seg, rpm_name, rpm_key, t)
+        rpm_rows = _rpm_rows(seg, rpm_name, rpm_key)
         m = steady_metrics(rpm_rows, rpm_key, target)
         summary.append((target, m))
 
-        st = bl.stats([rpm_name, tgt_name], since=t)
+        st = bl.stats([rpm_name, tgt_name])
         # 即时打印本段
         if st[rpm_name]["n"] == 0:
             print("     （本段无有效转速样本）")
@@ -218,13 +217,15 @@ def run_both(
 
     for target in steps:
         print("  → 双侧目标 %+.1f pct，保持 %.2fs" % (target, hold))
-        t = bl.spin_target(target, target)["t"]
+        bl.start_log()
+        bl.spin_target(target, target)
         bl.sleep(hold)
+        bl.end_log()
 
-        seg = _capture(bl, t, "both", target, all_rows)
+        seg = _capture(bl, "both", target, all_rows)
 
-        ml = steady_metrics(_rpm_rows(seg, MONITOR_WANT["L0_rpm"], "L0_rpm", t), "L0_rpm", target)
-        mr = steady_metrics(_rpm_rows(seg, MONITOR_WANT["R0_rpm"], "R0_rpm", t), "R0_rpm", target)
+        ml = steady_metrics(_rpm_rows(seg, MONITOR_WANT["L0_rpm"], "L0_rpm"), "L0_rpm", target)
+        mr = steady_metrics(_rpm_rows(seg, MONITOR_WANT["R0_rpm"], "R0_rpm"), "R0_rpm", target)
         summary.append((target, ml, mr))
         print(
             "     L稳态=%.2f(err%+.2f)  R稳态=%.2f(err%+.2f)  左右差=%.2f"
@@ -259,7 +260,6 @@ def main() -> None:
     )
     ap.add_argument("--hold", type=float, default=1.5, help="每段保持时间（秒）")
     ap.add_argument("--csv", default="pytest/motor_speed_step.csv", help="时序 CSV 路径，空字符串跳过")
-    ap.add_argument("--log", default="", help="非空则导出全量记录到该路径")
     args = ap.parse_args()
 
     steps = [float(x) for x in args.steps.split(",") if x.strip() != ""]
@@ -277,7 +277,6 @@ def main() -> None:
 
         # 一次登记 8 项（推送 + 记录都由后端负责）
         bl.sub(list(MONITOR_WANT.values()))
-        bl.start_log()
 
         print("\n===== 速度环阶跃  side=%s  steps=%s  hold=%.2fs ====="
               % (args.side, steps, args.hold))
@@ -294,9 +293,6 @@ def main() -> None:
         print("  · 启动迟缓 → 查 volt_min / static_deadzone（先用 motor_v_test 核对开环）")
         print("  · 左右同目标稳态差大 → 回查 volt_factor / 机械阻力")
 
-        bl.end_log()
-        if args.log:
-            bl.print_log(args.log)
         if args.csv and all_rows:
             bl.save_csv(args.csv, all_rows, TIMING_FIELDS)
 

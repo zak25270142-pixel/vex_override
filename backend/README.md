@@ -9,12 +9,31 @@
 ## 启动
 
 ```powershell
-cd backend
-pip install -r requirements.txt
-# 可选：指定串口，不设则自动 Ping 探测 User 口
-$env:V5_PORT = "COM5"
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+cd backend                                 # 在仓库根目录执行；若已在 backend 则跳过本行
+py -3.13 -m venv .venv                      # 固定用 3.13 建（本机 py 默认是 3.14，别用 python）
+.\.venv\Scripts\python -m pip install -r requirements.txt
 ```
+
+```bash
+cd d:\work\vex\test1\backend
+.\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+> **Python 基线固定 3.13**：本机装了 3.9/3.11/3.13/3.14 四套，且 `python`/`py` 默认都指向 **3.14**。
+> 直接 `python -m venv` 会建成 3.14。务必用 `py -3.13 -m venv` 显式指定。换基线版本时同样先删旧 `.venv`。
+
+> **为什么用 `.\.venv\Scripts\python -m ...` 而不是激活 + 裸 `uvicorn`**：
+> ① 本机 PowerShell 默认「禁止运行脚本」，`.\.venv\Scripts\Activate.ps1` 会直接报错；
+> 若激活失败又接着 `pip install`，依赖会装进**全局用户目录**、`.venv` 仍是空的（很难发现）。
+> ② `python -m uvicorn` 明确指定了解释器，不依赖 PATH 里有没有 `uvicorn.exe`。
+>
+> 确实想激活的话，先 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`，
+> 再 `.\.venv\Scripts\Activate.ps1`，之后 `python -m uvicorn ...` 同样可用。
+
+> **重建 venv 必须先删旧目录**：`python -m venv .venv` 对已存在的目录**不会清空
+> `Lib\site-packages`**，只改 `pyvenv.cfg`。若旧 venv 是别的 Python 版本建的，重跑后会留下
+> 旧版本的二进制扩展，报 `ImportError: cannot import name ... (unknown location)` 之类。
+> 换解释器/重建时一律先 `Remove-Item -Recurse -Force .venv` 再建。
 
 接口文档：<http://127.0.0.1:8000/docs>
 
@@ -36,57 +55,67 @@ v.start_log()              # 开始记录，以此刻为时间轴零点
 v.cmd("直行", 0.1)         # 参数个数以实车命令目录 fields 为准，必须全给
 v.sleep(1.0)               # 可被上位机停车打断
 v.end_log()
-v.print_log()              # JSON + CSV 落到 pytest/
+v.print_log("pytest/run.json")   # 后缀决定格式：json/csv/png/jpg（无后缀默认 json）
 v.stop()
 ```
 
-### 写新脚本：最短能到 14 行
+### 写新脚本：最短能到 15 行
 
-三件便利设施：`with BackendLink() as bl`（退出自动收车收尾）、`bl.motors`（电机三项中文名，
-不用记命名约定）、`bl.sweep(...)`（"设值→等稳定→取后窗统计"的扫描原语）。
+便利设施：`with BackendLink() as bl`（退出自动收车收尾）、`bl.mon_dir`（后端拉取的实车
+监控表 `中文名 → index`）。**后端不认识任何命名约定**，脚本只认实车目录里的**中文名**
+或 **index**；`L2 → 左2转速` 这类别名属脚本自己的约定，在脚本侧维护
+（`scripts/motor_names.py` 是个可抄的样例）。分段记录惯例：每档一段
+`start_log → 设值 → 保持 → end_log`，一段就是一条独立曲线，段末 `stats()` 取整段统计。
 
 ```python
 import sys; sys.path.insert(0, r"backend")
+from scripts.motor_names import motor_names     # 命名归脚本自己管
 from app.script_api import BackendLink
-
 with BackendLink() as bl:
-    ids = bl.motors["L0"]          # {'vact':'左0实际电压','rpm':'左0转速','cur':'左0电流'}
+    ids = motor_names("L0")        # {'vact':'左0实际电压','rpm':'左0转速','cur':'左0电流'}
     bl.sub(ids.values())           # 登记要记录的项
-    bl.start_log()
     rows = []
-    for row in bl.sweep([0.3, 0.6, 0.9, 1.2], lambda v: bl.set_volt(0, v),
-                        list(ids.values()), 0.4, last_frac=0.6):
-        rows.append({"v": row["value"], "rpm": row["stats"][ids["rpm"]]["abs_mean"]})
+    for v in [0.3, 0.6, 0.9, 1.2]:
+        bl.start_log()             # 每档一段独立曲线
+        bl.set_volt(0, v)
+        bl.sleep(0.4)
+        bl.end_log()
+        rows.append({"v": v, "rpm": bl.stats([ids["rpm"]])[ids["rpm"]]["abs_mean"]})
     bl.save_csv("pytest/l0_start.csv", rows)
 ```
 
-`sweep` 逐档给出 `{"value": 值, "t": 记录轴时刻, "stats": {中文名: {n,mean,abs_mean,...}}}`，
-想中途停止直接 `break`（比如"一旦转起来就停"）。它就是生成器，一次遍历同时打印和攒 CSV。
+`stats()` 统计本段全部样本；想避开开头的阶跃过渡，用 `wave()` 拿原始点自己在本地筛
+（后端不切窗口）。想提前停直接 `break`（比如"一旦转起来就停"），已 end_log 的段不受影响。
+原始曲线按段 `print_log(路径)` 落盘，格式看后缀：`.json` / `.csv` / `.png` / `.jpg`（无后缀默认 json）。
 
 ### 记录会话：脚本只管发命令，记录由后端干
 
-脚本决定"记哪些项、何时开始、存哪里"，中间只负责下达命令；取数据时按
-**相对开始记录的秒** 划区间，不用对齐本地时钟（命令响应里直接带回打点 `t`）。
+脚本决定"记哪些项"，每段测量自己收一段记录；段内时间戳是
+**相对本段零点（start_log）的毫秒**，不用对齐本地时钟，也不用自己打点。
 
 ```python
 v.sub(["左0转速", "左0实际电压"])
-v.start_log()
 for volt in (0.5, 1.0, 1.5):
-    t = v.cmd("设置电机电压", 0, volt)["t"]       # 打点：这一刻在记录轴上
+    v.start_log()                                    # 每档一段独立记录
+    v.cmd("设置电机电压", 0, volt)
     v.sleep(0.4)
-    st = v.stats(["左0转速"], since=t, last_frac=0.55)["items"][0]
+    v.end_log()
+    st = v.stats(["左0转速"])["items"][0]             # 本段整段统计
     print(volt, st["n"], st["mean"], st["abs_max"])
 
-v.stats(["左0转速"], tail=1.0, thresholds=[5.0])  # tail=最近1秒；thresholds 给占比
-v.wave(["左0转速"], since=t)                       # 原始长表，自己画图/落盘用
-v.print_log("pytest/run.csv")                      # 导出 JSON + CSV
+v.stats(["左0转速"], thresholds=[5.0])             # thresholds 给"|值|>=阈值"的样本占比
+v.wave(["左0转速"])                                # 整段原始长表，自己画图/筛选/落盘
+v.print_log("pytest/run.csv")                      # 导出 CSV（后缀决定格式）
 ```
+
+- `print_log(路径)` 按后缀选格式：`.json`（无后缀默认）/ `.csv` / `.png`|`.jpg`（按项作图）；
+  路径带子目录会自动创建；不传则落后端 `pytest/log_<时间戳>.json`
 
 - `stats` 字段：`n / mean / abs_mean / min / max / abs_max / std / rate_hz / ratio_ge`
   （`ratio_ge` 是 `|值| >= 阈值` 的样本占比；无样本时 `n=0`，其余为 `None`）
-- 窗口优先级：`tail`（最近 N 秒）> `last_frac`（窗口后百分之几）> `since/until` > 全窗
-- **记录缓冲上限 50 万条，超了丢新样**。长实验请在每个测点/每轮开头再调一次
-  `start_log()`（会清缓冲并重置零点），别让一次记录跨几十万条样本。
+- 后端只做整段统计/整段原始点，**不提供时间窗口参数**；要子区间就本地筛 `wave()` 的点
+- **记录缓冲上限 50 万条，超了丢新样**。段化写法天然不会累积；万一一次记录跨很多样本，
+  中途再调一次 `start_log()`（会清缓冲并重置零点）即可。
 
 ### 现成脚本（`scripts/`）
 

@@ -3,7 +3,7 @@
 """
 逐电机体检：每台单独加 3V / 0.5s，读转速 + 电流判断 堵转 / 空转 / 断线。
 
-记录交给后端：脚本只声明"记哪些项"，逐台发命令，再按区间取统计（不用自己攒样本）。
+记录按段进行：每台一段独立曲线（start_log → 设值 → 保持 → end_log），段末取本段统计。
 先启动后端：cd backend && uvicorn app.main:app --host 127.0.0.1 --port 8000
 再运行：python scripts/motor_check.py
 """
@@ -14,8 +14,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.script_api import BackendLink  # noqa: E402
-
-TAIL_FRAC = 0.6  # 只统计后 60% 窗口，避开启动那一瞬
 
 
 def main() -> None:
@@ -34,17 +32,18 @@ def main() -> None:
     with BackendLink(args.base) as bl:
         bl.sub(rpm_names + cur_names + pos_names)  # 登记要记录的项
         rows = []
-        bl.start_log()
         for mid in range(8):
             name = "%s%d" % ("L" if mid < 4 else "R", mid % 4)
             bl.stop_move()
             bl.sleep(0.15)
-            t = bl.set_volt(mid, args.volt)["t"]  # 命令响应带回记录时间轴上的时刻
+            bl.start_log()  # 每台一段独立曲线
+            bl.set_volt(mid, args.volt)
             bl.sleep(args.hold)
+            bl.end_log()
 
-            st_r = bl.stats([rpm_names[mid]], since=t, last_frac=TAIL_FRAC)[rpm_names[mid]]
-            st_i = bl.stats([cur_names[mid]], since=t, last_frac=TAIL_FRAC)[cur_names[mid]]
-            pos = bl.stats(pos_names, tail=0.1)
+            st_r = bl.stats([rpm_names[mid]])[rpm_names[mid]]
+            st_i = bl.stats([cur_names[mid]])[cur_names[mid]]
+            pos = bl.stats(pos_names)
 
             bl.set_volt(mid, 0.0)
             bl.stop_move()

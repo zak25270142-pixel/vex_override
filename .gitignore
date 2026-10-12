@@ -27,3 +27,4 @@ docs/
 backend/.venv/
 backend/**/__pycache__/
 backend/pytest/log_*
+backend/.idea/
