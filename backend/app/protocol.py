@@ -15,7 +15,7 @@ import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Any
+from typing import Any, ClassVar
 
 FRAME_HEAD = 0xA5 # 帧头
 
@@ -44,8 +44,9 @@ class CmdGet(IntEnum):
     RequestCommand = 4  # 请求命令目录
     Ping = 0xFF 
 
-# ---------- 值类型（编号必须与 my_main.h VALUE_TYPE 一致）----------
+
 class ValueType(IntEnum):
+    """值类型 与 my_main.h VALUE_TYPE 一致。"""
     UInt8 = 0
     UInt16 = 1
     UInt32 = 2
@@ -76,16 +77,18 @@ MONITOR_TAG_FAST = 0x40
 MONITOR_TAG_GETTER = 0x20
 MONITOR_TAG_KIND_MASK = 0x07
 
-
 def tag_subscribed(tag: int) -> bool:
+    """从tag提取是否订阅"""
     return (tag & MONITOR_TAG_SUB) != 0
 
 
 def tag_fast(tag: int) -> bool:
+    """从tag提取推送挡位"""
     return (tag & MONITOR_TAG_FAST) != 0
 
 
 def tag_kind(tag: int) -> int:
+    """从tag提取特殊类别"""
     return tag & MONITOR_TAG_KIND_MASK
 
 
@@ -94,7 +97,6 @@ def tag_kind(tag: int) -> int:
 #   bit6~4 ARGC   参数个数（0~7）—— 这是参数个数的唯一来源，不是靠 payload 长度反推
 #   bit3~0 SPEC   命令类别（0=普通 1=停车）
 # 参数个数写进 tag 是因为命令帧 payload 是紧凑拼接的，收到帧时无法靠长度反推
-# （不同类型宽度不同，且多种组合可能凑出相同长度）。
 CMD_TAG_RANGE = 0x80
 CMD_TAG_ARGC_MASK = 0x70
 CMD_TAG_ARGC_SHIFT = 4
@@ -106,12 +108,15 @@ class CmdSpec(IntEnum):
     Stop = 1  # 停车命令，Backend 据此识别并把它的帧提到最高优先级
 
 def cmd_spec(tag: int) -> int:
+    """从 tag 提取命令类别"""
     return tag & CMD_TAG_SPEC_MASK
 
 def cmd_argc(tag: int) -> int:
+    """从 tag 提取参数个数"""
     return (tag & CMD_TAG_ARGC_MASK) >> CMD_TAG_ARGC_SHIFT
 
 def cmd_has_range(tag: int) -> bool:
+    """从 tag 提取是否带范围"""
     return (tag & CMD_TAG_RANGE) != 0
 
 # ---------- 值编解码 ----------
@@ -168,11 +173,7 @@ def decode_value(data: bytes, off: int, type_: int) -> CellValue:
     return 0
 
 def encode_value(type_: int, value: CellValue) -> bytes:
-    """按真实宽度编码（动作命令字段用，紧凑无填充）。
-
-    命令帧里多个参数是紧挨着拼的，所以这里必须按类型真实宽度出字节，
-    不能用下面的 8B 定长版，否则下位机按 ARGC 和类型宽度切分会全错。
-    """
+    """按真实宽度编码（动作命令字段用，紧凑无填充）。"""
     size = value_size(type_)
     if size == 0:
         return b""
@@ -319,6 +320,63 @@ class DirTable(Enum):
     tunable = "tunable"
 
 
+# ---------- FrameParser 产出的事件（Hub 按类型消费）----------
+# 每种事件一个 dataclass；kind 是类级常量，用 isinstance 分派，语义比 dict 明确。
+
+
+@dataclass
+class RxEvent:
+    """事件基类。kind 标出具体类别（ClassVar，不进构造参数）。"""
+    kind: ClassVar[EventKind]
+
+
+@dataclass
+class DirectoryEvent(RxEvent):
+    """监控/调参目录项 → 填三张目录表。"""
+    kind: ClassVar[EventKind] = EventKind.directory
+    table: DirTable
+    item: MenuItem
+
+
+@dataclass
+class CmdDirectoryEvent(RxEvent):
+    """动作命令目录项 → 填命令表，顺带认出停车命令。"""
+    kind: ClassVar[EventKind] = EventKind.cmdDirectory
+    item: CmdDirItem
+
+
+@dataclass
+class ValueEvent(RxEvent):
+    """监控值推送 → 更新最新值快照 + 按需记日志。"""
+    kind: ClassVar[EventKind] = EventKind.value
+    index: int
+    value: CellValue
+
+
+@dataclass
+class EchoEvent(RxEvent):
+    """调参写回确认 → 回写调参项真实生效值。"""
+    kind: ClassVar[EventKind] = EventKind.echo
+    index: int
+    value: CellValue
+
+
+@dataclass
+class PongEvent(RxEvent):
+    """心跳应答 → 时间戳在 SerialBridge 里已更新。"""
+    kind: ClassVar[EventKind] = EventKind.pong
+
+
+@dataclass
+class RxStats:
+    """链路诊断计数（FrameParser 累计，UI/脚本直接读）。"""
+    bytes: int = 0        # 已收字节数
+    frames: int = 0       # 已收帧数
+    badChecksum: int = 0  # 校验失败：线路干扰 / 波特率不匹配 / 帧边界错位
+    unknownCmd: int = 0   # 收到不认识的命令字
+    overflow: int = 0     # payload 超过 MAX_PAYLOAD，状态机强制回到找帧头
+
+
 # ---------- 帧解析状态机 ----------
 
 class _RxState(IntEnum):
@@ -415,42 +473,50 @@ def scan_dir_frames(chunk: bytes) -> tuple[list[tuple[int, bytes]], int]:
 
 
 class FrameParser:
-    """与 TS FrameParser 同构的逐字节状态机：喂串口 chunk，吐解析事件 dict。
-
-    为什么是逐字节状态机而不是"找 A5 切段"：串口是字节流，一帧可能跨多个 chunk
-    （USB 分包），也可能一个 chunk 里塞多帧（粘包）。状态机天然处理这两种情况。
-
-    产出的事件 dict 有五种（kind 是 EventKind，table 是 DirTable）：
-      {kind: directory,    table: monitor|tunable, item: MenuItem}
-      {kind: cmdDirectory, item: CmdDirItem}
-      {kind: value,        index: int, value: 值}   监控值推送
-      {kind: echo,         index: int, value: 值}   调参写回确认
-      {kind: pong}                                  心跳应答
-    """
+    """与 TS FrameParser 同构的逐字节状态机：喂串口 chunk，吐解析事件（RxEvent）。"""
 
     def __init__(self) -> None:
         self.state = _RxState.WaitHead
+        '''当前状态'''
+        
         self.cmd = 0
-        self.expect = -1  # 本帧 payload 应有长度；-1 = 还没算出来
-        self.len = 0  # 已收 payload 字节数
-        self.xor = 0  # 滚动校验，从 Cmd 起
+        '''当前命令字'''
+
+        self.expect = -1
+        '''本帧 payload 应有长度；-1 = 还没算出来'''
+        
+        self.len = 0
+        '''已收 payload 字节数'''
+        
+        self.xor = 0 
+        '''滚动校验，从 Cmd 起'''
+
         self.payload = bytearray(MAX_PAYLOAD)
+        '''当前 payload 缓冲区'''
+        
         # monitor/tunable 每项 value 类型靠各自目录帧登记，收推送时按 index 查。
         # 这是关键：监控值推送帧里只有 [index][值]，没有类型字节，
         # 必须先收到目录帧才知道该项该按几个字节、什么类型解。
         # 所以目录没拉到之前收到的监控值帧会被解成 0（value_size(0)=1 → UInt8）。
+        # 两张表不能合并：index 是各自目录数组的下标（固件里 tunable_items 与
+        # monitor_items 是两个独立数组），同号 index 在两张表里是毫不相干的两项、
+        # 类型可能不同，合并会让两者互相覆盖。
         self.monitor_type = bytearray(256)
+        '''监控值类型缓存'''
+        
         self.tunable_type = bytearray(256)
-        self.stats = {
-            "bytes": 0,
-            "frames": 0,
-            "badChecksum": 0,  # 校验失败：线路干扰 / 波特率不匹配 / 帧边界错位
-            "unknownCmd": 0,  # 收到不认识的命令字
-            "overflow": 0,  # payload 超过 MAX_PAYLOAD，状态机强制回到找帧头
-        }
+        '''调参值类型缓存'''
+        
+        self.stats = RxStats()
+        '''链路诊断计数'''
 
-    def feed(self, chunk: bytes, on_event: Callable[[dict], None]) -> None:
-        self.stats["bytes"] += len(chunk)
+    def feed(self, chunk: bytes, on_event: Callable[[RxEvent], None]) -> None:
+        """
+        喂一批串口字节，逐字节走状态机，解出完整帧就调 on_event。
+        chunk   : 本次从串口读到的原始字节（可含半帧/多帧，状态机自己处理粘包拆包）
+        on_event: 解析完整帧回调函数
+        """
+        self.stats.bytes += len(chunk)
         for b in chunk:
             if self.state == _RxState.WaitHead:
                 if b == FRAME_HEAD:
@@ -477,11 +543,11 @@ class FrameParser:
                 else:
                     # 不认识的命令字：丢弃，回找帧头。
                     # 不去"猜"长度是因为无法判定该跳多远，硬跳会造成连锁错位。
-                    self.stats["unknownCmd"] += 1
+                    self.stats.unknownCmd += 1
                     self.state = _RxState.WaitHead
             elif self.state == _RxState.WaitData:
                 if self.len >= MAX_PAYLOAD:
-                    self.stats["overflow"] += 1
+                    self.stats.overflow += 1
                     self.state = _RxState.WaitHead
                     continue
                 self.payload[self.len] = b
@@ -512,12 +578,22 @@ class FrameParser:
             elif self.state == _RxState.WaitXor:
                 self.state = _RxState.WaitHead
                 if (self.xor ^ b) == 0:
-                    self.stats["frames"] += 1
+                    self.stats.frames += 1
                     self._dispatch(on_event)
                 else:
-                    self.stats["badChecksum"] += 1
+                    self.stats.badChecksum += 1
 
-    def _dispatch(self, on_event: Callable[[dict], None]) -> None:
+    def _dispatch(self, on_event: Callable[[RxEvent], None]) -> None:
+        """
+        一帧校验通过后调用：按命令字把 payload 解成对应 RxEvent 并回调 on_event。
+        on_event: 事件出口（SerialBridge 注入 Hub._on_serial_event）
+        按 self.cmd 分五种：
+            Tunable/MonitorDirectory → DirectoryEvent（顺带登记该项类型到类型表）
+            MonitorValue             → ValueEvent
+            TunableEcho              → EchoEvent
+            CMDDirectory             → CmdDirectoryEvent
+            Pong                     → PongEvent
+        """
         p = bytes(self.payload[: self.len])
         cmd = self.cmd
 
@@ -545,10 +621,9 @@ class FrameParser:
             else:
                 self.tunable_type[index] = type_
             on_event(
-                {
-                    "kind": EventKind.directory,
-                    "table": table,
-                    "item": MenuItem(
+                DirectoryEvent(
+                    table=table,
+                    item=MenuItem(
                         index=index,
                         type=type_,
                         tag=tag,
@@ -556,7 +631,7 @@ class FrameParser:
                         unit=unit,
                         value=value,  # 目录帧自带一次当前值，省得再单独取
                     ),
-                }
+                )
             )
             return
 
@@ -567,13 +642,10 @@ class FrameParser:
             types = self.monitor_type if cmd == CmdPost.MonitorValue else self.tunable_type
             type_ = types[index]
             value = decode_value(p, 1, type_) if value_size(type_) else 0
-            on_event(
-                {
-                    "kind": EventKind.value if cmd == CmdPost.MonitorValue else EventKind.echo,
-                    "index": index,
-                    "value": value,
-                }
-            )
+            if cmd == CmdPost.MonitorValue:
+                on_event(ValueEvent(index=index, value=value))
+            else:
+                on_event(EchoEvent(index=index, value=value))
             return
 
         if cmd == CmdPost.CMDDirectory:
@@ -608,13 +680,12 @@ class FrameParser:
                     fields[i].max = mx
                     off += 8
             on_event(
-                {
-                    "kind": EventKind.cmdDirectory,
-                    "item": CmdDirItem(index=index, tag=tag, name=name, fields=fields),
-                }
+                CmdDirectoryEvent(
+                    item=CmdDirItem(index=index, tag=tag, name=name, fields=fields),
+                )
             )
             return
 
         if cmd == CmdPost.Pong:
-            on_event({"kind": EventKind.pong})
+            on_event(PongEvent())
             return

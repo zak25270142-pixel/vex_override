@@ -181,12 +181,47 @@ export interface CmdDirItem {
   fields: CmdField[]
 }
 
+/* 解帧事件：每个事件一个 class；kind 是只读字面量属性，靠它做联合类型收窄。
+   与后端 protocol.py 的 RxEvent 子类一一对应，消费方用 e.kind 判别即可。 */
+export class DirectoryEvent {
+  readonly kind = 'directory'
+  constructor(
+    readonly table: 'tunable' | 'monitor',
+    readonly item: DirItem,
+  ) {}
+}
+
+export class ValueEvent {
+  readonly kind = 'value'
+  constructor(
+    readonly index: number,
+    readonly value: CellValue,
+  ) {}
+}
+
+export class EchoEvent {
+  readonly kind = 'echo'
+  constructor(
+    readonly index: number,
+    readonly value: CellValue,
+  ) {}
+}
+
+export class CmdDirectoryEvent {
+  readonly kind = 'cmdDirectory'
+  constructor(readonly item: CmdDirItem) {}
+}
+
+export class PongEvent {
+  readonly kind = 'pong'
+}
+
 export type RxEvent =
-  | { kind: 'directory'; table: 'tunable' | 'monitor'; item: DirItem }
-  | { kind: 'value'; index: number; value: CellValue }
-  | { kind: 'echo'; index: number; value: CellValue }
-  | { kind: 'cmdDirectory'; item: CmdDirItem }
-  | { kind: 'pong' }
+  | DirectoryEvent
+  | ValueEvent
+  | EchoEvent
+  | CmdDirectoryEvent
+  | PongEvent
 
 /** 按类型从小端字节流解码值；调用方保证剩余字节足够 */
 function decodeValue(d: DataView, off: number, type: ValueType, le = true): CellValue {
@@ -565,11 +600,12 @@ export class FrameParser {
         const name = decoder.decode(p.subarray(4, unitLenAt))
         const unit = decoder.decode(p.subarray(unitLenAt + 1, valueAt))
         const value = decodeValue(new DataView(p.buffer, p.byteOffset + valueAt), 0, type)
-        onEvent({
-          kind: 'directory',
-          table: this.cmd === CmdPost.TunableDirectory ? 'tunable' : 'monitor',
-          item: { index, type, tag, name, unit, value },
-        })
+        onEvent(
+          new DirectoryEvent(
+            this.cmd === CmdPost.TunableDirectory ? 'tunable' : 'monitor',
+            { index, type, tag, name, unit, value },
+          ),
+        )
         break
       }
       case CmdPost.MonitorValue: {
@@ -579,7 +615,7 @@ export class FrameParser {
         const type = this.monitorType[index] as ValueType
         if (valueSize(type) === 0) return
         const value = decodeValue(new DataView(p.buffer, p.byteOffset + 1), 0, type)
-        onEvent({ kind: 'value', index, value })
+        onEvent(new ValueEvent(index, value))
         break
       }
       case CmdPost.TunableEcho: {
@@ -589,7 +625,7 @@ export class FrameParser {
         const type = this.tunableType[index] as ValueType
         if (valueSize(type) === 0) return
         const value = decodeValue(new DataView(p.buffer, p.byteOffset + 1), 0, type)
-        onEvent({ kind: 'echo', index, value })
+        onEvent(new EchoEvent(index, value))
         break
       }
       case CmdPost.CMDDirectory: {
@@ -623,12 +659,12 @@ export class FrameParser {
             off += 8
           }
         }
-        onEvent({ kind: 'cmdDirectory', item: { index, tag, name, fields } })
+        onEvent(new CmdDirectoryEvent({ index, tag, name, fields }))
         break
       }
       case CmdPost.Pong:
         // 主控的心跳回应，无 payload；是否用来刷新在线状态由 store 决定
-        onEvent({ kind: 'pong' })
+        onEvent(new PongEvent())
         break
       default:
         break

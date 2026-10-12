@@ -140,7 +140,7 @@ def main() -> None:
     )
     hub._name_to_cmd["直行"] = 0x81
     r = hub.cmd("停车")  # 0 参命令 OK
-    assert r["ok"]
+    assert r.ok
     try:
         hub.cmd("直行", 0.1)  # 只给 1 个 → 应报错
         raise AssertionError("参数不足应报错")

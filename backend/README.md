@@ -19,21 +19,7 @@ cd d:\work\vex\test1\backend
 .\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-> **Python 基线固定 3.13**：本机装了 3.9/3.11/3.13/3.14 四套，且 `python`/`py` 默认都指向 **3.14**。
-> 直接 `python -m venv` 会建成 3.14。务必用 `py -3.13 -m venv` 显式指定。换基线版本时同样先删旧 `.venv`。
-
-> **为什么用 `.\.venv\Scripts\python -m ...` 而不是激活 + 裸 `uvicorn`**：
-> ① 本机 PowerShell 默认「禁止运行脚本」，`.\.venv\Scripts\Activate.ps1` 会直接报错；
-> 若激活失败又接着 `pip install`，依赖会装进**全局用户目录**、`.venv` 仍是空的（很难发现）。
-> ② `python -m uvicorn` 明确指定了解释器，不依赖 PATH 里有没有 `uvicorn.exe`。
->
-> 确实想激活的话，先 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`，
-> 再 `.\.venv\Scripts\Activate.ps1`，之后 `python -m uvicorn ...` 同样可用。
-
-> **重建 venv 必须先删旧目录**：`python -m venv .venv` 对已存在的目录**不会清空
-> `Lib\site-packages`**，只改 `pyvenv.cfg`。若旧 venv 是别的 Python 版本建的，重跑后会留下
-> 旧版本的二进制扩展，报 `ImportError: cannot import name ... (unknown location)` 之类。
-> 换解释器/重建时一律先 `Remove-Item -Recurse -Force .venv` 再建。
+> **Python 基线固定 3.13**：
 
 接口文档：<http://127.0.0.1:8000/docs>
 

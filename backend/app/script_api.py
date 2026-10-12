@@ -70,6 +70,7 @@ class VexScript:
     # ---------- 内部 ----------
 
     def _get(self, path: str, **params):
+        """发 GET 取 JSON；HTTP >=400 抛 RuntimeError（带路径与响应体，便于定位）。"""
         if self._sess is None:
             raise RuntimeError("请先 pip install requests")
         r = self._sess.get(f"{self.base}{path}", params=params, timeout=self.timeout)
@@ -78,6 +79,7 @@ class VexScript:
         return r.json()
 
     def _post(self, path: str, body: dict | None = None):
+        """发 POST（body 转 JSON）取响应 JSON；HTTP >=400 抛 RuntimeError。"""
         if self._sess is None:
             raise RuntimeError("请先 pip install requests")
         r = self._sess.post(f"{self.base}{path}", json=body or {}, timeout=self.timeout)
@@ -88,6 +90,7 @@ class VexScript:
     # ---------- 连接 / 目录 ----------
 
     def status(self) -> dict:
+        """后端状态快照（连接/表项数/记录状态等），与 /api/status 同结构。"""
         return self._get("/api/status")
 
     def wait_connected(self, timeout: float = 10.0) -> bool:
@@ -121,6 +124,7 @@ class VexScript:
         return self._get("/api/column", type=type)
 
     def values(self) -> list[dict]:
+        """全部监控项的当前值快照列表（结构同 ValueSnapshot；不含新鲜度）。"""
         return self._get("/api/values")
 
     def read(self, *index_or_name):
@@ -282,6 +286,7 @@ class VexScript:
             time.sleep(min(0.05, end - time.monotonic()))
 
     def close(self) -> None:
+        """关闭复用的 HTTP 会话（脚本结束时调，释放连接）。"""
         if self._sess is not None:
             self._sess.close()
 
@@ -344,6 +349,7 @@ class BackendLink:
         return self
 
     def __exit__(self, *exc_info) -> None:
+        """with 退出时调 close_safely()（自动收车收尾），异常也照收。"""
         self.close_safely()
 
     # ---------- 连接 / 目录 ----------
@@ -395,6 +401,7 @@ class BackendLink:
         return out
 
     def _idx(self, name_or_idx) -> int | None:
+        """名字或 index → index；名字不在目录里返回 None。"""
         return name_or_idx if isinstance(name_or_idx, int) else self.mon_dir.get(name_or_idx)
 
     # ---------- 订阅 / 记录登记 ----------
@@ -428,6 +435,7 @@ class BackendLink:
         return self.v.start_log()
 
     def end_log(self) -> dict:
+        """结束本段记录（停止收集样本），返回本段样本数与丢弃数。"""
         return self.v.end_log()
 
     def print_log(self, path: str | None = None) -> dict:
@@ -519,6 +527,7 @@ class BackendLink:
     # ---------- 写 ----------
 
     def cmd(self, name, *args) -> dict:
+        """按命令名或命令字下发动作命令，args 个数须与命令目录一致（后端严格校验）。"""
         return self.v.cmd(name, *args)
 
     def stop_move(self) -> dict:
@@ -530,6 +539,7 @@ class BackendLink:
         return self.cmd("停止运动")
 
     def set_volt(self, motor_id: int, volts: float) -> dict:
+        """设单个电机电压：motor_id 电机编号(0~7)，volts 目标电压(单位 V)。"""
         return self.cmd("设置电机电压", int(motor_id), float(volts))
 
     def drive_volt(self, volts: float) -> None:
@@ -541,9 +551,11 @@ class BackendLink:
             self.set_volt(mid, volts)
 
     def spin_target(self, left: float, right: float) -> dict:
+        """下发"设置底盘目标速度"：left/right 为左、右两侧的目标速度（走速度环）。"""
         return self.cmd("设置底盘目标速度", float(left), float(right))
 
     def set_tunable(self, name: str, value: float) -> dict:
+        """写调参项（转发 VexScript.set_tunable）；下位机回显后上位机表格自会更新。"""
         return self.v.set_tunable(name, value)
 
     # ---------- 时序 / 中止 ----------
@@ -612,4 +624,5 @@ class BackendLink:
         self.close()
 
     def close(self) -> None:
+        """关闭底层 HTTP 会话；只断连接、不做收车（收车请用 close_safely）。"""
         self.v.close()

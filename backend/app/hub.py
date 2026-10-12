@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from collections import deque
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -20,12 +21,16 @@ from fastapi import WebSocket
 
 from .protocol import (
     CmdDirItem,
+    CmdDirectoryEvent,
     CmdGet,
     CmdPost,
     CmdSpec,
     DirTable,
-    EventKind,
+    DirectoryEvent,
+    EchoEvent,
     MenuItem,
+    RxEvent,
+    ValueEvent,
     build_frame,
     cmd_spec,
     command_send,
@@ -39,7 +44,7 @@ from .protocol import (
     tag_fast,
     tag_subscribed,
 )
-from .serial_bridge import SerialBridge, Status
+from .serial_bridge import PortInfo, SerialBridge, Status
 
 logger = logging.getLogger("vex.hub")
 
@@ -66,27 +71,38 @@ DEFAULT_PYTEST_DIR = Path(__file__).resolve().parent.parent / "pytest"
 #   std         标准差。注意是总体标准差（除以 n），不是样本标准差（除以 n-1）
 #   rate_hz     样本数 / 区间秒数。反映下位机实际推送率，用来验证是否真按 100Hz 在推
 #   ratio_ge    |值| >= 阈值的样本占比。判断"超差时间占比"这类指标（thresholds 传入阈值列表）
-def _aggregate(vals: list[float], thresholds=(), span_ms: float = 0.0) -> dict:
+@dataclass
+class AggregateStats:
+    """一批样本压成的统计量（各字段用途见上）。"""
+    n: int
+    mean: float | None
+    abs_mean: float | None
+    min: float | None
+    max: float | None
+    abs_max: float | None
+    std: float | None
+    rate_hz: float | None
+    ratio_ge: dict[str, float]  # 阈值字符串 → |值|>=阈值的占比（阈值动态传入，故保留 dict）
+
+
+def _aggregate(vals: list[float], thresholds=(), span_ms: float = 0.0) -> AggregateStats:
     """区间样本的统计量；无样本时除 n 外全为 None。"""
     n = len(vals)
     if n == 0:
-        return {
-            "n": 0, "mean": None, "abs_mean": None, "min": None, "max": None,
-            "abs_max": None, "std": None, "rate_hz": None, "ratio_ge": {},
-        }
+        return AggregateStats(0, None, None, None, None, None, None, None, {})
     mean = sum(vals) / n
     var = sum((v - mean) ** 2 for v in vals) / n
-    return {
-        "n": n,
-        "mean": mean,
-        "abs_mean": sum(abs(v) for v in vals) / n,
-        "min": min(vals),
-        "max": max(vals),
-        "abs_max": max(abs(v) for v in vals),
-        "std": var ** 0.5,
-        "rate_hz": round(n / (span_ms / 1000.0), 2) if span_ms > 0 else None,
-        "ratio_ge": {str(th): sum(1 for v in vals if abs(v) >= th) / n for th in thresholds},
-    }
+    return AggregateStats(
+        n=n,
+        mean=mean,
+        abs_mean=sum(abs(v) for v in vals) / n,
+        min=min(vals),
+        max=max(vals),
+        abs_max=max(abs(v) for v in vals),
+        std=var ** 0.5,
+        rate_hz=round(n / (span_ms / 1000.0), 2) if span_ms > 0 else None,
+        ratio_ge={str(th): sum(1 for v in vals if abs(v) >= th) / n for th in thresholds},
+    )
 
 
 # ---------- 最新样本快照 ----------
@@ -100,7 +116,187 @@ class MonitorSample(NamedTuple):
     value: Any
     t_recv: float | None
 
+
+# ---------- 接口返回体（dataclass；FastAPI 自动转 JSON，字段名即 JSON 键名）----------
+
+
+@dataclass
+class OkResult:
+    """只有 ok 的通用成功返回。"""
+    ok: bool = True
+
+
+@dataclass
+class MonitorReading:
+    """监控项当前值 + 新鲜度（/api/value 一项）。"""
+    index: int
+    name: str
+    value: Any
+    unit: str
+    age_s: float  # 距上次收到推送的秒数
+
+
+@dataclass
+class ValueSnapshot:
+    """监控项当前值快照（/api/values 用，不含新鲜度）。"""
+    index: int
+    name: str
+    value: Any
+    unit: str
+
+
+@dataclass
+class PushState:
+    """某项的下位机推送档位。"""
+    sub: bool
+    fast: bool
+
+
+@dataclass
+class SubResult:
+    """/api/sub 返回：push/log 为 None 表示该项未走这条分支。"""
+    index: int
+    name: str | None
+    push: PushState | None
+    log: bool | None
+
+
+@dataclass
+class CmdResult:
+    """/api/cmd 返回。"""
+    ok: bool
+    index: int
+    name: str
+    args: list
+
+
+@dataclass
+class SetTunableResult:
+    """/api/tunable 返回。"""
+    ok: bool
+    index: int
+    value: Any
+
+
+@dataclass
+class StopResult:
+    """/api/stop 返回。"""
+    ok: bool
+    cmd_index: int
+
+
+@dataclass
+class RegisteredItem:
+    """一个被登记记录的监控项（start_log / 导出元信息用）。"""
+    index: int
+    name: str
+
+
+@dataclass
+class StartLogResult:
+    """/api/log/start 返回。"""
+    ok: bool
+    registered: list[RegisteredItem]
+
+
+@dataclass
+class EndLogResult:
+    """/api/log/end 返回。"""
+    ok: bool
+    samples: int
+    dropped: int
+
+
+@dataclass
+class LogRow:
+    """一条原始样本（长表的一行）。"""
+    t: float  # 相对本段零点的毫秒
+    index: int
+    name: str
+    value: Any
+
+
+@dataclass
+class LogRowsResult:
+    """/api/log/window 返回。"""
+    rows: list[LogRow]
+
+
+@dataclass
+class LogStatsItem(AggregateStats):
+    """一项的整段统计；直接摊平成 index/name + 各统计量，保持原有 JSON 结构。"""
+    index: int
+    name: str
+
+
+@dataclass
+class LogStatsResult:
+    """/api/log/stats 返回。"""
+    items: list[LogStatsItem]
+
+
+@dataclass
+class LogFileMeta:
+    """导出 JSON 的元信息 + 原始样本长表。"""
+    created: str
+    samples: int
+    dropped: int
+    registered: list[RegisteredItem]
+    data: list[LogRow]
+
+
+@dataclass
+class PrintLogResult:
+    """/api/log/print 返回。"""
+    ok: bool
+    path: str
+    format: str
+    samples: int
+    dropped: int
+
+
+@dataclass
+class Snapshot:
+    """/api/status 返回：一眼看清 Backend 全貌。"""
+    status: str
+    message: str
+    connected: bool
+    monitor_count: int
+    tunable_count: int
+    cmd_count: int
+    log_reg: list[int]
+    logging: bool
+    log_samples: int
+    log_dropped: int
+    abort: bool
+    stop_cmd: int | None
+    ports: list[PortInfo]
+
+
+@dataclass
+class ConnectResult:
+    """/api/connect 返回。"""
+    ok: bool
+    snapshot: Snapshot
+
+
+@dataclass
+class StatusMessage:
+    """WS 文本通道推给前端的连接状态消息（前端按 op=="status" 处理）。"""
+    op: str
+    state: str
+    message: str
+
+
 class Hub:
+    """整车调试的状态中枢：独占一个 SerialBridge，向上管 WebSocket 上位机，向下管脚本 API。
+
+    职责边界：
+        · 收：串口字节 → 原样广播给 WS 上位机 + 喂 FrameParser 更新目录/快照/日志
+        · 发：所有下行帧经 enqueue 进唯一优先级队列（STOP < 上位机 < 脚本）串行写串口
+        · 管：目录缓存与名字反查、订阅意图聚合、记录会话、紧急停车/脚本中止
+    单例：整个进程只应有一个（main.py 里是模块级 hub），别在别处再 new。
+    """
 
     def __init__(
         self,
@@ -108,6 +304,13 @@ class Hub:
         baud: int = 115200, # usb 中仅占位
         pytest_dir: Path | None = None, # pytest 输出目录
     ) -> None:
+        """建 Hub：组装 SerialBridge（回调指回本类），建目录缓存/队列/锁等全部内部状态。
+
+        port      : 串口名；None=交给 SerialBridge 自动探测
+        baud      : 波特率（CDC 虚拟口仅占位）
+        pytest_dir: print_log 不传 path 时的默认落盘目录；None 用 backend/pytest
+        注意：这里只建对象不开串口，真正连接由 start()/ensure_connected() 触发。
+        """
         self.bridge = SerialBridge(
             port=port,
             baud=baud,
@@ -115,7 +318,9 @@ class Hub:
             on_status=self._on_serial_status, # 串口状态回调
             on_raw=self._on_serial_raw, # 串口原始数据回调
         )
+        '''串口桥：本 Hub 独占，收发的唯一落点（连接/探测/心跳都由它管）'''
         self.pytest_dir = Path(pytest_dir) if pytest_dir else DEFAULT_PYTEST_DIR
+        '''print_log 不传 path 时的默认落盘目录；构造时确保存在'''
         self.pytest_dir.mkdir(parents=True, exist_ok=True)
 
         # 三张目录缓存 index → item（item 是 protocol.py 里的 dataclass）
@@ -285,8 +490,11 @@ class Hub:
             threading.Thread(target=self._auto_connect, name="vex-connect", daemon=True).start()
 
     def _auto_connect(self) -> None:
-        # 串口探测要逐口发 Ping 等应答，可能阻塞数秒。
-        # 放在线程里，FastAPI 的 startup 才能立刻返回、HTTP 接口马上可用。
+        """start(auto_connect=True) 时开的一次性线程：探测连上串口并拉三张表。
+
+        串口探测要逐口发 Ping 等应答，可能阻塞数秒，所以放线程里，
+        FastAPI 的 startup 才能立刻返回、HTTP 接口马上可用。连上后开心跳 + 拉目录。
+        """
         if self.bridge.connect():
             self.bridge.start_heartbeat(1.0)
             # 脚本没连上位机时也要有目录：连上自动拉三张表
@@ -309,9 +517,11 @@ class Hub:
         self._reconnect_thread.start()
 
     def _reconnect_loop(self) -> None:
-        # 断线后每 2s 重试，直到连上或用户不想连了（_want_connected 置 False 就退出）
-        # 重连成功必须做三件事：清目录缓存、重拉三张表、补发订阅——
-        # 下位机重启后目录内容可能变了，且它的订阅表是空的。
+        """重连线程主循环：每 2s 试一次，直到连上或用户不再想连（_want_connected=False）。
+
+        重连成功必须做三件事：清目录缓存 + 重拉三张表 + 补发订阅——
+        下位机重启后目录内容可能变了，且它的订阅表是空的。做完即退出本线程。
+        """
         while self._want_connected and not self.bridge.connected:
             if self.bridge.connect():
                 self.bridge.start_heartbeat(1.0)
@@ -391,7 +601,7 @@ class Hub:
         self._request_dir(CmdPost.MonitorDirectory, request_monitor())
         self._request_dir(CmdPost.CMDDirectory, request_command())
 
-    def refresh_directories(self) -> dict:
+    def refresh_directories(self) -> OkResult:
         """清空三张目录缓存并重新向车请求（表结构变更或怀疑缓存过期时用）。
 
         与被动更新的区别：目录是下位机启动/订阅时推的，平时不会主动重推。
@@ -400,7 +610,7 @@ class Hub:
         self._dir_cache.clear()
         self._dir_buf.clear()
         self._request_all_dirs()
-        return {"ok": True}
+        return OkResult(ok=True)
 
     def stop(self) -> None:
         """收尾。顺序有讲究：先置标志 → 再唤醒 tx 线程 → 再关串口 → 最后 join。
@@ -447,12 +657,17 @@ class Hub:
         self.status_msg = message
         logger.info("串口状态 %s: %s", state.value, message)
         # JSON 出口才转成字符串——前端按 state 的字符串值决定指示灯
-        self._broadcast_json({"op": "status", "state": state.value, "message": message})
+        self._broadcast_json(StatusMessage(op="status", state=state.value, message=message))
         # 掉线了但用户还想连着 → 自动重连
         if state is Status.disconnected and self._want_connected and self._running:
             self.ensure_connected()
 
     def _on_serial_raw(self, chunk: bytes) -> None:
+        """串口收到一批原始字节的回调（SerialBridge 注入，在 rx 线程里跑）。
+
+        chunk: 本次读到的原始字节（可能含半帧/多帧）
+        两件事：原样广播给 WS 上位机；从流里旁路摘目录帧缓存（半帧尾巴留到下批）。
+        """
         # 关键设计：上位机看到的串口和脚本看到的是同一股原始字节。
         # 原样广播给 WS（前端 FrameParser 自己拆帧，因此前端代码零改动），
         # 同一份字节再喂 Python FrameParser 做目录缓存/快照/日志（供脚本）。
@@ -469,16 +684,14 @@ class Hub:
         if len(self._dir_buf) > 8192:
             del self._dir_buf[:-4096]
 
-    def _on_serial_event(self, event: dict) -> None:
+    def _on_serial_event(self, event: RxEvent) -> None:
         """FrameParser 解出一个事件就调这里（在串口 rx 线程里执行）。
 
-        event["kind"] 是 EventKind（详见 protocol.py 里各分支的注释）。
+        事件是 protocol.py 里的 RxEvent 子类，用 isinstance 分派。
         """
-        kind = event.get("kind")
-
-        if kind is EventKind.directory:
-            table = event["table"]
-            item = event["item"]
+        if isinstance(event, DirectoryEvent):
+            table = event.table
+            item = event.item
             idx = item.index
             if table is DirTable.monitor:
                 self.monitor_dir[idx] = item
@@ -495,8 +708,8 @@ class Hub:
                 self.tunable_dir[idx] = item
                 self._name_to_tun[item.name] = idx
 
-        elif kind is EventKind.cmdDirectory:
-            item = event["item"]
+        elif isinstance(event, CmdDirectoryEvent):
+            item = event.item
             idx = item.index
             self.cmd_dir[idx] = item
             self._name_to_cmd[item.name] = idx
@@ -505,22 +718,22 @@ class Hub:
             if cmd_spec(item.tag) == CmdSpec.Stop:
                 self._stop_cmd_index = idx
 
-        elif kind is EventKind.value:
-            idx = event["index"]
-            val = event["value"]
+        elif isinstance(event, ValueEvent):
+            idx = event.index
+            val = event.value
             # 只存"最新值"不存历史：历史由 log_dir 负责（且仅登记项才记）
             self.monitor_latest[idx] = MonitorSample(val, time.monotonic())  # 供 age_s 判新鲜度
             # 记录中 且 该被登记过 → 才落样本。未登记的高频项不会撑爆内存
             if self.logging and idx in self.log_reg:
                 self._record(idx, val)
 
-        elif kind is EventKind.echo:
+        elif isinstance(event, EchoEvent):
             # 调参回显：下位机把"实际生效值"发回来。用它覆盖目录里的 value，
             # 这样界面显示的是车里真实的值，而不是上位机以为自己设的那个
             # （下位机可能做了限幅、取整、拒绝）。
-            idx = event["index"]
+            idx = event.index
             if idx in self.tunable_dir:
-                self.tunable_dir[idx].value = event["value"]
+                self.tunable_dir[idx].value = event.value
 
     # ---------- 下行优先级队列 ----------
 
@@ -578,7 +791,7 @@ class Hub:
             self._ws_clients.add(ws)
         # 只推连接状态；目录由前端连上后自己发请求（与直连串口行为一致）
         await ws.send_json(
-            {"op": "status", "state": self.status.value, "message": self.status_msg}
+            asdict(StatusMessage(op="status", state=self.status.value, message=self.status_msg))
         )
         try:
             while True:
@@ -730,12 +943,16 @@ class Hub:
         self.enqueue(data, PRI_UI)
 
     def _stop_index(self) -> int:
+        """停车命令用的 index：有目录以目录认出的为准，没到则兜底 0x80。
+
+        返回: 停车命令字（命令目录 tag SPEC=Stop 认出的 index，或目录未到时的硬编码 0x80）
+        """
         # 目录未到时的兜底：本车停车固定是命令表第一项 0x80。
         # 有了目录后以目录为准（从 tag SPEC=Stop 认出来），硬编码只在早期生效。
         return self._stop_cmd_index if self._stop_cmd_index is not None else 0x80
 
-    def _broadcast_json(self, obj: dict) -> None:
-        """给所有 WS 客户端推一条 JSON（状态类消息用这个）。
+    def _broadcast_json(self, msg: StatusMessage) -> None:
+        """给所有 WS 客户端推一条状态 JSON 消息（StatusMessage → JSON）。
 
         与 _broadcast_bytes 的区别：字节通道走的是"下位机原样数据"，
         JSON 通道走的是"Backend 自己的状态"（连接状态等），两者互不混淆。
@@ -747,7 +964,7 @@ class Hub:
             clients = list(self._ws_clients)
         if not clients:
             return
-        text = json.dumps(obj, ensure_ascii=False, default=str)
+        text = json.dumps(asdict(msg), ensure_ascii=False, default=str)
 
         async def _send_all() -> None:
             dead = []
@@ -822,6 +1039,12 @@ class Hub:
         raise KeyError(f"监控项不存在: {index_or_name}")
 
     def resolve_tunable(self, index_or_name) -> int:
+        """把"index 或中文名"解析成调参项 index；名字最后忽略大小写容错。
+
+        index_or_name: int（直接返回）或 str（数字按 index、否则按调参目录中文名查）
+        返回: 调参项 index
+        抛错: KeyError 名字不在调参目录里
+        """
         if isinstance(index_or_name, int):
             return index_or_name
         name = str(index_or_name)
@@ -833,6 +1056,12 @@ class Hub:
         raise KeyError(f"调参项不存在: {index_or_name}")
 
     def resolve_cmd(self, index_or_name) -> CmdDirItem:
+        """把"命令字或中文名"解析成命令目录项；名字最后忽略大小写容错。
+
+        index_or_name: int（命令字，必须是命令目录里的 index）或 str（命令中文名）
+        返回: 该命令的 CmdDirItem（含字段类型/名字/范围，供 Hub.cmd 组帧与校验）
+        抛错: KeyError 命令字/名字不在命令目录里
+        """
         if isinstance(index_or_name, int):
             if index_or_name not in self.cmd_dir:
                 raise KeyError(f"命令字不存在: 0x{index_or_name:02X}")
@@ -846,6 +1075,12 @@ class Hub:
         raise KeyError(f"命令不存在: {index_or_name}")
 
     def get_column(self, type_: str) -> list[MenuItem | CmdDirItem]:
+        """按类型取整张目录列表（/api/column 用）。
+
+        type_: "monitor"/"mon"（实参表）、"tunable"/"tun"（调参表）、"cmd"/"command"/"commands"（命令表）
+        返回: 对应目录的项列表（monitor/tunable 是 MenuItem，cmd 是 CmdDirItem）
+        抛错: ValueError 类型不认识
+        """
         t = type_.lower()
         if t in ("monitor", "mon"):
             return list(self.monitor_dir.values())
@@ -860,7 +1095,7 @@ class Hub:
         it = self.monitor_dir.get(idx)
         return it.name if it else str(idx)
 
-    def read_item(self, index_or_name) -> dict:
+    def read_item(self, index_or_name) -> MonitorReading:
         """单项当前值（看门狗用）：index(int) 或目录中文名均可。
 
         前提：该项必须正在被推送（订阅过 push/log/both 任一），
@@ -875,16 +1110,16 @@ class Hub:
             raise KeyError(f"监控项尚无数据（先 push 订阅再 read）: {index_or_name}")
         item = self.monitor_dir.get(idx)
         s = self.monitor_latest[idx]
-        return {
-            "index": idx,
-            "name": item.name if item else str(idx),
-            "value": s.value,
-            "unit": item.unit if item else "",
+        return MonitorReading(
+            index=idx,
+            name=item.name if item else str(idx),
+            value=s.value,
+            unit=item.unit if item else "",
             # t_recv=None（只有目录初值、没推送过）按极旧处理，看门狗自然当过期
-            "age_s": round(time.monotonic() - (s.t_recv or 0.0), 3),
-        }
+            age_s=round(time.monotonic() - (s.t_recv or 0.0), 3),
+        )
 
-    def read_items(self, keys: list, missing_ok: bool = False) -> list[dict]:
+    def read_items(self, keys: list, missing_ok: bool = False) -> list[MonitorReading]:
         """多项当前值，一次返回（看门狗一轮要看 x/y/yaw，避免连发三个请求）。
         missing_ok=True 时跳过还没有数据的项（不抛 404），供批量轮询用。"""
         if not missing_ok:
@@ -903,10 +1138,11 @@ class Hub:
 
         多项一次取的意义：看门狗一轮通常要同时看 x/y/yaw，
         一次请求拿全避免三次往返带来的时间偏差（三个值不是同一时刻的）。
+        多项的返回值是"名字 → 值"的动态映射，故仍用 dict。
         """
         if len(index_or_name) == 1:
-            return self.read_item(index_or_name[0])["value"]
-        return {it["name"]: it["value"] for it in self.read_items(list(index_or_name))}
+            return self.read_item(index_or_name[0]).value
+        return {it.name: it.value for it in self.read_items(list(index_or_name))}
 
     def sub(
         self,
@@ -915,7 +1151,7 @@ class Hub:
         *,
         on: bool = True,
         fast: bool | None = None,
-    ) -> dict:
+    ) -> SubResult:
         """
         两种订阅可叠加：
           push - 只改下位机推送档位（Subscribe 帧），用于砍带宽，fast 指定高/低速
@@ -930,12 +1166,7 @@ class Hub:
         idx = self.resolve_monitor(index_or_name)
         kind = kind.lower()
         it = self.monitor_dir.get(idx)
-        result = {
-            "index": idx,
-            "name": it.name if it else None,
-            "push": None,
-            "log": None,
-        }
+        result = SubResult(index=idx, name=it.name if it else None, push=None, log=None)
 
         if kind in ("push", "both"):
             use_fast = bool(fast) if fast is not None else on
@@ -943,7 +1174,7 @@ class Hub:
                 intent = self._sub_intent.setdefault(idx, {})
                 intent["script"] = (on, use_fast)
                 self._recompute_and_emit({idx})
-            result["push"] = {"sub": on, "fast": use_fast}
+            result.push = PushState(sub=on, fast=use_fast)
 
         if kind in ("log", "both"):
             if on:
@@ -956,14 +1187,14 @@ class Hub:
                             intent = self._sub_intent.setdefault(idx, {})
                             intent["script"] = (True, True)
                             self._recompute_and_emit({idx})
-                        result["push"] = {"sub": True, "fast": True}
+                        result.push = PushState(sub=True, fast=True)
             else:
                 self.log_reg.discard(idx)
-            result["log"] = on
+            result.log = on
 
         return result
 
-    def emergency_stop(self) -> dict:
+    def emergency_stop(self) -> StopResult:
         """最高优先级停车：发停车帧、清脚本队列、置 abort 打断脚本。
 
         三步缺一不可：
@@ -980,16 +1211,21 @@ class Hub:
 
         idx = self._stop_index()
         self.enqueue(build_frame(idx, b""), PRI_STOP)
-        return {"ok": True, "cmd_index": idx}
+        return StopResult(ok=True, cmd_index=idx)
 
     def clear_abort(self) -> None:
+        """清掉中止旗标：脚本被停车打断后，再跑新脚本前必须先调它，否则 cmd() 直接抛错。"""
         self.abort_event.clear()
 
     def check_abort(self) -> None:
+        """中止检查点：abort 置位就抛 RuntimeError，供脚本在命令/等待处调用。
+
+        抛错: RuntimeError 已停车（上位机按了停车），需 clear_abort() 才能继续
+        """
         if self.abort_event.is_set():
             raise RuntimeError("已紧急停车 / 脚本被中止（调 clear_abort 后才能继续）")
 
-    def cmd(self, index_or_name, *args) -> dict:
+    def cmd(self, index_or_name, *args) -> CmdResult:
         """按命令目录发一条命令（脚本主力写接口）。
 
         两道严格校验：
@@ -1019,19 +1255,21 @@ class Hub:
             if (lo is not None and v < lo) or (hi is not None and v > hi):
                 raise ValueError(f"命令 {item.name} 的参数 {f.name}={v} 超出范围（{lo}~{hi}）")
         self.enqueue(command_send(item.index, types, values), PRI_SCRIPT)
-        return {
-            "ok": True,
-            "index": item.index,
-            "name": item.name,
-            "args": values,
-        }
+        return CmdResult(ok=True, index=item.index, name=item.name, args=values)
 
-    def set_tunable_value(self, index_or_name, value) -> dict:
+    def set_tunable_value(self, index_or_name, value) -> SetTunableResult:
+        """写一个调参项（脚本用）：类型从目录查、值按 8B 定长组帧、脚本优先级入队。
+
+        index_or_name: 调参项 index(int) 或中文名(str)
+        value        : 要写入的值，最终以下位机回显(EchoEvent)为准覆盖显示值
+        返回: SetTunableResult(ok, index, value)
+        抛错: abort 中抛 RuntimeError；名字不存在抛 KeyError
+        """
         self.check_abort()
         idx = self.resolve_tunable(index_or_name)
         item = self.tunable_dir[idx]
         self.enqueue(set_tunable(idx, item.type, value), PRI_SCRIPT)
-        return {"ok": True, "index": idx, "value": value}
+        return SetTunableResult(ok=True, index=idx, value=value)
 
     # ---------- 记录会话 ----------
     # 一段 = 一次 start_log → end_log。脚本在段内发命令、段末取整段数据；
@@ -1066,7 +1304,7 @@ class Hub:
         """
         return sum(len(v) for v in self.log_dir.values())
 
-    def start_log(self) -> dict:
+    def start_log(self) -> StartLogResult:
         """开始记录：清掉上一段缓冲，并以此刻为本段零点。
 
         记哪些项由脚本先用 sub(x, 'log'/'both') 登记；
@@ -1079,22 +1317,25 @@ class Hub:
             self.log_dropped = 0
             self._log_t0 = time.monotonic()
             self.logging = True
-        return {
-            "ok": True,
-            "registered": [
-                {"index": i, "name": self._mon_name(i)}
-                for i in sorted(self.log_reg)
-            ],
-        }
+        return StartLogResult(
+            ok=True,
+            registered=[RegisteredItem(i, self._mon_name(i)) for i in sorted(self.log_reg)],
+        )
 
-    def end_log(self) -> dict:
+    def end_log(self) -> EndLogResult:
+        """结束记录：锁内一并关掉收样本并数样本，返回本段总数与丢弃数。"""
         # 两件事一起在锁内做完：关掉收样本、数样本。
         # rx 线程可能正卡在"过了 logging 检查、等锁落盘"那一步，锁住数才不会边遍历边改字典
         with self._log_lock:
             self.logging = False
-            return {"ok": True, "samples": self.log_samples(), "dropped": self.log_dropped}
+            return EndLogResult(ok=True, samples=self.log_samples(), dropped=self.log_dropped)
 
     def _log_indices(self, names) -> list[int]:
+        """把查询参数解析成一组 index：names=None 取全部已记录项，否则逐项 resolve。
+
+        names: None（全部）/ 单个 name 或 index / name、index 混合的列表
+        返回: index 列表（names=None 时按 index 升序）
+        """
         if names is None:
             with self._log_lock:  # 防遍历 keys 时 rx 线程 setdefault 出新 key
                 return sorted(self.log_dir)
@@ -1111,18 +1352,18 @@ class Hub:
         with self._log_lock:
             return list(self.log_dir.get(idx) or ())
 
-    def log_rows(self, names=None) -> dict:
+    def log_rows(self, names=None) -> LogRowsResult:
         """取整段原始样本（长表，按时间排序），供脚本自己画图、落盘或自行统计。"""
         idxs = self._log_indices(names)
-        rows: list[dict] = []
+        rows: list[LogRow] = []
         for idx in idxs:
             name = self._mon_name(idx)
             for t, v in self._samples(idx):
-                rows.append({"t": t, "index": idx, "name": name, "value": v})
-        rows.sort(key=lambda r: r["t"])
-        return {"rows": rows}
+                rows.append(LogRow(t=t, index=idx, name=name, value=v))
+        rows.sort(key=lambda r: r.t)
+        return LogRowsResult(rows=rows)
 
-    def log_stats(self, names=None, thresholds=()) -> dict:
+    def log_stats(self, names=None, thresholds=()) -> LogStatsResult:
         """整段统计（后端算好，脚本不用自己攒样本）。
 
         thresholds 里每个 th 额外给出 ratio_ge[th] = |值| >= th 的样本占比。
@@ -1130,17 +1371,18 @@ class Hub:
         更能说明增益给大了。取绝对值是因为正负超调都算问题。
         """
         idxs = self._log_indices(names)
-        items = []
+        items: list[LogStatsItem] = []
         for idx in idxs:
             name = self._mon_name(idx)
             samples = self._samples(idx)
             vals = [v for _, v in samples]
             # rate_hz 用样本自身跨度算（首个到末个时间戳），不依赖任何窗口
             span_ms = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
-            items.append({"index": idx, "name": name, **_aggregate(vals, thresholds, span_ms)})
-        return {"items": items}
+            # 统计量摊平成 {index,name,n,mean,...}：/api/log/stats 的 JSON 契约不能变
+            items.append(LogStatsItem(index=idx, name=name, **asdict(_aggregate(vals, thresholds, span_ms))))
+        return LogStatsResult(items=items)
 
-    def print_log(self, path: str | None = None) -> dict:
+    def print_log(self, path: str | None = None) -> PrintLogResult:
         """导出记录，格式由 path 的后缀决定（只写一种，不再一次落两份）：
 
           path 后缀  导出内容
@@ -1160,7 +1402,7 @@ class Hub:
             target = self.pytest_dir / f"log_{datetime.now():%Y%m%d_%H%M%S}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        rows = self.log_rows()["rows"]
+        rows = self.log_rows().rows
         suffix = target.suffix.lower()
         if suffix == ".csv":
             self._write_csv(target, rows)
@@ -1169,37 +1411,34 @@ class Hub:
         else:
             self._write_json(target, rows)
 
-        return {
-            "ok": True,
-            "path": str(target),
-            "format": suffix.lstrip("."),
-            "samples": len(rows),
-            "dropped": self.log_dropped,
-        }
+        return PrintLogResult(
+            ok=True,
+            path=str(target),
+            format=suffix.lstrip("."),
+            samples=len(rows),
+            dropped=self.log_dropped,
+        )
 
-    def _write_json(self, target: Path, rows: list[dict]) -> None:
+    def _write_json(self, target: Path, rows: list[LogRow]) -> None:
         """全量 JSON：元信息 + 原始样本长表。"""
-        meta = {
-            "created": datetime.now().isoformat(timespec="seconds"),
-            "samples": len(rows),
-            "dropped": self.log_dropped,
-            "registered": [
-                {"index": i, "name": self._mon_name(i)}
-                for i in sorted(self.log_reg)
-            ],
-            "data": rows,
-        }
+        meta = LogFileMeta(
+            created=datetime.now().isoformat(timespec="seconds"),
+            samples=len(rows),
+            dropped=self.log_dropped,
+            registered=[RegisteredItem(i, self._mon_name(i)) for i in sorted(self.log_reg)],
+            data=rows,
+        )
         with open(target, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(asdict(meta), f, ensure_ascii=False, indent=2, default=str)
 
-    def _write_csv(self, target: Path, rows: list[dict]) -> None:
+    def _write_csv(self, target: Path, rows: list[LogRow]) -> None:
         """长表 CSV：每条推送一行；utf-8-sig 带 BOM，Excel 打开中文不乱码。"""
         with open(target, "w", encoding="utf-8-sig") as f:
             f.write("t_ms,index,name,value\n")
             for row in rows:
-                f.write(f"{row['t']},{row['index']},{row['name']},{row['value']}\n")
+                f.write(f"{row.t},{row.index},{row.name},{row.value}\n")
 
-    def _write_plot(self, target: Path, rows: list[dict]) -> None:
+    def _write_plot(self, target: Path, rows: list[LogRow]) -> None:
         """按监控项作图并导出图片：每项一条曲线，横轴为相对本段零点的秒。
 
         matplotlib 延迟导入——不画图的后端无需安装它。
@@ -1215,7 +1454,7 @@ class Hub:
 
         series: dict[str, list[tuple[float, float]]] = {}
         for r in rows:
-            series.setdefault(r["name"], []).append((r["t"] / 1000.0, r["value"]))
+            series.setdefault(r.name, []).append((r.t / 1000.0, r.value))
 
         fig, ax = plt.subplots(figsize=(12, 6))
         for name, pts in series.items():
@@ -1229,7 +1468,7 @@ class Hub:
         fig.savefig(target, dpi=120)
         plt.close(fig)
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> Snapshot:
         """/api/status 的返回体：一眼看清 Backend 全貌，调试脚本连不上的第一站。
 
         logging / log_samples / log_dropped 三个一起看能判断记录是否健康：
@@ -1237,18 +1476,18 @@ class Hub:
         """
         with self._log_lock:  # 记录中被轮询时 rx 在 append，数样本防字典变尺寸
             log_samples = self.log_samples()
-        return {
-            "status": self.status.value,
-            "message": self.status_msg,
-            "connected": self.bridge.connected,
-            "monitor_count": len(self.monitor_dir),
-            "tunable_count": len(self.tunable_dir),
-            "cmd_count": len(self.cmd_dir),
-            "log_reg": sorted(self.log_reg),
-            "logging": self.logging,
-            "log_samples": log_samples,
-            "log_dropped": self.log_dropped,
-            "abort": self.abort_event.is_set(),
-            "stop_cmd": self._stop_cmd_index,
-            "ports": SerialBridge.list_ports(),
-        }
+        return Snapshot(
+            status=self.status.value,
+            message=self.status_msg,
+            connected=self.bridge.connected,
+            monitor_count=len(self.monitor_dir),
+            tunable_count=len(self.tunable_dir),
+            cmd_count=len(self.cmd_dir),
+            log_reg=sorted(self.log_reg),
+            logging=self.logging,
+            log_samples=log_samples,
+            log_dropped=self.log_dropped,
+            abort=self.abort_event.is_set(),
+            stop_cmd=self._stop_cmd_index,
+            ports=SerialBridge.list_ports(),
+        )

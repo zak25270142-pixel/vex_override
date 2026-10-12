@@ -48,7 +48,7 @@ def test_encode_float():
 def test_parser_pong():
     events = []
     FrameParser().feed(bytes([0xA5, 0xFF, 0xFF]), events.append)
-    assert len(events) == 1 and events[0]["kind"] is EventKind.pong
+    assert len(events) == 1 and events[0].kind is EventKind.pong
 
 
 def test_parser_monitor_value_after_directory():
@@ -58,13 +58,13 @@ def test_parser_monitor_value_after_directory():
     # 目录 payload: [index=2][type=float][tag=0][名长1 'v'][单位长0][float初值0]
     dir_payload = bytes([2, ValueType.Float, 0, 1]) + b"v" + bytes([0]) + struct.pack("<f", 0.0)
     p.feed(_frame(CmdPost.MonitorDirectory, dir_payload), events.append)
-    assert events[-1]["item"].name == "v"
+    assert events[-1].item.name == "v"
 
     val_payload = bytes([2]) + struct.pack("<f", 1.0)
     p.feed(_frame(CmdPost.MonitorValue, val_payload), events.append)
-    assert events[-1]["kind"] is EventKind.value
-    assert events[-1]["index"] == 2
-    assert abs(events[-1]["value"] - 1.0) < 1e-6
+    assert events[-1].kind is EventKind.value
+    assert events[-1].index == 2
+    assert abs(events[-1].value - 1.0) < 1e-6
 
 
 def test_parser_cmd_directory_with_ranges():
@@ -77,7 +77,7 @@ def test_parser_cmd_directory_with_ranges():
         + struct.pack("<ff", -10.0, 10.0)
     )
     p.feed(_frame(CmdPost.CMDDirectory, payload), events.append)
-    item = events[-1]["item"]
+    item = events[-1].item
     assert item.index == 0x80 and item.name == "mk"
     assert item.fields[0].min == -10.0 and item.fields[0].max == 10.0
 
@@ -87,11 +87,11 @@ def test_parser_bad_checksum_and_half_frame():
     p = FrameParser()
     good = ping()
     p.feed(bytes([0xA5, 0xFF, 0x00]), events.append)  # 校验错
-    assert not events and p.stats["badChecksum"] == 1
+    assert not events and p.stats.badChecksum == 1
     # 半帧分两次喂也能拼起来
     p.feed(good[:1], events.append)
     p.feed(good[1:], events.append)
-    assert events and events[0]["kind"] is EventKind.pong
+    assert events and events[0].kind is EventKind.pong
 
 
 def test_max_payload_constant():

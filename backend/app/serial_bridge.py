@@ -16,9 +16,10 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 
-from .protocol import FRAME_HEAD, EventKind, FrameParser, ping
+from .protocol import FRAME_HEAD, FrameParser, PongEvent, RxEvent, ping
 
 logger = logging.getLogger("vex.serial")
 
@@ -50,6 +51,16 @@ except ImportError:  # pragma: no cover
 VEX_VID = 0x2888
 
 
+@dataclass
+class PortInfo:
+    """一个串口设备的信息（pyserial 原始描述符的裁剪版，/api/ports 直接返回）。"""
+    device: str
+    description: str
+    vid: int | None
+    pid: int | None
+    serial_number: str
+
+
 class SerialBridge:
     """线程安全的串口读写；读走独立线程 + FrameParser，写由 Hub 队列统一调度。
 
@@ -63,12 +74,22 @@ class SerialBridge:
         self,
         port: str | None = None,
         baud: int = 115200,
-        on_event: Callable[[dict], None] | None = None,
+        on_event: Callable[[RxEvent], None] | None = None,
         on_status: Callable[[Status, str], None] | None = None,
         on_raw: Callable[[bytes], None] | None = None,
     ) -> None:
+        """建串口桥（不立即开串口，connect() 才探测打开）。
+
+        port     : 指定串口名（如 "COM5"）；None=connect 时自动逐口 Ping 探测
+        baud     : 波特率，CDC 虚拟口仅占位（USB 全速跑，实际不影响）
+        on_event : FrameParser 解出事件的回调（Hub._on_serial_event）
+        on_status: 连接状态变化回调（Hub._on_serial_status），收到 Status 枚举 + 人读说明
+        on_raw   : 原始字节回调（Hub._on_serial_raw），用来原样广播给 WS 上位机
+        """
         self.port_name = port
+        '''指定串口名；None=自动探测'''
         self.baud = baud
+        '''波特率（CDC 虚拟口仅占位）'''
         
         # 不给回调就塞空 lambda，省得调用处到处判 None
         self.on_event = on_event or (lambda e: None)
@@ -85,10 +106,14 @@ class SerialBridge:
         '''串口对象'''
 
         self._parser = FrameParser()
+        '''Python 侧帧解析器；喂收上来的字节，吐目录/值/回显事件'''
+
         # 写锁：虽然目前只有 Hub 的 tx 线程会调 send，但 send 是公共方法，
         # 留锁防将来有人从别的线程直接写，两次 write 交错会撕帧。
         self._tx_lock = threading.Lock()
+        '''写锁：串行化 send()，防多线程写交错撕帧'''
         self._rx_thread: threading.Thread | None = None
+        '''收数线程（connect 成功时启动，disconnect/_lost 时收尾）'''
 
         self._stop = threading.Event()  
         '''全局停止标志，置位后 rx 循环退出'''
@@ -108,48 +133,58 @@ class SerialBridge:
 
     @property
     def connected(self) -> bool:
+        """当前是否真正连着（三重判断，供 Hub/路由判断能否发帧）。"""
         # 三重判断：标志位 + 对象存在 + 端口真开着。
         # 只判 _connected 会在拔线后仍返回 True（标志还没被 _lost 清掉）。
         return self._connected and self._ser is not None and self._ser.is_open
 
     @property
     def parser(self) -> FrameParser:
+        """Python 侧帧解析器（Hub 读它的 stats 做链路诊断）。"""
         return self._parser
 
     @property
     def last_pong(self) -> float:
+        """上次收到 Pong 的 time.monotonic() 秒；0.0=还没收到过（心跳超时判定用）。"""
         return self._last_pong
 
     # ---------- 端口枚举 ----------
 
     @staticmethod
-    def list_ports() -> list[dict]:
+    def list_ports() -> list[PortInfo]:
+        """枚举本机串口设备（pyserial 描述符裁剪成 PortInfo）。
+
+        返回: PortInfo 列表；没装 pyserial 时返回空列表（不抛错，便于无串口开发机启动）
+        """
         if serial is None:
             return []
         out = []
         for p in serial.tools.list_ports.comports():
             out.append(
-                {
-                    "device": p.device,
-                    "description": p.description or "",
-                    "vid": p.vid,
-                    "pid": p.pid,
-                    "serial_number": p.serial_number or "",
-                }
+                PortInfo(
+                    device=p.device,
+                    description=p.description or "",
+                    vid=p.vid,
+                    pid=p.pid,
+                    serial_number=p.serial_number or "",
+                )
             )
         return out
 
     def find_candidates(self) -> list[str]:
-        """寻找候选串口
-        优先返回可能是 V5 的口"""
+        """给出待探测的串口名列表，VEX 可能的口排前面。
+
+        返回: 设备名字符串列表；指定了 self.port_name 就只返回它（跳过自动探测）。
+              VEX_VID 匹配 / 描述含 "vex"、"user" 的排前面，其余口兜底排后面。
+        """
         if self.port_name:
             return [self.port_name]
         preferred = []
         others = []
         for p in self.list_ports():
-            dev = p["device"]
-            desc = (p["description"] or "").lower()
-            if p["vid"] == VEX_VID or "vex" in desc or "user" in desc:
+            dev = p.device
+            desc = (p.description or "").lower()
+            if p.vid == VEX_VID or "vex" in desc or "user" in desc:
                 preferred.append(dev)
             else:
                 others.append(dev)
@@ -158,6 +193,12 @@ class SerialBridge:
     # ---------- 连接 / 探测 ----------
 
     def connect(self, timeout: float = 2.0) -> bool:
+        """打开并认领 V5 User 口：逐候选口发 Ping，认得出才建收数线程。
+
+        timeout: 每个候选口的探测时长（秒），不够可加大
+        返回: True=已连上（收数线程已在跑）；False=没认出来（已上报 error 状态）
+        副作用: 认领成功后启动 _rx_thread、清停止标志、上报 connected 状态
+        """
         if serial is None:
             self.on_status(Status.error, "未安装 pyserial，请 pip install pyserial")
             return False
@@ -211,7 +252,12 @@ class SerialBridge:
     # 而函数体内的注解不求值。pyserial 未装时 serial 为 None，
     # 不加引号这里会 AttributeError: 'NoneType' object has no attribute 'Serial'。
     def _probe(self, ser: "serial.Serial", timeout: float = 0.3) -> bool:
-        """发 Ping，在 timeout 内找到完整 Pong(A5 FF FF) 才算这个口对。"""
+        """发 Ping，在 timeout 内找到完整 Pong(A5 FF FF) 才算这个口对。
+
+        ser    : 已打开、待验证的串口对象
+        timeout: 等 Pong 的时长（秒）；后半程会补发一次 Ping 防首帧丢在枚举窗口
+        返回: True=认领成功（这是 V5 User 口）；False=该口无应答
+        """
         try:
             ser.reset_input_buffer()  # 清掉打开端口时可能残留的旧字节
         except Exception:
@@ -290,12 +336,22 @@ class SerialBridge:
     # ---------- 收发 ----------
 
     def send(self, data: bytes) -> None:
+        """写一帧到串口（加写锁串行化）。
+
+        data: 完整帧字节（含帧头与校验，由 protocol.build_frame 组好）
+        抛错: 未连接时 RuntimeError("串口未连接")，由 Hub 的 tx 线程捕获处理
+        """
         if not self.connected or not self._ser:
             raise RuntimeError("串口未连接")
         with self._tx_lock:
             self._ser.write(data)
 
     def _rx_loop(self) -> None:
+        """收数线程主循环：轮询 in_waiting，有字节就一次读走并分给两个消费者。
+
+        每批字节先 on_raw 原样广播给 WS 上位机（前端自己拆帧），
+        再喂 Python FrameParser（供脚本侧目录/快照/日志）。读异常即判定掉线 _lost。
+        """
         assert self._ser is not None
         while not self._stop.is_set():
             try:
@@ -318,9 +374,14 @@ class SerialBridge:
                     self._lost(f"串口读取异常: {e}")
                 break
 
-    def _on_parsed(self, event: dict) -> None:
+    def _on_parsed(self, event: RxEvent) -> None:
+        """FrameParser 的每帧回调：截获 Pong 更新时间戳，再把事件转给上层 on_event。
+
+        event: protocol.py 的 RxEvent 子类实例
+        上层回调抛异常只记日志、不上抛——否则会把 rx 线程带崩，整条链路静默死亡。
+        """
         # Pong 在这里被"截获"更新时间戳，同时也继续往下传给 on_event
-        if event.get("kind") is EventKind.pong:
+        if isinstance(event, PongEvent):
             self._last_pong = time.monotonic()
         try:
             self.on_event(event)
@@ -342,7 +403,12 @@ class SerialBridge:
         self._hb_thread = None
 
     def start_heartbeat(self, interval: float = 1.0) -> threading.Thread:
-        """单例心跳：重复调用先停旧线程再启，避免重连后叠出多个 Ping 源。"""
+        """单例心跳：重复调用先停旧线程再启，避免重连后叠出多个 Ping 源。
+
+        interval: 发 Ping 的间隔（秒），默认 1s
+        返回: 刚启动的心跳线程
+        线程内每拍发一次 Ping，并检查 last_pong——超过 PONG_TIMEOUT_S 未回则判定掉线。
+        """
         self.stop_heartbeat()
         self._hb_stop.clear()
 

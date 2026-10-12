@@ -24,7 +24,7 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware # CORS 中间件（允许跨域）
 from pydantic import BaseModel, Field 
 
-from .hub import Hub
+from .hub import ConnectResult, Hub, OkResult, ValueSnapshot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +45,11 @@ hub = Hub(port=V5_PORT, baud=V5_BAUD)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """FastAPI 生命周期钩子：启动时注入事件循环并拉起 Hub，关闭时 hub.stop() 收尾。
+
+    app: FastAPI 实例（框架注入，本函数不用它）
+    进入时 set_loop（须在 start 前，否则首批串口事件推不出）+ hub.start；退出时 hub.stop。
+    """
     # 把主事件循环注入 Hub：串口线程要用 run_coroutine_threadsafe 把 WS 发送
     # 投回这个循环里执行（线程里不能 await）。必须在 start() 之前注入，
     # 否则首批串口事件推不出去。
@@ -81,8 +86,12 @@ app.add_middleware(
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
-    # 一个连接 = 一个 WS 客户端，Hub 内部用 id(ws) 区分订阅来源，
-    # 所以开多个页面时各自的订阅不会互相覆盖
+    """WS 端点：把连接整体托管给 hub.attach_ui（收字节透传/发状态 JSON 都在里面）。
+
+    ws: 已建立的 WebSocket 连接
+    一个连接 = 一个 WS 客户端，Hub 内部用 id(ws) 区分订阅来源，
+    所以开多个页面时各自的订阅不会互相覆盖。本函数在连接关闭前一直不返回。
+    """
     await hub.attach_ui(ws)
 
 
@@ -90,6 +99,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
 
 class SubBody(BaseModel):
+    """/api/sub 请求体：订阅/退订一个监控项（push 档位 / log 登记可叠加）。"""
     # index_or_name 用 Any：HTTP 传进来的可能是 5 / "5" / "左0转速" 三种形态，
     # 具体分发在 hub.resolve_monitor 里用 isinstance 做
     index_or_name: Any
@@ -102,42 +112,52 @@ class SubBody(BaseModel):
 
 
 class CmdBody(BaseModel):
+    """/api/cmd 请求体：下发一条动作命令（按命令目录的字段顺序给参数）。"""
     index_or_name: Any
     # 参数按命令目录里的顺序给，个数必须完全一致（Hub.cmd 会严格校验）
     args: list[Any] = Field(default_factory=list)  # 默认空，用于无参命令（如停车）
 
 
 class TunableBody(BaseModel):
+    """/api/tunable 请求体：写一个调参项的值。"""
     index_or_name: Any
     value: Any
 
 
 class PrintLogBody(BaseModel):
+    """/api/log/print 请求体：导出路径；None=默认落后端 pytest/log_<时间戳>.json。"""
     path: str | None = None
 
 
 @app.get("/api/status")
 def api_status():
+    """后端全貌快照：连接状态、三张表项数、记录状态、端口列表（调试连不上的第一站）。"""
     return hub.snapshot()
 
 
 @app.post("/api/connect")
 def api_connect():
+    """前端连接/重连按钮入口：标记想连并异步触发探测，立即返回当前快照。
+
+    返回: ConnectResult(ok, snapshot)
+    探测本身可能阻塞数秒，不等结果——进度靠 WS 状态消息感知；置意愿后掉线会自动重连。
+    """
     # 前端连接/重连按钮入口：标记想连并立即尝试。
     # 串口探测本身可能阻塞数秒，不等它出结果，交给重连线程反复试；
     # 前端看 WS 状态消息（connecting/connected/disconnected）感知进度。
     # 注意这是"意愿开关"：置 _want_connected=True 后，之后每次掉线都会自动重连。
     hub.ensure_connected()
-    return {"ok": True, "snapshot": hub.snapshot()}
+    return ConnectResult(ok=True, snapshot=hub.snapshot())
 
 
 @app.post("/api/disconnect")
 def api_disconnect():
+    """用户主动断开：先关自动重连意愿，再关串口（顺序反了会被立刻重连回去）。"""
     # 先关意愿再断：顺序反了的话，断线回调看到 _want_connected 还是 True，
     # 会立刻触发自动重连，等于断开失败
     hub.set_want_connected(False)
     hub.bridge.disconnect()
-    return {"ok": True}
+    return OkResult()
 
 
 @app.post("/api/dirs/refresh")
@@ -150,16 +170,22 @@ def api_dirs_refresh():
 def api_clear_script_subs():
     """脚本结束时调用：去掉 script 侧订阅意图，不影响各 UI 客户端。"""
     hub.clear_script_intents()
-    return {"ok": True}
+    return OkResult()
 
 
 @app.get("/api/ports")
 def api_ports():
+    """枚举本机串口设备列表（PortInfo：device/description/vid/pid/serial_number）。"""
     return hub.bridge.list_ports()
 
 
 @app.get("/api/column")
 def api_column(type: str = "monitor"):
+    """拉一张目录整表。
+
+    type: monitor(实参表) | tunable(调参表) | cmd(命令表)，默认 monitor
+    返回: 该项列表；type 不认识 → 400
+    """
     try:
         return hub.get_column(type)
     except ValueError as e:
@@ -168,6 +194,11 @@ def api_column(type: str = "monitor"):
 
 @app.post("/api/sub")
 def api_sub(body: SubBody):
+    """订阅/退订一个监控项。
+
+    body: SubBody（index_or_name + kind=push/log/both + on + fast）
+    返回: SubResult；index_or_name 不存在 → 404
+    """
     try:
         return hub.sub(body.index_or_name, body.kind, on=body.on, fast=body.fast)
     except KeyError as e:
@@ -176,6 +207,7 @@ def api_sub(body: SubBody):
 
 @app.post("/api/stop")
 def api_stop():
+    """紧急停车：最高优先级发停车帧 + 清脚本队列 + 置 abort（立即返回，不等串口）。"""
     # 停车不等串口：先入队（PRI_STOP），串口一接上立刻发出去。
     # 即便此刻断线，停车帧也会反复重试直到发出——不会静默丢失。
     return hub.emergency_stop()
@@ -183,12 +215,18 @@ def api_stop():
 
 @app.post("/api/abort/clear")
 def api_abort_clear():
+    """清掉中止旗标：停车后要再跑脚本前必须调，否则 cmd() 直接报 409。"""
     hub.clear_abort()
-    return {"ok": True}
+    return OkResult()
 
 
 @app.post("/api/cmd")
 def api_cmd(body: CmdBody):
+    """下发动作命令（脚本主力写接口）。
+
+    body: CmdBody（index_or_name + args，参数个数须与命令目录一致）
+    返回: CmdResult；名字不存在 → 404；abort 中 → 409；参数个数/范围不符 → 400
+    """
     try:
         return hub.cmd(body.index_or_name, *body.args)
     except KeyError as e:
@@ -203,6 +241,11 @@ def api_cmd(body: CmdBody):
 
 @app.post("/api/tunable")
 def api_tunable(body: TunableBody):
+    """写一个调参项的值。
+
+    body: TunableBody（index_or_name + value）
+    返回: SetTunableResult；名字不存在 → 404；abort 中 → 409
+    """
     try:
         return hub.set_tunable_value(body.index_or_name, body.value)
     except KeyError as e:
@@ -213,16 +256,23 @@ def api_tunable(body: TunableBody):
 
 @app.post("/api/log/start")
 def api_log_start():
+    """开始一段记录：清上一段缓冲并以此刻为本段零点，返回已登记项列表。"""
     return hub.start_log()
 
 
 @app.post("/api/log/end")
 def api_log_end():
+    """结束记录：停止收样本并返回本段样本总数与丢弃数。"""
     return hub.end_log()
 
 
 @app.post("/api/log/print")
 def api_log_print(body: PrintLogBody = PrintLogBody()):
+    """把本段记录导出到后端机器（格式由 path 后缀决定：json/csv/png/jpg）。
+
+    body: PrintLogBody（path，None=默认 pytest/log_<时间戳>.json）
+    返回: PrintLogResult(ok, path, format, samples, dropped)
+    """
     return hub.print_log(body.path)
 
 
@@ -284,11 +334,11 @@ def api_values():
     for idx, s in hub.monitor_latest.items():
         item = hub.monitor_dir.get(idx)
         out.append(
-            {
-                "index": idx,
-                "name": item.name if item else str(idx),
-                "value": s.value,
-                "unit": item.unit if item else "",
-            }
+            ValueSnapshot(
+                index=idx,
+                name=item.name if item else str(idx),
+                value=s.value,
+                unit=item.unit if item else "",
+            )
         )
     return out
