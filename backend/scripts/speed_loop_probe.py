@@ -52,16 +52,16 @@ MON_CLOSED = ["左指令转速", "右指令转速", "左0转速", "右0转速",
 NAME_X, NAME_Y, NAME_YAW = "全局X", "全局Y", "航向"
 
 # 调参项中文名（调参目录下发的是 Chinese_name，不是代码里的 item_name）
-GAIN_KEYS = ["左kf 输出/pct", "左kp 输出/pct", "左ki内部÷1e6", "左kd内部×1e6",
-             "右kf 输出/pct", "右kp 输出/pct", "右ki内部÷1e6", "右kd内部×1e6"]
+GAIN_KEYS = ["左kf 输出/pct", "左kp 输出/pct", "左ki 输出/(pct·s)", "左kd 输出·s/pct",
+             "右kf 输出/pct", "右kp 输出/pct", "右ki 输出/(pct·s)", "右kd 输出·s/pct"]
 GAIN_NAME = {"L": {"kf": "左kf 输出/pct", "kp": "左kp 输出/pct",
-                   "ki": "左ki内部÷1e6", "kd": "左kd内部×1e6"},
+                   "ki": "左ki 输出/(pct·s)", "kd": "左kd 输出·s/pct"},
              "R": {"kf": "右kf 输出/pct", "kp": "右kp 输出/pct",
-                   "ki": "右ki内部÷1e6", "kd": "右kd内部×1e6"}}
+                   "ki": "右ki 输出/(pct·s)", "kd": "右kd 输出·s/pct"}}
 
 # 闭环增益组：(组名, kf, kp, ki每秒, kd每秒, 摩擦垫设置)
 # 摩擦垫设置=None 用当前调参值；否则为 (静摩擦V, 动摩擦V, volt_min V×8台)
-# 注意 ki/kd 调参表里存的是内部值 = 每秒值×1e-6，脚本下发时自行换算。
+# 注意 ki/kd 调参表里存的就是每秒量纲值，脚本原样下发，无需换算。
 GAIN_GROUPS = [
     # --- 前馈扫掠（ki=0，看纯前馈残差分布）---
     ("ff05_hi",  0.005, 0.0,   0.0, 0.0, (2.0, 1.0, 0.5)),
@@ -411,7 +411,7 @@ class Probe:
 
     # ---------------- 实验2：闭环增益扫掠（每脉冲后倒车回原点） ----------------
     def apply_settings(self, kf, kp, ki_s, kd_s, pads, remember=True):
-        val = {"kf": kf, "kp": kp, "ki": ki_s * 1e-6, "kd": kd_s * 1e6}
+        val = {"kf": kf, "kp": kp, "ki": ki_s, "kd": kd_s}
         for side in ("L", "R"):
             for k in ("kf", "kp", "ki", "kd"):
                 self.L.set_tunable(GAIN_NAME[side][k], val[k])

@@ -17,15 +17,15 @@ static MENU_state menu_state = pre;
 const struct MENU_ITEM menu_item[] =
     {
         // ========== 速度环（左右）==========
-        // kp/kf 与构造入参同量纲；ki 成员=秒量纲/1e6；kd 成员=秒量纲*1e6
-        {"L_kf", type_float, &left_motors.kf, "左kf 输出/pct", ""},
-        {"L_kp", type_float, &left_motors.kp, "左kp 输出/pct", ""},
-        {"L_ki", type_float, &left_motors.ki, "左ki内部÷1e6", ""},
-        {"L_kd", type_float, &left_motors.kd, "左kd内部×1e6", ""},
-        {"R_kf", type_float, &right_motors.kf, "右kf 输出/pct", ""},
-        {"R_kp", type_float, &right_motors.kp, "右kp 输出/pct", ""},
-        {"R_ki", type_float, &right_motors.ki, "右ki内部÷1e6", ""},
-        {"R_kd", type_float, &right_motors.kd, "右kd内部×1e6", ""},
+        // kf/kp/ki/kd 成员均与构造入参同量纲（秒量纲），不再有 1e6 内部换算
+        {"L_kf", type_float, &left_motors.kf, "左kf", ""},
+        {"L_kp", type_float, &left_motors.kp, "左kp", ""},
+        {"L_ki", type_float, &left_motors.ki, "左ki", ""},
+        {"L_kd", type_float, &left_motors.kd, "左kd", ""},
+        {"R_kf", type_float, &right_motors.kf, "右kf", ""},
+        {"R_kp", type_float, &right_motors.kp, "右kp", ""},
+        {"R_ki", type_float, &right_motors.ki, "右ki", ""},
+        {"R_kd", type_float, &right_motors.kd, "右kd", ""},
 
         {"L_st_dz", type_float, &left_motors.static_deadzone, "左静摩擦", "V"},
         {"L_dy_dz", type_float, &left_motors.dynamic_deadzone, "左动摩擦", "V"},
@@ -71,19 +71,19 @@ const struct MENU_ITEM menu_item[] =
         {"R_errIratio", type_float, &right_motors.error_for_i_ratio, "右I误差比例", ""},
 
         // // ========== 位置环 ==========
-        // {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp 输出/误差", ""},
-        // {"d_ki", type_float, &robot_action.distance_pid.ki, "距离ki内部÷1e6", ""},
-        // {"d_kd", type_float, &robot_action.distance_pid.kd, "距离kd内部×1e6", ""},
+        // {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp", ""},
+        // {"d_ki", type_float, &robot_action.distance_pid.ki, "距离ki", ""},
+        // {"d_kd", type_float, &robot_action.distance_pid.kd, "距离kd", ""},
         // {"d_max", type_float, &robot_action.distance_pid.max_output, "距离环限速", "pct"},
 
-        // {"h_kp", type_float, &robot_action.heading_pid.kp, "纠偏kp 输出/误差", ""},
-        // {"h_ki", type_float, &robot_action.heading_pid.ki, "纠偏ki内部÷1e6", ""},
-        // {"h_kd", type_float, &robot_action.heading_pid.kd, "纠偏kd内部×1e6", ""},
+        // {"h_kp", type_float, &robot_action.heading_pid.kp, "纠偏kp", ""},
+        // {"h_ki", type_float, &robot_action.heading_pid.ki, "纠偏ki", ""},
+        // {"h_kd", type_float, &robot_action.heading_pid.kd, "纠偏kd", ""},
         // {"h_max", type_float, &robot_action.heading_pid.max_output, "纠偏限速", "pct"},
 
-        // {"t_kp", type_float, &robot_action.turn_pid.kp, "转向kp 输出/误差", ""},
-        // {"t_ki", type_float, &robot_action.turn_pid.ki, "转向ki内部÷1e6", ""},
-        // {"t_kd", type_float, &robot_action.turn_pid.kd, "转向kd内部×1e6", ""},
+        // {"t_kp", type_float, &robot_action.turn_pid.kp, "转向kp", ""},
+        // {"t_ki", type_float, &robot_action.turn_pid.ki, "转向ki", ""},
+        // {"t_kd", type_float, &robot_action.turn_pid.kd, "转向kd", ""},
         // {"t_max", type_float, &robot_action.turn_pid.max_output, "转向限速", "pct"},
 
         // // ========== 满速 / 容差 ==========

@@ -3,8 +3,8 @@
 
 #include "my_main.h"
 
-// motor1/2 与轮轴同轴直连（60 齿），motor3/4 经齿轮传动（48 齿），
-// 里程计读数只取直连轮轴、无啮合背隙的 motor1；后期改用定位轮后该读数可废弃。
+// 里程计读数只取motor1
+// MotorGroup 里的电机都用齿轮串连传动，物理等速
 class MyMotorGroup
 {
 private:
@@ -84,14 +84,16 @@ public:
 
     float kf;                    // 阻力前馈，单位：归一输出 / pct
     float kp;                    // 比例项，单位：归一输出 / pct
-    float ki;                    // 积分项，内部单位：归一输出 / (pct·us)
-    float kd;                    // 微分项，内部单位：归一输出·us / pct
-    float integral = 0.0f;       // integral 保存误差累计；本类所有时间量统一使用 us。
+    float ki;                    // 积分项，单位：归一输出 / (pct·秒)，与构造入参一致
+    float kd;                    // 微分项，单位：归一输出·秒 / pct，与构造入参一致
+    float integral = 0.0f;       // integral 保存误差累计，单位 pct·秒（本类内部时间统一为秒）。
     float previous_error = 0.0f; // previous_error 保存上一轮误差，用于计算 D 项。
     float pre_v = 0.0f;          // 上一次速度
     float pre_a = 0.0f;          // 上一次的加速度
 
     uint32_t last_time_us = 0; // 上一轮 update() 使用的 VEX 系统微秒时间戳。
+    // 新进入 Transit 的前两拍只观察加速度，避免起步第一拍速度仍为 0 时直接误进 Track。
+    uint8_t transit_ticks = 0;
 
     MyMotorGroup(vex::motor &m1, vex::motor &m2,
                  vex::motor &m3, vex::motor &m4,

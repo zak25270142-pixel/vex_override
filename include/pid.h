@@ -11,7 +11,7 @@
 //   kp : 输出 / 误差
 //   ki : 输出 / (误差·秒)
 //   kd : 输出·秒 / 误差
-// 内部时间单位为 us，构造时已将 ki、kd 换算到 us 量纲，调用无需关心。
+// 传入的时间戳为 us
 class PositionPID
 {
 private:
@@ -21,17 +21,12 @@ private:
     int8_t pre_sign = 0;
 
 public:
-    // 三个控制系数在创建对象时确定；内部 ki、kd 已换算为 us 量纲。
     float kp;
-    float ki; // 内部单位：输出 / (误差·us)
-    float kd; // 内部单位：输出·us / 误差
+    float ki; // 单位：输出 / (误差·秒)
+    float kd; // 单位：输出·秒 / 误差
 
-    // integral 保存误差累计；本类所有时间量统一使用 us。
-    float integral;
-    // previous_error 保存上一轮误差，用于计算 D 项和判断误差是否越过零点。
+    float integral;//误差累计，消除稳态误差
     float previous_error;
-
-    // 输出限幅
     float max_output;
 
     // 构造函数：I、D 和输出上限均可省略。
@@ -44,8 +39,8 @@ public:
     // 开始设置一个目标并返回第一轮输出。
     float reset(float error, uint32_t current_time_us = vex::timer::systemHighResolution());
 
-    // 根据本轮误差计算输出。
-    // 内部时间单位为 us：i += error * gap_time_us；d = error_change / gap_time_us
+    // 根据本轮误差计算输出。传入时间戳为 us，内部换算为秒后使用：
+    // i += error * gap_time_s；d = error_change / gap_time_s
     // 返回值范围由公开成员 max_output 决定。
     float update(float error, uint32_t current_time_us = vex::timer::systemHighResolution());
 };

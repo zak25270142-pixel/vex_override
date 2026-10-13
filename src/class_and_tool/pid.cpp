@@ -3,8 +3,8 @@
 
 PositionPID::PositionPID(float p, float i, float d, float output_limit)
     : last_time_us(0), kp(p),
-      ki(i / 1000000.0f),
-      kd(d * 1000000.0f),
+      ki(i),
+      kd(d),
       integral(0.0f), previous_error(0.0f),
       max_output(output_limit) {}
 
@@ -28,8 +28,9 @@ float PositionPID::reset(float error, uint32_t current_time_us)
 
 float PositionPID::update(float error, uint32_t current_time_us)
 {
-    // uint32_t 时间戳相减得到两次计算之间经过的微秒数。
+    // uint32_t 时间戳相减得到两次计算之间经过的微秒数，再换算成本轮间隔秒数。
     uint32_t gap_time_us = current_time_us - last_time_us;
+    float gap_time_s = static_cast<float>(gap_time_us) / 1000000.0f;
 
     // pre_error为0时pre_sign保持不变，引入该项主要解出err正好是0时的后续处理
     if (previous_error != 0.0f)
@@ -39,9 +40,9 @@ float PositionPID::update(float error, uint32_t current_time_us)
     if ((error > 0.0f && pre_sign == -1) || (error < 0.0f && pre_sign == 1))
         integral = 0.0f;
 
-    // 统一使用 us：I 项是“误差×us”，D 项是“误差/us”。
-    float candidate_i = integral + error * gap_time_us;
-    float p_add_d = kp * error + kd * (error - previous_error) / gap_time_us;
+    // 统一使用秒：I 项是“误差×秒”，D 项是“误差/秒”。
+    float candidate_i = integral + error * gap_time_s;
+    float p_add_d = kp * error + kd * (error - previous_error) / gap_time_s;
     // 用候选积分计算一次未经限幅的输出，判断电机是否已经达到输出极限。
     float candidate_output = p_add_d + ki * candidate_i;
     /*
