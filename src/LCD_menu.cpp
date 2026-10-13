@@ -35,40 +35,38 @@ const struct MENU_ITEM menu_item[] =
         // ========== 电压映射（速度环归一输出 → 四路实际电压）==========
         // V = 目标方向·(摩擦+volt_min) + out·(volt_max-摩擦-volt_min)·volt_factor
         // 摩擦垫只认目标方向，out 是双极性连续修正，过零不再翻转摩擦电压
-        {"L_vmin0", type_float, &left_motors.volt_min[0], "左0最小电压", "V"},
-        {"L_vmin1", type_float, &left_motors.volt_min[1], "左1最小电压", "V"},
-        {"L_vmin2", type_float, &left_motors.volt_min[2], "左2最小电压", "V"},
-        {"L_vmin3", type_float, &left_motors.volt_min[3], "左3最小电压", "V"},
-        {"R_vmin0", type_float, &right_motors.volt_min[0], "右0最小电压", "V"},
-        {"R_vmin1", type_float, &right_motors.volt_min[1], "右1最小电压", "V"},
-        {"R_vmin2", type_float, &right_motors.volt_min[2], "右2最小电压", "V"},
-        {"R_vmin3", type_float, &right_motors.volt_min[3], "右3最小电压", "V"},
-        {"L_vmax0", type_float, &left_motors.volt_max[0], "左0最大电压", "V"},
-        {"L_vmax1", type_float, &left_motors.volt_max[1], "左1最大电压", "V"},
-        {"L_vmax2", type_float, &left_motors.volt_max[2], "左2最大电压", "V"},
-        {"L_vmax3", type_float, &left_motors.volt_max[3], "左3最大电压", "V"},
-        {"R_vmax0", type_float, &right_motors.volt_max[0], "右0最大电压", "V"},
-        {"R_vmax1", type_float, &right_motors.volt_max[1], "右1最大电压", "V"},
-        {"R_vmax2", type_float, &right_motors.volt_max[2], "右2最大电压", "V"},
-        {"R_vmax3", type_float, &right_motors.volt_max[3], "右3最大电压", "V"},
-        {"L_vf0", type_float, &left_motors.volt_factor[0], "左0电压系数", ""},
-        {"L_vf1", type_float, &left_motors.volt_factor[1], "左1电压系数", ""},
-        {"L_vf2", type_float, &left_motors.volt_factor[2], "左2电压系数", ""},
-        {"L_vf3", type_float, &left_motors.volt_factor[3], "左3电压系数", ""},
-        {"R_vf0", type_float, &right_motors.volt_factor[0], "右0电压系数", ""},
-        {"R_vf1", type_float, &right_motors.volt_factor[1], "右1电压系数", ""},
-        {"R_vf2", type_float, &right_motors.volt_factor[2], "右2电压系数", ""},
-        {"R_vf3", type_float, &right_motors.volt_factor[3], "右3电压系数", ""},
+        {"L_vmin0", type_float, &left_motors.motors[0].volt_min, "左0最小电压", "V"},
+        {"L_vmin1", type_float, &left_motors.motors[1].volt_min, "左1最小电压", "V"},
+        {"L_vmin2", type_float, &left_motors.motors[2].volt_min, "左2最小电压", "V"},
+        {"L_vmin3", type_float, &left_motors.motors[3].volt_min, "左3最小电压", "V"},
+        {"R_vmin0", type_float, &right_motors.motors[0].volt_min, "右0最小电压", "V"},
+        {"R_vmin1", type_float, &right_motors.motors[1].volt_min, "右1最小电压", "V"},
+        {"R_vmin2", type_float, &right_motors.motors[2].volt_min, "右2最小电压", "V"},
+        {"R_vmin3", type_float, &right_motors.motors[3].volt_min, "右3最小电压", "V"},
+        {"L_vmax0", type_float, &left_motors.motors[0].volt_max, "左0最大电压", "V"},
+        {"L_vmax1", type_float, &left_motors.motors[1].volt_max, "左1最大电压", "V"},
+        {"L_vmax2", type_float, &left_motors.motors[2].volt_max, "左2最大电压", "V"},
+        {"L_vmax3", type_float, &left_motors.motors[3].volt_max, "左3最大电压", "V"},
+        {"R_vmax0", type_float, &right_motors.motors[0].volt_max, "右0最大电压", "V"},
+        {"R_vmax1", type_float, &right_motors.motors[1].volt_max, "右1最大电压", "V"},
+        {"R_vmax2", type_float, &right_motors.motors[2].volt_max, "右2最大电压", "V"},
+        {"R_vmax3", type_float, &right_motors.motors[3].volt_max, "右3最大电压", "V"},
+        {"L_vf0", type_float, &left_motors.motors[0].volt_factor, "左0电压系数", ""},
+        {"L_vf1", type_float, &left_motors.motors[1].volt_factor, "左1电压系数", ""},
+        {"L_vf2", type_float, &left_motors.motors[2].volt_factor, "左2电压系数", ""},
+        {"L_vf3", type_float, &left_motors.motors[3].volt_factor, "左3电压系数", ""},
+        {"R_vf0", type_float, &right_motors.motors[0].volt_factor, "右0电压系数", ""},
+        {"R_vf1", type_float, &right_motors.motors[1].volt_factor, "右1电压系数", ""},
+        {"R_vf2", type_float, &right_motors.motors[2].volt_factor, "右2电压系数", ""},
+        {"R_vf3", type_float, &right_motors.motors[3].volt_factor, "右3电压系数", ""},
         {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
         {"L_iSlew", type_float, &left_motors.i_slew, "左I速率", "out/s"},
         {"R_iSlew", type_float, &right_motors.i_slew, "右I速率", "out/s"},
         {"L_slewB", type_float, &left_motors.slew_boost, "左提速斜率", "V/s"},
         {"R_slewB", type_float, &right_motors.slew_boost, "右提速斜率", "V/s"},
-        {"L_errImin", type_float, &left_motors.error_for_i_min, "左I误差下限", "pct"},
-        {"R_errImin", type_float, &right_motors.error_for_i_min, "右I误差下限", "pct"},
-        {"L_errIratio", type_float, &left_motors.error_for_i_ratio, "左I误差比例", ""},
-        {"R_errIratio", type_float, &right_motors.error_for_i_ratio, "右I误差比例", ""},
+        {"L_errI", type_float, &left_motors.error_for_i, "左I误差阈值", "pct"},
+        {"R_errI", type_float, &right_motors.error_for_i, "右I误差阈值", "pct"},
 
         // // ========== 位置环 ==========
         // {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp", ""},
@@ -121,14 +119,14 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"trk_side", type_float, &chassis.side_tracking_distance, "侧向轮里程", "m", monitor_tag_slow},
 
         // 指令电压：有稳定地址，内存项即可（无需 getter）
-        {"L0_Vcmd", type_float, &left_motors.volt_output[0], "左0指令电压", "V", monitor_tag_fast},
-        {"R0_Vcmd", type_float, &right_motors.volt_output[0], "右0指令电压", "V", monitor_tag_fast},
-        {"L1_Vcmd", type_float, &left_motors.volt_output[1], "左1指令电压", "V", monitor_tag_slow},
-        {"R1_Vcmd", type_float, &right_motors.volt_output[1], "右1指令电压", "V", monitor_tag_slow},
-        {"L2_Vcmd", type_float, &left_motors.volt_output[2], "左2指令电压", "V", monitor_tag_slow},
-        {"R2_Vcmd", type_float, &right_motors.volt_output[2], "右2指令电压", "V", monitor_tag_slow},
-        {"L3_Vcmd", type_float, &left_motors.volt_output[3], "左3指令电压", "V", monitor_tag_slow},
-        {"R3_Vcmd", type_float, &right_motors.volt_output[3], "右3指令电压", "V", monitor_tag_slow},
+        {"L0_Vcmd", type_float, &left_motors.motors[0].volt_output, "左0指令电压", "V", monitor_tag_fast},
+        {"R0_Vcmd", type_float, &right_motors.motors[0].volt_output, "右0指令电压", "V", monitor_tag_fast},
+        {"L1_Vcmd", type_float, &left_motors.motors[1].volt_output, "左1指令电压", "V", monitor_tag_slow},
+        {"R1_Vcmd", type_float, &right_motors.motors[1].volt_output, "右1指令电压", "V", monitor_tag_slow},
+        {"L2_Vcmd", type_float, &left_motors.motors[2].volt_output, "左2指令电压", "V", monitor_tag_slow},
+        {"R2_Vcmd", type_float, &right_motors.motors[2].volt_output, "右2指令电压", "V", monitor_tag_slow},
+        {"L3_Vcmd", type_float, &left_motors.motors[3].volt_output, "左3指令电压", "V", monitor_tag_slow},
+        {"R3_Vcmd", type_float, &right_motors.motors[3].volt_output, "右3指令电压", "V", monitor_tag_slow},
 
         // 指令转速：速度环目标，内存项直接读（与 L0/R0_rpm 对照即跟踪误差）
         {"L_tgt", type_float, &left_motors.target, "左指令转速", "pct", monitor_tag_fast},
@@ -150,55 +148,55 @@ static struct MENU_ITEM monitor_menu_item[] =
 
         // 实际电压：SDK 回读，与指令电压 Vcmd 对照（差距大说明被限幅/堵转）
         {"L0_Vact", []
-         { return static_cast<float>(left_motors.motors[0]->voltage(vex::voltageUnits::volt)); }, "左0实际电压", "V", monitor_tag_fast},
+         { return static_cast<float>(left_motors.motors[0].motor->voltage(vex::voltageUnits::volt)); }, "左0实际电压", "V", monitor_tag_fast},
         {"R0_Vact", []
-         { return static_cast<float>(right_motors.motors[0]->voltage(vex::voltageUnits::volt)); }, "右0实际电压", "V", monitor_tag_fast},
+         { return static_cast<float>(right_motors.motors[0].motor->voltage(vex::voltageUnits::volt)); }, "右0实际电压", "V", monitor_tag_fast},
         {"L1_Vact", []
-         { return static_cast<float>(left_motors.motors[1]->voltage(vex::voltageUnits::volt)); }, "左1实际电压", "V", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[1].motor->voltage(vex::voltageUnits::volt)); }, "左1实际电压", "V", monitor_tag_slow},
         {"R1_Vact", []
-         { return static_cast<float>(right_motors.motors[1]->voltage(vex::voltageUnits::volt)); }, "右1实际电压", "V", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[1].motor->voltage(vex::voltageUnits::volt)); }, "右1实际电压", "V", monitor_tag_slow},
         {"L2_Vact", []
-         { return static_cast<float>(left_motors.motors[2]->voltage(vex::voltageUnits::volt)); }, "左2实际电压", "V", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[2].motor->voltage(vex::voltageUnits::volt)); }, "左2实际电压", "V", monitor_tag_slow},
         {"R2_Vact", []
-         { return static_cast<float>(right_motors.motors[2]->voltage(vex::voltageUnits::volt)); }, "右2实际电压", "V", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[2].motor->voltage(vex::voltageUnits::volt)); }, "右2实际电压", "V", monitor_tag_slow},
         {"L3_Vact", []
-         { return static_cast<float>(left_motors.motors[3]->voltage(vex::voltageUnits::volt)); }, "左3实际电压", "V", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[3].motor->voltage(vex::voltageUnits::volt)); }, "左3实际电压", "V", monitor_tag_slow},
         {"R3_Vact", []
-         { return static_cast<float>(right_motors.motors[3]->voltage(vex::voltageUnits::volt)); }, "右3实际电压", "V", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[3].motor->voltage(vex::voltageUnits::volt)); }, "右3实际电压", "V", monitor_tag_slow},
 
         {"L0_I", []
-         { return static_cast<float>(left_motors.motors[0]->current(vex::currentUnits::amp)); }, "左0电流", "A", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[0].motor->current(vex::currentUnits::amp)); }, "左0电流", "A", monitor_tag_slow},
         {"L0_pct", []
-         { return static_cast<float>(left_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "左0转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[0].motor->velocity(vex::velocityUnits::pct)); }, "左0转速", "pct", monitor_tag_slow},
         {"L1_I", []
-         { return static_cast<float>(left_motors.motors[1]->current(vex::currentUnits::amp)); }, "左1电流", "A", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[1].motor->current(vex::currentUnits::amp)); }, "左1电流", "A", monitor_tag_slow},
         {"L1_pct", []
-         { return static_cast<float>(left_motors.motors[1]->velocity(vex::velocityUnits::pct)); }, "左1转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[1].motor->velocity(vex::velocityUnits::pct)); }, "左1转速", "pct", monitor_tag_slow},
         {"L2_I", []
-         { return static_cast<float>(left_motors.motors[2]->current(vex::currentUnits::amp)); }, "左2电流", "A", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[2].motor->current(vex::currentUnits::amp)); }, "左2电流", "A", monitor_tag_slow},
         {"L2_pct", []
-         { return static_cast<float>(left_motors.motors[2]->velocity(vex::velocityUnits::pct)); }, "左2转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[2].motor->velocity(vex::velocityUnits::pct)); }, "左2转速", "pct", monitor_tag_slow},
         {"L3_I", []
-         { return static_cast<float>(left_motors.motors[3]->current(vex::currentUnits::amp)); }, "左3电流", "A", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[3].motor->current(vex::currentUnits::amp)); }, "左3电流", "A", monitor_tag_slow},
         {"L3_pct", []
-         { return static_cast<float>(left_motors.motors[3]->velocity(vex::velocityUnits::pct)); }, "左3转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(left_motors.motors[3].motor->velocity(vex::velocityUnits::pct)); }, "左3转速", "pct", monitor_tag_slow},
 
         {"R0_I", []
-         { return static_cast<float>(right_motors.motors[0]->current(vex::currentUnits::amp)); }, "右0电流", "A", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[0].motor->current(vex::currentUnits::amp)); }, "右0电流", "A", monitor_tag_slow},
         {"R0_pct", []
-         { return static_cast<float>(right_motors.motors[0]->velocity(vex::velocityUnits::pct)); }, "右0转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[0].motor->velocity(vex::velocityUnits::pct)); }, "右0转速", "pct", monitor_tag_slow},
         {"R1_I", []
-         { return static_cast<float>(right_motors.motors[1]->current(vex::currentUnits::amp)); }, "右1电流", "A", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[1].motor->current(vex::currentUnits::amp)); }, "右1电流", "A", monitor_tag_slow},
         {"R1_pct", []
-         { return static_cast<float>(right_motors.motors[1]->velocity(vex::velocityUnits::pct)); }, "右1转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[1].motor->velocity(vex::velocityUnits::pct)); }, "右1转速", "pct", monitor_tag_slow},
         {"R2_I", []
-         { return static_cast<float>(right_motors.motors[2]->current(vex::currentUnits::amp)); }, "右2电流", "A", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[2].motor->current(vex::currentUnits::amp)); }, "右2电流", "A", monitor_tag_slow},
         {"R2_pct", []
-         { return static_cast<float>(right_motors.motors[2]->velocity(vex::velocityUnits::pct)); }, "右2转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[2].motor->velocity(vex::velocityUnits::pct)); }, "右2转速", "pct", monitor_tag_slow},
         {"R3_I", []
-         { return static_cast<float>(right_motors.motors[3]->current(vex::currentUnits::amp)); }, "右3电流", "A", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[3].motor->current(vex::currentUnits::amp)); }, "右3电流", "A", monitor_tag_slow},
         {"R3_pct", []
-         { return static_cast<float>(right_motors.motors[3]->velocity(vex::velocityUnits::pct)); }, "右3转速", "pct", monitor_tag_slow},
+         { return static_cast<float>(right_motors.motors[3].motor->velocity(vex::velocityUnits::pct)); }, "右3转速", "pct", monitor_tag_slow},
 
         // 手柄（手动/Arcade 对照）。now_x/now_y 是稳定地址，value环形槽会轮转不能直接取地址。
         {"axis_Lx", type_int32_t, &left_axis.now_x, "左杆X", nullptr, monitor_tag_slow},

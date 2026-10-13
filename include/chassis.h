@@ -5,6 +5,24 @@
 
 // 里程计读数只取motor1
 // MotorGroup 里的电机都用齿轮串连传动，物理等速
+
+// 单台电机的个体属性：一台电机实例 + 逐台标定的电压参数 + 上一拍输出电压。
+// 电机组按数组元素逐台读写这几个属性，外界（LCD调参/监控）也直接取其字段地址。
+// 无默认初值：作为聚合体由调用方（robot_and_control.cpp）逐台显式填好（gnu++11 要求）。
+struct MyMotor
+{
+    vex::motor *motor; // 电机实例指针（vex::motor 不可拷贝，只能持指针）
+    // 电压缩放因子：让组内各电机同指令下输出的轮速一致。
+    // 各台斜率 k(pct/V) 有个体差异，且经齿轮传动的电机轮速 = 轴速/r，
+    // 等效轮速斜率 = k/r（r=1直连 / 1.25齿轮）。只能削峰填谷——以全局最慢
+    // 等效轮速为基准，factor = k_min_等效 / (k_i/r_i)，全部 ≤1，
+    // 组内输出上限 1/max(factor) 才不损失极速。
+    float volt_factor;
+    float volt_max;    // 最大电压
+    float volt_min;    // 最小电压（个体死区补偿，对齐各电机开始转动的起点）
+    float volt_output; // 目标输出电压
+};
+
 class MyMotorGroup
 {
 private:
@@ -28,22 +46,11 @@ public:
 
     SpinState spin_state = Stopped;
 
-    // 绑定构造传入的四台电机（public：监控 getter 模板直接调 motors[i] 的 SDK 读数）
-    vex::motor *motors[4];
-
-    // 电压缩放因子：让组内四台电机同指令下输出的轮速一致。
-    // 各台斜率 k(pct/V) 有个体差异，且 motor2/3(48齿)经齿轮后轮速 = 轴速/1.2，
-    // 等效轮速斜率 = k/r（r=1直连 / 1.25齿轮）。只能削峰填谷——以全局最慢
-    // 等效轮速为基准，factor = k_min_等效 / (k_i/r_i)，全部 ≤1，
-    // 组内输出上限 1/max(factor) 才不损失极速。
-    // 实测值随左右组不同由构造参数传入（见 robot_and_control.cpp）。
-    float volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    // 电压限幅与映射
-    float volt_max[4] = {12.0f, 12.0f, 12.0f, 12.0f}; // 最大电压(实测，空载时)
-    // 每台电机的个体死区补偿：用来对齐各轮开始转动的起点;取值 = 该电机空载时稳定低速运转所需的最低电压(通常在0.5V左右)
-    float volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
-    // 上一轮的输出电压(单位V)，和实际比较如果没达到可能就是被限了，会影响限幅
-    float volt_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // 组内电机属性表：构造时从入参拷入，容量上限 4
+    // public：监控 getter 直接取各台字段做 SDK 读数。实际台数见 motor_count。
+    MyMotor motors[4];
+    uint8_t motor_count;
+    // 电机组始终以 motors[0]（与轮轴直连的那台）的速度作为本组反馈。
 
     // 摩擦补偿曲线两端：target=0 时用 static，target增大后用 dynamic。
     // 中间连续过渡（target 每增大 3pct，静态→动态多衰减约 63%），全程无跳变。
@@ -67,10 +74,9 @@ public:
     // 例如 0.1 表示速度变化率 < max(|speed|, target_min_current) 的 10% 每秒。
     float speed_stable_ratio = 0.1f;
 
-    // I 项工作范围（稳定态误差阈值）：max(error_for_i_min, error_for_i_ratio·|target|)，单位 pct。
-    // 做成相对量，低速目标（3/5pct）也能进稳定态。
-    float error_for_i_min = 3.0f;
-    float error_for_i_ratio = 0.2f;
+    // I 项工作范围（误差阈值）：|error| 落在它以内算小误差——I 才开始工作、Transit 才可进 Track。单位 pct。
+    // 固定值即可：I 的波动幅度天生与 error 同量纲、与 target 无关，稳定态抖动靠调小 ki 抑制。
+    float error_for_i = 2.5f;
 
     // I 项贡献的步长限幅
     float i_slew = 5.0f; // 5.0代表每次 ki* error 时 error只计算 不超过 5.0的部分
@@ -92,13 +98,14 @@ public:
     float pre_a = 0.0f;          // 上一次的加速度
 
     uint32_t last_time_us = 0; // 上一轮 update() 使用的 VEX 系统微秒时间戳。
-    // 新进入 Transit 的前两拍只观察加速度，避免起步第一拍速度仍为 0 时直接误进 Track。
-    uint8_t transit_ticks = 0;
+    // ---- Transit 起步观察窗 ----
+    // 新进入 Transit 后先冻结这么久（窗内只采样加速度），避免起步第一拍速度仍为 0 时直接误进 Track。
+    uint32_t transit_freeze_us = 20000; // 冻结时长，单位 us（约合 10ms 周期的两拍）
+    uint32_t transit_start_us = 0;      // 进入 Transit 的时刻，单位 us
 
-    MyMotorGroup(vex::motor &m1, vex::motor &m2,
-                 vex::motor &m3, vex::motor &m4,
-                 float f, float p, float ki, float kd,
-                 const float vf[4], const float vmin[4]);
+    // motor_list/count 为本组电机表（构造时拷入，上限 4）；后四个为速度环增益。
+    MyMotorGroup(const MyMotor *motor_list, uint8_t count,
+                 float f, float p, float ki, float kd);
 
     void setStopping(vex::brakeType brake); // 设置电机刹车类型
 

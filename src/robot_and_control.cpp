@@ -19,13 +19,22 @@ static vex::motor right_chassis_4(vex::PORT19, vex::ratio6_1, true);
 // ki(输出/(pct·秒))、kd(输出·秒/pct)。
 // 当前为接通链路用的占位值，两组相同，必须在实车上重新标定后再用于比赛。
 
-// volt_factor / volt_min 是逐台电机的空载标定值：前者让同一指令下各轮轮速一致，
-// 后者对齐各轮开始转动的最低电压。原数值是旧车的实测结果，对本车无意义，已重置为
-// 默认（factor 全 1、min 全 0.5V），上车后必须逐台重新标定再用于比赛。
-static const float left_volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-static const float right_volt_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-static const float left_volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
-static const float right_volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+// 逐台电机的个体属性（构造种子，组内会拷走一份）：volt_factor 让同一指令下各轮轮速
+// 一致，volt_min 对齐各轮开始转动的最低电压，volt_max 为该电机可达最高电压（V）。
+// 原数值是旧车的实测结果，对本车无意义，已重置为默认（factor 全 1、max 12V、min 0.5V），
+// 上车后必须逐台重新标定再用于比赛。组内速度环始终以 [0] 号电机（与轮轴直连）的速度为反馈。
+static const MyMotor left_motor_list[4] = {
+    {&left_chassis_1, 1.0f, 12.0f, 0.5f, 0.0f},
+    {&left_chassis_2, 1.0f, 12.0f, 0.5f, 0.0f},
+    {&left_chassis_3, 1.0f, 12.0f, 0.5f, 0.0f},
+    {&left_chassis_4, 1.0f, 12.0f, 0.5f, 0.0f},
+};
+static const MyMotor right_motor_list[4] = {
+    {&right_chassis_1, 1.0f, 12.0f, 0.5f, 0.0f},
+    {&right_chassis_2, 1.0f, 12.0f, 0.5f, 0.0f},
+    {&right_chassis_3, 1.0f, 12.0f, 0.5f, 0.0f},
+    {&right_chassis_4, 1.0f, 12.0f, 0.5f, 0.0f},
+};
 
 // 速度环默认增益（连续摩擦补偿+斜率限制架构下标定）：
 // kf=0.006 前馈按开环 V(tgt)≈1.15+0.065·pct 反推斜率；
@@ -36,11 +45,11 @@ static const float right_volt_min[4] = {0.5f, 0.5f, 0.5f, 0.5f};
 // 我发现他电压经常容易达不到(应该是达到最大功率什么的了),但电压改小了他会变得更小，然后就一直达不到，不知道怎么解决
 // 我感觉我可能，写程序写上位机可以，但调车与最底层的运动逻辑真不行？
 MyMotorGroup left_motors(
-    left_chassis_1, left_chassis_2, left_chassis_3, left_chassis_4,
-    0.01f, 0.006f, 0.08f, 0.0f, left_volt_factor, left_volt_min);
+    left_motor_list, 4,
+    0.01f, 0.006f, 0.08f, 0.0f);
 MyMotorGroup right_motors(
-    right_chassis_1, right_chassis_2, right_chassis_3, right_chassis_4,
-    0.01f, 0.006f, 0.08f, 0.0f, right_volt_factor, right_volt_min);
+    right_motor_list, 4,
+    0.01f, 0.006f, 0.08f, 0.0f);
 
 // 定位轮端口与转向取自旧车工程：PORT1 为前向轮（旧工程 RotationY），
 // PORT2 为侧向轮（旧工程 RotationX），均反转。首次试车需核对滚动方向：
@@ -110,9 +119,9 @@ static void cmd_set_volt(const uint8_t *p)
     memcpy(&id, p, sizeof(id));
     memcpy(&volts, p + sizeof(id), sizeof(volts));
     if (id < 4)
-        left_motors.motors[id]->spin(vex::directionType::fwd, volts, vex::voltageUnits::volt);
+        left_motors.motors[id].motor->spin(vex::directionType::fwd, volts, vex::voltageUnits::volt);
     else if (id < 8)
-        right_motors.motors[id - 4]->spin(vex::directionType::fwd, volts, vex::voltageUnits::volt);
+        right_motors.motors[id - 4].motor->spin(vex::directionType::fwd, volts, vex::voltageUnits::volt);
 }
 
 static void cmd_set_spin(const uint8_t *p)
@@ -153,14 +162,13 @@ static const VALUE_TYPE cmd_ui8_f_type[] = {type_uint8_t, type_float};
 // tag末位由cmd_tag_make拼出：bit6~4参数个数（上限7）；停车命令特化位=1。
 // 带取值范围的命令：ranges填非空数组（每字段一对{min,max}，顺序同字段表）即可，
 // 目录发送时自动按它置位tag bit7并追加min/max，tag里不用手填范围位。
-static const float range_turn[] = {-360, 360};                  // 原地转向：角度
-static const float range_move[] = {-10, 10};                    // 直行：距离
-static const float range_goto[] = {-10, 10, -10, 10, -360, 360}; // 局部移动：x、y、航向
-static const float range_volt[] = {0, 7, 0, 12};                // 电机电压：编号、电压
-static const float range_spin[] = {-100, 100, -100, 100};       // 底盘目标速度：左、右
+static const float range_move[] = {-5, 5};                           // 直行：距离
+static const float range_goto[] = {-3.6, 3.6, -3.6, 3.6, -360, 360}; // 局部移动：x、y、航向
+static const float range_volt[] = {0, 7, 0, 12};                     // 电机电压：编号、电压
+static const float range_spin[] = {-100, 100, -100, 100};            // 底盘目标速度：左、右
 const CMD_ITEM robot_cmds[] = {
     {cmd_stop, nullptr, nullptr, "停止运动", cmd_tag_make(0, CMD_SPEC_STOP), nullptr},
-    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, "原地转向", cmd_tag_make(1, CMD_SPEC_NORMAL), range_turn},
+    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, "原地转向", cmd_tag_make(1, CMD_SPEC_NORMAL), nullptr},
     {cmd_move, cmd_f_type, (const char *[]){"距离(米)"}, "直行", cmd_tag_make(1, CMD_SPEC_NORMAL), range_move},
     {cmd_goto, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, "局部移动", cmd_tag_make(3, CMD_SPEC_NORMAL), range_goto},
     {cmd_set_volt, cmd_ui8_f_type, (const char *[]){"编号(0-3左1-4,4-7右1-4)", "电压(伏)"}, "设置电机电压", cmd_tag_make(2, CMD_SPEC_NORMAL), range_volt},
