@@ -61,8 +61,6 @@ const struct MENU_ITEM menu_item[] =
         {"R_vf3", type_float, &right_motors.motors[3].volt_factor, "右3电压系数", ""},
         {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
-        {"L_iSlew", type_float, &left_motors.i_slew, "左I速率", "out/s"},
-        {"R_iSlew", type_float, &right_motors.i_slew, "右I速率", "out/s"},
         {"L_slewB", type_float, &left_motors.slew_boost, "左提速斜率", "V/s"},
         {"R_slewB", type_float, &right_motors.slew_boost, "右提速斜率", "V/s"},
         {"L_errI", type_float, &left_motors.error_for_i, "左I误差阈值", "pct"},

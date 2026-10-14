@@ -67,7 +67,7 @@ void MyMotorGroup::my_spin()
 
     last_time_us = now_us;
 
-    // 直接读 SDK 速度，不做滤波
+    // 直接读速度，不重复做滤波
     const float speed = static_cast<float>(motors[0].motor->velocity(vex::velocityUnits::pct));
 
     // 目标速为0：输出0V惰行。(在drive中归一)
@@ -86,42 +86,26 @@ void MyMotorGroup::my_spin()
 
     // ---------- 状态判定 ----------
     const float error = target - speed;
+    const float fabs_error = fabsf(error);
+    const float derivative = (error - previous_error) / dt_s;
     const float now_a = (speed - pre_v) / dt_s;
-    const bool error_small = fabsf(error) <= error_for_i;
-    const bool acceleration_small = fabsf(now_a) <= speed_stable && fabsf(pre_a) <= speed_stable;
-    const float error_change = error - previous_error;
-    // target 未大跳而误差仍向自身方向增大，才认为是负载变化或实际跟不上。
-    const bool need_recover = fabsf(error) > error_for_i && error * error_change > 0.0f;
 
-    if (spin_state == Transit)
-    {
-        // 冻结窗内只采样，避免刚起步速度未变化、加速度为 0 而提前进入 Track。
-        // 若确实推不动，冻结窗结束后的低加速度会放开 I，避免一直卡在 Transit。
-        if (error_small || (now_us - transit_start_us >= transit_freeze_us && acceleration_small))
-            spin_state = Track;
-    }
-    else if ((spin_state == Track || spin_state == Stable) && need_recover)
-    {
-        spin_state = Recover;
-    }
-    else if (spin_state == Track && fabsf(error) <= err_dead && acceleration_small)
-    {
-        spin_state = Stable;
-    }
-    else if (spin_state == Stable && (fabsf(error) > err_dead || !acceleration_small))
-    {
+    // Recover（堵转）判据：
+    //   进入：误差大、仍在被拉大，且加速度与误差反向（负荷突增/被顶住）。
+    //   退出：电压从顶满回落即脱离堵转（高 target 时速度回升、低 target 时电压被 P 压回）。
+    if (spin_state == Transit && (fabs_error <= error_for_i || (now_us - transit_start_us >= transit_freeze_us && fabsf(now_a) <= speed_stable && fabsf(pre_a) <= speed_stable)))
         spin_state = Track;
-    }
-    else if (spin_state == Recover && !need_recover)
-    {
-        spin_state = (fabsf(error) <= err_dead && acceleration_small) ? Stable : Track;
-    }
+    else if ((error > error_for_i && derivative > 0.0f && now_a < 0.0f || error < -error_for_i && derivative < 0.0f && now_a > 0.0f))
+        spin_state = Recover;
+    else if (spin_state == Track && fabs_error <= err_in_dead)
+        spin_state = Stable;
+    else if (spin_state == Stable && fabs_error > err_out_dead)
+        spin_state = Track;
 
     // ---------- 连续摩擦补偿 ----------
     const float friction = dynamic_deadzone + (static_deadzone - dynamic_deadzone) * expf(-fabs_target / 3.0f);
 
     // ---------- PID ----------
-    const float derivative = (error - previous_error) / dt_s;
     const float p_output = kp * error;
     const float d_output = kd * derivative;
     const float feedforward = kf * target;
@@ -129,18 +113,9 @@ void MyMotorGroup::my_spin()
     // ---------- I 项：Transit 不工作；Stable 只缩小新增积分，避免已有 I 输出跳变 ---------
     if (spin_state != Transit)
     {
-        float delta;
-        // 仅在同向增加积分（加速充能）时限制步长；反向退积分（泄能）时放开限制
-        if (integral >= 0.0f && error > i_slew)
-            delta = i_slew * dt_s;
-        else if (integral <= 0.0f && error < -i_slew)
-            delta = -i_slew * dt_s;
-        else
-            delta = error * dt_s;
-
+        float delta = error * dt_s;
         if (spin_state == Stable)
             delta *= i_stable_k;
-
         // 方向性抗饱和：候选输出在误差想推的方向被归一硬限顶住，本拍就不积；
         const float candidate_output = feedforward + p_output + ki * (integral + delta) + d_output;
         if ((candidate_output <= 1.0f || error <= 0.0f) && (candidate_output >= -1.0f || error >= 0.0f))
@@ -148,8 +123,11 @@ void MyMotorGroup::my_spin()
             integral += delta;
         }
     }
-
     float output = feedforward + p_output + ki * integral + d_output;
+
+    if (spin_state == Recover && fabs_error <= error_for_i && fabsf(output) < 1) // 误差小且输出没拉满
+        spin_state = Track;
+
     if (output > 1)
         output = 1;
     else if (output < -1)
@@ -189,20 +167,19 @@ void MyMotorGroup::drive(float target)
         target = 0.0f;
         fabs_target = 0.0f;
     }
-    // 进入 Transit 的三种情形都刷新冻结窗起点，故这里统一取一次时间。
     const uint32_t now_us = get_time_us();
-    // 运行中再次调用只改目标，不清任何环内状态。
     if (spin_state == Stopped)
     {
         last_time_us = now_us;
         transit_start_us = now_us;
         spin_state = Transit;
     }
-    // 清积分、进提速态，避免旧方向积分带着车冲过零点。
+    // 换向：正常态清积分并进提速态，避免旧方向积分带着车冲过零点。
+    // 但堵转(Recover)下保留积分、不进 Transit——让电压随目标过零平滑释放，不被瞬间推爆。
     const int8_t new_target_sign = target > 0.0f ? 1 : (target < 0.0f ? -1 : 0);
     if (new_target_sign != 0)
     {
-        if (target_sign != 0 && new_target_sign != target_sign)
+        if (target_sign != 0 && new_target_sign != target_sign && spin_state != Recover)
         {
             integral = 0.0f;
             transit_start_us = now_us;
@@ -212,9 +189,8 @@ void MyMotorGroup::drive(float target)
     }
     // else target_sign保留符号
 
-    // target 相对跳变：进入 Transit。
-    const float target_scale = fmaxf(fabs_target, target_min_current);
-    if (fabsf(target - this->target) > target_scale * target_jump_ratio)
+    // target 变化超过固定阈值：进入 Transit（堵转期间粘住，不打断 Recover）。
+    if (spin_state != Recover && fabsf(target - this->target) > target_jump_abs)
     {
         transit_start_us = now_us;
         spin_state = Transit;

@@ -34,14 +34,17 @@ public:
         Track,   // 正常跟踪：I 工作                               特征:error(较)小或加速度(较)小
         Stable,  // 目标稳定：I 大砍,尽量保持稳定                    特征:error小且加速度小
         Recover  // 目标未大跳，但 error 被拉大：负载或跟不上，I 工作  特征:error大且加速度小->突然大->小(经常会推到100%电压)
+        // 进入:error大且仍在拉大、加速度与error反向; 堵转中换向不清积分、不限电压斜率，电压随目标过零慢释放
+        // 堵转：负载顶住，电压顶满(≈100%)对抗，I 工作
+        // 退出:电压从顶满回落(负载松开)
+
         // other -> Stopped 仅手动停车 (0pct target不算Stopped)
         // Stop -> Transit  启动
         // Transit -> Track  error小到一定程度 或加速度小到一定程度(加速度小了还没进入小error区间说明缺I不够，得加上I进行追踪)
         // Track -> Stable  在不断追踪后error小且加速度小(说明稳定了,砍kI减小震荡)
         // Other -> Transit  targrt突变，需先等kf释放完
-        // Track/Stable -> Recover  负载突变导致转速突变导致error(不符合预期地)突变,需要P和I回馈补偿
-        // Track 与 Recover似乎有点模糊
-        // 加速度不能丢，加速度是非常重要的判断依据
+        // Track/Stable -> Recover  负荷突增/被顶:error大且仍在拉大、加速度与error反向
+        // Recover -> Track/Stable   ？？
     };
 
     SpinState spin_state = Stopped;
@@ -58,28 +61,20 @@ public:
     float dynamic_deadzone = 0.8f; // 高速时补偿电压下限(整车下,单位V)
     float output_deadzone = 0.5f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
 
-    // ---- target突变进入 Transit 状态的判态参数 ----
-    // target 跳变判定：相对变化超过此比例算大幅，强制进入提速态若干拍。
-    // 例如 0.5 表示 target 变化量超过 max(|target|, target_min_current) * 0.5 即触发。
-    float target_jump_ratio = 0.5f;
-    // 小 target 时基准被该值兜底，避免 1→2 这种绝对值小但比例大的误触发。
-    float target_min_current = 5.0f;
+    // ---- target 突变进入 Transit 状态的判态参数 ----
+    // target 变化量超过该固定阈值即视为大幅跳变，强制进入提速态（清积分、重新观察）。
+    // 用固定值：各速度段行为一致，不会出现低速敏感、高速迟钝的割裂感。单位 pct。
+    float target_jump_abs = 12.0f;
     // ---- 稳定态判态参数 ----
     float speed_stable = 50.0f; // Transit->Track加速度阈值，单位 pct/s方
-    float err_dead = 1.0f;      // Track->Stable 误差死区，进入该范围内后，I 大砍，减少震荡
+    float err_in_dead = 2.0f;   // Track->Stable 误差死区，进入该范围内后，I 大砍，减少震荡
+    float err_out_dead = 3.0f;  // Stable->Track  误差死区，退出该范围内后，I 大砍，减少震荡
 
     float i_stable_k = 0.5f; // Stable模式下 I项系数为原先多少
 
-    // 速度稳定判定：速度变化率（pct/s）相对当前速度低于此比例，认为速度已稳定。
-    // 例如 0.1 表示速度变化率 < max(|speed|, target_min_current) 的 10% 每秒。
-    float speed_stable_ratio = 0.1f;
-
     // I 项工作范围（误差阈值）：|error| 落在它以内算小误差——I 才开始工作、Transit 才可进 Track。单位 pct。
     // 固定值即可：I 的波动幅度天生与 error 同量纲、与 target 无关，稳定态抖动靠调小 ki 抑制。
-    float error_for_i = 2.5f;
-
-    // I 项贡献的步长限幅
-    float i_slew = 5.0f; // 5.0代表每次 ki* error 时 error只计算 不超过 5.0的部分
+    float error_for_i = 8.0f;
 
     // 提速态电压斜率上限：比稳定态宽，让电压快速跟上目标跳变，
     float slew_boost = 25.0f; // V/s
