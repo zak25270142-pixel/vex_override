@@ -134,7 +134,7 @@ interface MockCmd {
   tag: number
   name: string
   fields: { type: ValueType; name: string }[]
-  /** tag bit7=1 时下发的取值范围数组[min1,max1,...]，与字段顺序配对 */
+  /** tag bit7=1 时下发的取值范围 [min1,max1,min2,max2,...]，与字段顺序配对、类型随字段 */
   ranges?: number[]
 }
 
@@ -146,22 +146,32 @@ const mockCommands: MockCmd[] = [
     { type: ValueType.Float, name: 'x前(米)' },
     { type: ValueType.Float, name: 'y右(米)' },
     { type: ValueType.Float, name: '航向(度)' },
-  ], ranges: [-10, -10, -10, 10, -360, 360] },
+  ], ranges: [-10, 10, -10, 10, -360, 360] },
+  // 字段异型的例子：编号是 uint8_t、电压是 float，min/max 各自按字段类型定宽
+  { index: 0x84, tag: (2 << CMD_TAG_ARGC_SHIFT) | CMD_TAG_RANGE, name: '设置电机电压', fields: [
+    { type: ValueType.UInt8, name: '编号(0-7)' },
+    { type: ValueType.Float, name: '电压(伏)' },
+  ], ranges: [0, 7, 0, 12] },
 ]
 
-/** 拼动作命令目录帧：[命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×参数量] */
+/** 拼动作命令目录帧：[内容长度2B][命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×N] */
 function cmdDirectoryFrame(c: MockCmd): Uint8Array {
   const enc = new TextEncoder()
-  const payload: number[] = [c.index, c.tag]
+  const body: number[] = [c.index, c.tag]
   const nameBytes = [...enc.encode(c.name)]
-  payload.push(nameBytes.length, ...nameBytes, c.fields.length)
+  body.push(nameBytes.length, ...nameBytes, c.fields.length)
   for (const f of c.fields) {
     const fb = [...enc.encode(f.name)]
-    payload.push(f.type, fb.length, ...fb)
+    body.push(f.type, fb.length, ...fb)
   }
-  // tag bit7=1：字段后跟每字段一对min/max（float小端各4B）
+  // tag bit7=1：每字段一对 min/max，宽度与类型随该字段（不再一律 float 4B）
   if (c.tag & CMD_TAG_RANGE)
-    for (const v of c.ranges ?? []) appendValue(payload, ValueType.Float, v)
+    c.fields.forEach((f, i) => {
+      appendValue(body, f.type, c.ranges![2 * i]!)
+      appendValue(body, f.type, c.ranges![2 * i + 1]!)
+    })
+  // payload 头 2B = 后续内容长度（小端）
+  const payload = [body.length & 0xff, (body.length >> 8) & 0xff, ...body]
   return frame(CmdPost.CMDDirectory, payload)
 }
 
@@ -203,6 +213,9 @@ export class MockTransport implements SerialTransport {
   private slowTimer: ReturnType<typeof setInterval> | null = null
   private slowPhase = 0
   private monitorOn = false
+  // 一次性推送（emit/命令目录）用 setTimeout 异步抛；disconnect 时必须清掉，
+  // 否则切回真串口/演示 off 后，残留回调仍会把帧喂给刚连上的 FrameParser，污染 store
+  private pendingTimers = new Set<ReturnType<typeof setTimeout>>()
 
   constructor(private cb: TransportCallbacks) {}
 
@@ -227,6 +240,9 @@ export class MockTransport implements SerialTransport {
   async disconnect(): Promise<void> {
     this.stopTimers()
     this.monitorOn = false
+    // 一次性推送还排着没触发：清掉，否则残留帧会在切到真串口后污染 store
+    for (const id of this.pendingTimers) clearTimeout(id)
+    this.pendingTimers.clear()
   }
 
   /** 模拟下位机收到下发命令 */
@@ -260,7 +276,11 @@ export class MockTransport implements SerialTransport {
     } else if (cmd === CmdGet.RequestCommand) {
       // 命令目录：一条命令一帧，分两拍发，模拟真机分批轮转
       mockCommands.forEach((c, i) => {
-        setTimeout(() => this.cb.onData(cmdDirectoryFrame(c)), i * 10)
+        const id = setTimeout(() => {
+          this.pendingTimers.delete(id)
+          this.cb.onData(cmdDirectoryFrame(c))
+        }, i * 10)
+        this.pendingTimers.add(id)
       })
     } else if (cmd >= 0x80 && cmd <= 0x9f) {
       // 动作命令下发：演示源不执行真动作，静默吞掉（无ACK协议，真机同理不回帧）
@@ -268,8 +288,12 @@ export class MockTransport implements SerialTransport {
   }
 
   private emit(f: Uint8Array): void {
-    // 异步抛出，模拟串口到达的时序
-    setTimeout(() => this.cb.onData(f), 0)
+    // 异步抛出，模拟串口到达的时序；句柄登记便于 disconnect 清理
+    const id = setTimeout(() => {
+      this.pendingTimers.delete(id)
+      this.cb.onData(f)
+    }, 0)
+    this.pendingTimers.add(id)
   }
 
   private startTimers(): void {

@@ -68,18 +68,42 @@ def test_parser_monitor_value_after_directory():
 
 
 def test_parser_cmd_directory_with_ranges():
-    """命令目录带 bit7 范围：[cmd][tag][名长][名][参数量][字段...][min,max]"""
+    """命令目录带 bit7 范围：[内容长度2B][cmd][tag][名长][名][参数量][字段...][min,max]"""
     events = []
     p = FrameParser()
+
+    # 单字段 float：min/max 各 4B
     tag = 0x80 | (1 << 4)  # bit7 范围 + argc=1 + spec=0
-    payload = (
+    content = (
         bytes([0x80, tag, 2]) + b"mk" + bytes([1, ValueType.Float, 1]) + b"a"
         + struct.pack("<ff", -10.0, 10.0)
     )
+    payload = len(content).to_bytes(2, "little") + content
     p.feed(_frame(CmdPost.CMDDirectory, payload), events.append)
     item = events[-1].item
     assert item.index == 0x80 and item.name == "mk"
     assert item.fields[0].min == -10.0 and item.fields[0].max == 10.0
+
+
+def test_parser_cmd_directory_ranges_follow_field_type():
+    """min/max 的类型与宽度必须跟字段走：uint8_t 字段 1B、float 字段 4B"""
+    events = []
+    p = FrameParser()
+    tag = 0x80 | (2 << 4)  # bit7 范围 + argc=2
+    content = (
+        bytes([0x84, tag, 2]) + b"mv"
+        + bytes([2, ValueType.UInt8, 3]) + b"idx"      # 字段1：uint8_t 编号
+        + bytes([ValueType.Float, 3]) + b"vol"         # 字段2：float 电压
+        + bytes([0, 7])                                # 编号范围 0~7（各1B）
+        + struct.pack("<ff", 0.0, 12.0)                # 电压范围 0~12（各4B）
+    )
+    payload = len(content).to_bytes(2, "little") + content
+    p.feed(_frame(CmdPost.CMDDirectory, payload), events.append)
+    item = events[-1].item
+    idx, vol = item.fields
+    assert idx.type == ValueType.UInt8 and idx.min == 0 and idx.max == 7
+    assert isinstance(idx.min, int)
+    assert vol.type == ValueType.Float and vol.min == 0.0 and vol.max == 12.0
 
 
 def test_parser_bad_checksum_and_half_frame():
@@ -110,6 +134,7 @@ if __name__ == "__main__":
     test_parser_pong()
     test_parser_monitor_value_after_directory()
     test_parser_cmd_directory_with_ranges()
+    test_parser_cmd_directory_ranges_follow_field_type()
     test_parser_bad_checksum_and_half_frame()
     test_max_payload_constant()
     test_request_monitor()

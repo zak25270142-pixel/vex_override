@@ -23,8 +23,7 @@ private:
 
     // 本轮要到达的目标（均相对 begin_segment 开启的新段）。
     float turn_target = 0.0f; // deg
-    float move_target = 0.0f; // m
-    GOTO_LOCAL_TARGET goto_target = {};
+    GOTO_LOCAL_TARGET goto_target = {}; // move 也走它（y=0、朝向不变）
 
     // 任务执行接力指针：nullptr 为空闲。发起动作时绑定 start_xxx；
     // start_xxx 首轮结束自动接力到对应 update_xxx；、
@@ -37,17 +36,32 @@ private:
     //            收尾把 chassis_task_ptr 接力到对应 update_xxx。
     // update_xxx：后续每轮，PID update 推进并做稳定完成判定，完成时经 action_finished 收尾。
     void start_turn(uint32_t now);
-    void start_move(uint32_t now);
     void start_goto(uint32_t now);
     void update_turn(uint32_t now);
-    void update_move(uint32_t now);
     void update_goto(uint32_t now);
 
     void update_manual(uint32_t now); // 手动控制每轮执行
 
+    // 转向通道取值：转向杆有输入就直接用，回中则由航向保持接管（松杆减速缓冲期间也要它）。
+    float turn_hold(float turn, uint32_t now);
+
+    // ---- 松杆减速缓冲（只影响手柄，不碰位置环）----
+    // 松杆时不能直接 stop()：brake 硬刹会把整车压得前倾（old_car 手柄实测）。
+    // 先把平移指令按固定斜率收到 0（减速过程被斜率限住），收完实际速度已经很低，再 stop() 就不点头。
+    float manual_forward = 0.0f; // 本拍平移指令（前/侧），松杆后按它做缓冲
+    float manual_side = 0.0f;
+    uint32_t manual_prev_us = 0; // 上一拍时间戳，用来算缓冲步长
+
     // 手动控制引用的手柄摇杆数值，由装配层（robot_and_control.cpp）在构造时注入。
+    // 全向底盘三个通道各自独立：前后、左右平移、转向。
     int32_t *move_axis;
+    int32_t *side_axis;
     int32_t *turn_axis;
+
+    // 航向保持：转向杆回中时锁住该瞬间的航向，交给航向环持续补 ω。
+    // 全向轮没有胶轮的被动横摆阻尼，松手就会慢慢歪，这条闭环是手动姿态的唯一依靠。
+    bool hold_active = false;
+    float hold_heading = 0.0f;
 
     // 动作自然结束的统一收尾（含发起时已在容差内、一步未动的瞬间完成）：
     // 停车、清指针、触发 move_end_callback。
@@ -62,9 +76,11 @@ public:
     // 底盘实例由 .cpp 用本车硬件构造后传入；里程与速度数据可供 monitor 等直接读取。
     Chassis &chassis;
 
-    // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
-    // distance：直行/goto 的纵向推进；heading：直行段差速纠偏；turn：原地/goto 转向。
+    // 全向底盘三个通道各一个 PID，输出分别喂给混控的 forward/side/turn：
+    // 平移与旋转在混控前完全解耦，叠加后仍自洽，不会像"输出层加法"那样制造内力。
+    // distance：前后推进；side：左右平移；heading：直行段与手动的航向保持；turn：原地/goto 转向。
     PositionPID distance_pid;
+    PositionPID side_pid;
     PositionPID heading_pid;
     PositionPID turn_pid;
     // 误差与实际速度连续满足条件 180 ms 后才结束当前步骤，避免刚经过目标就切换。
@@ -78,7 +94,8 @@ public:
     float angular_speed_tolerance = 5.0f;  // deg/s
 
     // 底盘与手柄摇杆数值均在构造时注入：底盘来自本车硬件，摇杆来自装配层。
-    RobotAction(Chassis &chassis, int32_t *move, int32_t *turn);
+    // 摇杆顺序：前后、左右、转向。
+    RobotAction(Chassis &chassis, int32_t *move, int32_t *side, int32_t *turn);
 
     // ---- 整机生命周期：main 在主循环前调用 ----
     void init();
@@ -100,16 +117,19 @@ public:
     void stop_move();
 
     // ---- 手动控制----
-    float turn_atten = 0.5f;  // 转向衰减系数，0=无衰减，1=全衰减
-    int manual_deadzone = 16; // 手动摇杆输入死区
+    // 手动摇杆输入死区，单位是**摇杆值的平方**（pct²）：代码判的是 v*v < manual_deadzone，
+    // 所以 16 对应 |v| < 4 才算回中；映射区间是 [manual_deadzone, 127²]，不是 [deadzone², 127²]。
+    int manual_deadzone = 16;
+
+    // 松杆后平移指令每秒收多少 pct：100pct 约 0.67s 收完。
+    // 太小 → 减速太猛会前倾点头；太大 → 松杆后滑行太久。这个只影响手柄，位置环不受它管。
+    float manual_decay_per_s = 150.0f;
 
     // 进入手动模式：把注入的摇杆设为 only_value（不触发方向键），
     // 接力指针指向 update_manual，refresh() 每轮自动执行手动控制。
     // is_busy() 此后为真，调用方可据此挡住自动动作。
     // 退出用 stop_move()。
-    // 当前实现为 Arcade（单左手摇杆：value_y 前后、value_x 转向）。
-    // 迁移到 Tank：改读 manual_right_axis 的 value_y，与左手摇杆的 value_y
-    // 分别作为左右轮速度，去掉 turn 项，直接 chassis.output(left, right)。
+    // 全向底盘三通道：左手 Y=前后、左手 X=左右平移、右手 X=转向；车体坐标系（非场地坐标系）。
     void manual();
 
     // ---- 可直接调用的动作 ----

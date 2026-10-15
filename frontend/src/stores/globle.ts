@@ -309,7 +309,9 @@ function syncTraceSubs(before: Set<number>, after: Set<number>): void {
   for (const idx of before) {
     if (after.has(idx)) continue
     const orig = traceOrigSubs.get(idx)
-    traceOrigSubs.delete(idx)
+    // 永久保留 orig：不要 delete，否则同一量第二次追踪时
+    // rememberTraceOrigin 会读到"已被提速"的状态并误存为 orig，
+    // 第二次取消追踪时 if (orig && !(orig.sub && orig.fast)) 不发退订 → 卡死高速
     if (orig && !(orig.sub && orig.fast)) void sendSubscribe(idx, orig.sub, orig.fast)
   }
 }
@@ -499,14 +501,80 @@ export function getSeries(index: number): SeriesBuf | undefined {
   return seriesBuf.get(index)
 }
 
+/** 导出列描述：名称/单位/类型都在，离线按名取列即可（与后端 JSON 的 columns 同构） */
+export interface TraceColumn {
+  index: number
+  name: string
+  unit: string
+  /** 原始值类型，用于格式化（float 要还原成最短 float32 写法）；未登记类型时为 undefined */
+  type: ValueType | undefined
+}
+
 /**
- * 导出追踪量历史为「JSON 元数据头 + 宽表」文本，供丢给 AI 或离线分析。
- * - 元数据头用 JSON：逐列给出名称与单位（不再区分曲线通道——通道只是给人看的）
- * - 数据行按主控推送节拍对齐：同一拍到达的量落在同一行，该拍没采到的量记 NaN
+ * 一次导出的全部内容：元信息 + 对齐后的宽表。CSV/JSON 两种格式都从它序列化，
+ * 保证同一份数据两种格式完全一致。
+ * - 数据行按主控推送节拍对齐：同一拍到达的量落在同一行，该拍没采到的量记 null
  * - t 为相对导出时刻的秒数（负=过去），与曲线页 x 轴同语义
- * 没有任何数据时返回空串。
+ * 没有任何数据时返回 null。
  */
-export function buildExportText(): string {
+export interface TraceExport {
+  created: string
+  /** 对齐节拍（毫秒）：导出宽表相邻两行的时间间隔 */
+  alignMs: number
+  /** 首行相对导出时刻的毫秒（负数） */
+  t0Ms: number
+  columns: TraceColumn[]
+  /** 每行：[t, 各列值或 null(该拍没采到)] */
+  rows: (number | null)[][]
+}
+
+/** CSV：BOM + 表头「t,名称(单位)」+ 宽表行，Excel 双击直接打开、中文不乱码；空拍留空 */
+export function buildExportCsv(): string {
+  const e = buildTraceExport()
+  if (!e) return ''
+  const head = ['t', ...e.columns.map((c) => (c.unit ? `${c.name}(${c.unit})` : c.name))]
+  const lines = [head.join(',')]
+  for (const row of e.rows) {
+    lines.push(
+      row
+        .map((v, k) => {
+          if (v === null) return ''
+          return k === 0 ? String(v) : fmtTrace(v, e.columns[k - 1]?.type)
+        })
+        .join(','),
+    )
+  }
+  return '\ufeff' + lines.join('\r\n') // BOM + CRLF：Excel 友好
+}
+
+/** JSON：元信息 + 宽表（行是数组，与 CSV 同序），丢给 AI / 离线脚本最省事 */
+export function buildExportJson(): string {
+  const e = buildTraceExport()
+  if (!e) return ''
+  return JSON.stringify(
+    {
+      format: 'v5-trace',
+      version: 1,
+      created: e.created,
+      note: '宽表：每行一拍，t 为相对导出时刻的秒数(0=导出时刻,负=过去)；该拍未采到的量记 null',
+      alignMs: e.alignMs,
+      t0Ms: e.t0Ms,
+      rows: e.rows.length,
+      columns: e.columns.map((c) => ({
+        index: c.index,
+        name: c.name,
+        unit: c.unit,
+        type: c.type ? typeName(c.type) : 'unknown',
+      })),
+      data: e.rows,
+    },
+    null,
+    2,
+  )
+}
+
+/** 收集当前可导出的量并归行对齐（导出列：位姿优先，其次各通道追踪的量） */
+export function buildTraceExport(): TraceExport | null {
   const now = performance.now() / 1000
   // 导出列：位姿 x/y/yaw 优先置于最前（分析里程/轨迹常用），随后是被追踪的量。
   // 同一量只出一份（位姿被通道追踪时也在其中），只保留真出过历史点的
@@ -526,7 +594,7 @@ export function buildExportText(): string {
       if (buf && buf.len > 0) cols.push(idx)
     }
   }
-  if (cols.length === 0) return ''
+  if (cols.length === 0) return null
 
   // 对齐节拍：各序列相邻间隔的中位数里最小的那个（最快的那档就是采样节拍，通常 10ms）
   let period = FAST_PERIOD
@@ -568,38 +636,26 @@ export function buildExportText(): string {
     }
   }
 
-  const meta = {
-    format: 'v5-trace',
-    version: 1,
-    exportedAt: new Date().toLocaleString('sv-SE'),
-    note: '宽表：每行一拍，t 为相对导出时刻的秒数(0=导出时刻,负=过去)；该拍未采到的量记 NaN',
-    alignMs: Number((period * 1000).toFixed(3)),
-    t0Ms: Math.round((t0 - now) * 1000),
-    rows: lastRow + 1,
-    columns: cols.map((idx) => {
-      const it = monitorMap[idx]
-      return {
-        index: idx,
-        name: it?.name ?? `#${idx}`,
-        unit: it?.unit ?? '',
-        type: it ? typeName(it.type) : 'unknown',
-      }
-    }),
-  }
-
-  const lines: string[] = [JSON.stringify(meta)]
-  lines.push(['t', ...cols.map((idx) => `#${idx}`)].join(','))
-  // 均匀输出整段网格（含掉线造成的空拍留 NaN），保证时间轴等间隔、可比对
+  // 均匀输出整段网格（含掉线造成的空拍留 null），保证时间轴等间隔、可比对
+  const rows: (number | null)[][] = []
   for (let r = 0; r <= lastRow; r++) {
     const row = grid.get(r)
-    const cells = cols.map((idx) => {
-      const v = row?.get(idx)
-      if (v === undefined) return 'NaN'
-      return fmtTrace(v, monitorMap[idx]?.type)
-    })
-    lines.push([(t0 + r * period - now).toFixed(3), ...cells].join(','))
+    rows.push([
+      Number((t0 + r * period - now).toFixed(3)),
+      ...cols.map((idx) => row?.get(idx) ?? null),
+    ])
   }
-  return lines.join('\n')
+
+  return {
+    created: new Date().toLocaleString('sv-SE'),
+    alignMs: Number((period * 1000).toFixed(3)),
+    t0Ms: Math.round((t0 - now) * 1000),
+    columns: cols.map((idx) => {
+      const it = monitorMap[idx]
+      return { index: idx, name: it?.name ?? `#${idx}`, unit: it?.unit ?? '', type: it?.type }
+    }),
+    rows,
+  }
 }
 
 function bufStart(buf: SeriesBuf): number {

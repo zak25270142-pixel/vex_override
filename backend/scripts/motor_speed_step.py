@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-单侧/双侧速度环阶跃响应测试（闭环，走 0x85 设置底盘目标速度）。
+全向底盘速度环阶跃响应测试（闭环，走 0x85 设置底盘目标速度）。
+
+底盘已改为 X 布局全向轮：0x85 的三参数是 前/侧/转 三通道（不再是左右轮），
+chassis.output(forward, side, turn) 内部混控成四轮目标再交给各组速度环追踪。
 
 与 motor_v_test.py（0x84 开环直加电压）互补：
-  - 本脚本经速度环：chassis.output(left, right) → 5ms my_spin 追踪
-  - 用于标定 kf/kp/ki/kd、核对 volt_min/factor 在闭环下的表现
+  - 本脚本经速度环：三通道 → 混控 → 四轮 my_spin 追踪
+  - 用于标定 kf/kp/ki/kd、核对 volt_min/volt_factor 在闭环下的表现
 
-默认流程（单侧）：
-  对侧目标=0，本侧按阶跃序列 0→30→60→0（pct），每段保持固定时间；
-  全程记录 L_tgt/R_tgt、L0_rpm/R0_rpm、L0_Vcmd/R0_Vcmd、L0_Vact/R0_Vact 八项；
+默认流程（单通道）：
+  只给一个通道阶跃序列 0→30→60→0（pct），另两通道为 0，每段保持固定时间；
+  全程记录 左前/右前 的 指令、转速、指令电压、实际电压 八项；
   原始时序写入 CSV，结束后打印上升时间/超调/稳态误差摘要。
 
 记录交给后端：脚本只声明"记哪些项"，逐段发命令；每段是一段独立记录（start_log → 设目标 → 保持 → end_log），段末取波形/统计。
 
 用法示例（先启动后端 uvicorn app.main:app --host 127.0.0.1 --port 8000，再运行本脚本）：
-  python scripts/motor_speed_step.py --side L
-  python scripts/motor_speed_step.py --side R --steps 0,20,40,60,0 --hold 2.0
-  python scripts/motor_speed_step.py --side both --csv pytest/speed_step.csv
-  python scripts/motor_speed_step.py --base http://127.0.0.1:8000 --side L
+  python scripts/motor_speed_step.py --chan F
+  python scripts/motor_speed_step.py --chan S --steps 0,20,40,60,0 --hold 2.0
+  python scripts/motor_speed_step.py --chan all --csv pytest/speed_step.csv
+  python scripts/motor_speed_step.py --base http://127.0.0.1:8000 --chan T
 """
 
 from __future__ import annotations
@@ -31,16 +34,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.script_api import BackendLink  # noqa: E402
 
-# 监控项中文名 → 逻辑键（与 LCD_menu.cpp monitor_menu_item 一致）
+# 监控项中文名 → 逻辑键（与 LCD_menu.cpp monitor_menu_item 一致；全向底盘按轮组命名）
 MONITOR_WANT = {
-    "L_tgt": "左指令转速",
-    "R_tgt": "右指令转速",
-    "L0_rpm": "左0转速",
-    "R0_rpm": "右0转速",
-    "L0_Vcmd": "左0指令电压",
-    "R0_Vcmd": "右0指令电压",
-    "L0_Vact": "左0实际电压",
-    "R0_Vact": "右0实际电压",
+    "LF_tgt": "左前指令",
+    "RF_tgt": "右前指令",
+    "LF_pct": "左前转速",
+    "RF_pct": "右前转速",
+    "LF_Vcmd": "左前0指令电压",
+    "RF_Vcmd": "右前0指令电压",
+    "LF_Vact": "左前0实际电压",
+    "RF_Vact": "右前0实际电压",
 }
 
 # 全程要记的监控键
@@ -133,20 +136,21 @@ def _capture(bl: BackendLink, side: str, target: float, all_rows: List[dict]) ->
     return seg
 
 
-def run_side(
+def run_chan(
     bl: BackendLink,
-    side: str,
+    chan: str,
     steps: List[float],
     hold: float,
     all_rows: List[dict],
 ) -> List[Tuple[float, dict]]:
     """
-    side: 'L' | 'R'
-    对侧始终 0；返回 [(target, metrics), ...]
+    chan: 'F'（前向）| 'S'（侧向）| 'T'（转向）
+    另两个通道始终 0；返回 [(target, metrics), ...]
     """
-    assert side in ("L", "R")
-    rpm_key = "L0_rpm" if side == "L" else "R0_rpm"
-    tgt_key = "L_tgt" if side == "L" else "R_tgt"
+    assert chan in ("F", "S", "T")
+    # 取左前轮作为观察对象：混控后四个轮目标幅值相同，看一个就够
+    rpm_key = "LF_pct"
+    tgt_key = "LF_tgt"
     rpm_name = MONITOR_WANT[rpm_key]
     tgt_name = MONITOR_WANT[tgt_key]
     summary: List[Tuple[float, dict]] = []
@@ -154,22 +158,24 @@ def run_side(
     # 起始停车，确保 is_busy=false 且速度环可接收 0x85
     bl.stop_move()
     bl.sleep(0.3)
-    bl.spin_target(0.0, 0.0)
+    bl.spin_target(0.0, 0.0, 0.0)
     bl.sleep(0.4)
 
     for target in steps:
-        if side == "L":
-            left, right = target, 0.0
+        if chan == "F":
+            forward, side, turn = target, 0.0, 0.0
+        elif chan == "S":
+            forward, side, turn = 0.0, target, 0.0
         else:
-            left, right = 0.0, target
+            forward, side, turn = 0.0, 0.0, target
 
-        print("  → %s 目标 %+.1f pct（对侧 0），保持 %.2fs" % (side, target, hold))
+        print("  → %s 通道目标 %+.1f pct（另两通道 0），保持 %.2fs" % (chan, target, hold))
         bl.start_log()                     # 本段一段独立记录
-        bl.spin_target(left, right)
+        bl.spin_target(forward, side, turn)
         bl.sleep(hold)
         bl.end_log()
 
-        seg = _capture(bl, side, target, all_rows)  # 本段 8 项长表
+        seg = _capture(bl, chan, target, all_rows)  # 本段 8 项长表
 
         rpm_rows = _rpm_rows(seg, rpm_name, rpm_key)
         m = steady_metrics(rpm_rows, rpm_key, target)
@@ -196,39 +202,39 @@ def run_side(
                 print("     回读 %s 均值=%.2f（应接近目标）" % (tgt_key, tgt_mean))
 
     # 段末停车
-    bl.spin_target(0.0, 0.0)
+    bl.spin_target(0.0, 0.0, 0.0)
     bl.sleep(0.3)
     bl.stop_move()
     return summary
 
 
-def run_both(
+def run_all(
     bl: BackendLink,
     steps: List[float],
     hold: float,
     all_rows: List[dict],
 ) -> List[Tuple[float, dict, dict]]:
-    """双侧同目标阶跃，用于看左右对齐。"""
+    """前向阶跃，四轮同目标：看左前/右前对齐（差大说明 volt_factor 或机械阻力不一致）。"""
     summary = []
     bl.stop_move()
     bl.sleep(0.3)
-    bl.spin_target(0.0, 0.0)
+    bl.spin_target(0.0, 0.0, 0.0)
     bl.sleep(0.4)
 
     for target in steps:
-        print("  → 双侧目标 %+.1f pct，保持 %.2fs" % (target, hold))
+        print("  → 前向目标 %+.1f pct（四轮同幅值），保持 %.2fs" % (target, hold))
         bl.start_log()
-        bl.spin_target(target, target)
+        bl.spin_target(target, 0.0, 0.0)
         bl.sleep(hold)
         bl.end_log()
 
-        seg = _capture(bl, "both", target, all_rows)
+        seg = _capture(bl, "all", target, all_rows)
 
-        ml = steady_metrics(_rpm_rows(seg, MONITOR_WANT["L0_rpm"], "L0_rpm"), "L0_rpm", target)
-        mr = steady_metrics(_rpm_rows(seg, MONITOR_WANT["R0_rpm"], "R0_rpm"), "R0_rpm", target)
+        ml = steady_metrics(_rpm_rows(seg, MONITOR_WANT["LF_pct"], "LF_pct"), "LF_pct", target)
+        mr = steady_metrics(_rpm_rows(seg, MONITOR_WANT["RF_pct"], "RF_pct"), "RF_pct", target)
         summary.append((target, ml, mr))
         print(
-            "     L稳态=%.2f(err%+.2f)  R稳态=%.2f(err%+.2f)  左右差=%.2f"
+            "     左前稳态=%.2f(err%+.2f)  右前稳态=%.2f(err%+.2f)  两轮差=%.2f"
             % (
                 ml.get("ss_mean", float("nan")),
                 ml.get("ss_err", float("nan")),
@@ -238,7 +244,7 @@ def run_both(
             )
         )
 
-    bl.spin_target(0.0, 0.0)
+    bl.spin_target(0.0, 0.0, 0.0)
     bl.sleep(0.3)
     bl.stop_move()
     return summary
@@ -248,10 +254,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="速度环阶跃响应测试（0x85 闭环）")
     ap.add_argument("--base", default="http://127.0.0.1:8000", help="后端地址，默认本机 8000")
     ap.add_argument(
-        "--side",
-        default="L",
-        choices=["L", "R", "both"],
-        help="L/R=单侧对侧为0；both=左右同目标",
+        "--chan",
+        default="F",
+        choices=["F", "S", "T", "all"],
+        help="F/S/T=单通道阶跃、另两通道为0；all=前向阶跃（四轮同幅值，看轮间对齐）",
     )
     ap.add_argument(
         "--steps",
@@ -278,20 +284,22 @@ def main() -> None:
         # 一次登记 8 项（推送 + 记录都由后端负责）
         bl.sub(list(MONITOR_WANT.values()))
 
-        print("\n===== 速度环阶跃  side=%s  steps=%s  hold=%.2fs ====="
-              % (args.side, steps, args.hold))
+        print("\n===== 速度环阶跃  chan=%s  steps=%s  hold=%.2fs ====="
+              % (args.chan, steps, args.hold))
 
-        if args.side == "both":
-            run_both(bl, steps, args.hold, all_rows)
+        if args.chan == "all":
+            run_all(bl, steps, args.hold, all_rows)
         else:
-            run_side(bl, args.side, steps, args.hold, all_rows)
+            run_chan(bl, args.chan, steps, args.hold, all_rows)
 
         print("\n调参提示：")
         print("  · 稳态偏低且 Vcmd 未饱和 → 略增 kf 或 kp")
         print("  · 超调大/振荡 → 降 kp，kd 小量试")
         print("  · 静差长期不消 → 略增 ki（注意抗饱和已开启）")
         print("  · 启动迟缓 → 查 volt_min / static_deadzone（先用 motor_v_test 核对开环）")
-        print("  · 左右同目标稳态差大 → 回查 volt_factor / 机械阻力")
+        print("  · 四轮同目标稳态差大 → 回查 volt_factor / 机械阻力")
+        print("  · 横移(S)比直行(F)明显差 → 滚子摩擦更大，四组静/动摩擦要按方向分别标定")
+        print("  · 跑起来姿态歪 → 看监控的 内耗 与四组 达标率，同步没起作用就调 dyn_* 三件套")
 
         if args.csv and all_rows:
             bl.save_csv(args.csv, all_rows, TIMING_FIELDS)

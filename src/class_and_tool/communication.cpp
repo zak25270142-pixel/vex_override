@@ -224,7 +224,9 @@ void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd
 
 // 发动作命令目录的一批：直接取外部表下标 [batch*CMD_DIR_BATCH, +CMD_DIR_BATCH)
 // 这连续几条，一条拼一帧。
-// 帧payload: [命令字][tag][命令名长][命令名][参数量]([字段类型][字段名长][字段名])×N[bit7=1时:(min,max)×参数量]
+// 帧payload: [内容长度2B][命令字][tag][命令名长][命令名][参数量]([字段类型][字段名长][字段名])×N[bit7=1时:(min,max)×参数量]
+// 头这2B长度是给上位机省事的：本帧长度要沿字段走查、还要按各字段类型累加 min/max 宽度
+// 才能算出来，让上位机再实现一遍这套走查纯属折磨。带上长度后它收2B就能定帧长。
 void USB_Comm::send_cmd_dir_batch(uint8_t batch)
 {
     uint8_t start = batch * CMD_DIR_BATCH;
@@ -239,7 +241,7 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
         const CMD_ITEM *item = &cmd_items[start + k];
 
         // pos用16位：范围数组按上限7参数展开时payload可能超255，uint8会回绕发坏帧
-        uint16_t pos = 2; // payload从tx_frame[2]起拼，最后pos-2就是payload总长
+        uint16_t pos = 4; // payload前2B留给内容长度，内容从tx_frame[4]起，最后pos-2是payload总长
         tx_frame[pos++] = static_cast<uint8_t>(CMD_BASE + start + k);
         // bit7按ranges是否为空自动置位，上位机据此判断字段后有没有min/max数组
         tx_frame[pos++] = item->ranges != nullptr
@@ -264,17 +266,27 @@ void USB_Comm::send_cmd_dir_batch(uint8_t batch)
             memcpy(&tx_frame[pos], item->field_name[f], flen);
             pos += flen;
         }
-        // ranges非空：字段描述后紧跟取值范围数组[min1,max1,min2,max2,...]，float小端各4B
+        // ranges非空：字段描述后紧跟[min1,max1,min2,max2,...]，每个值与该字段同类型、
+        // 同宽度（value_size），不再一律 4B float——uint8_t 编号的范围就得是 1B。
         if (item->ranges != nullptr)
         {
+            const uint8_t *raw = reinterpret_cast<const uint8_t *>(item->ranges);
+            uint16_t src = 0; // 源字节流已消费数：各字段宽度不同，只能按 value_size 逐段推进
             for (uint8_t f = 0; f < cmd_tag_argc(item->tag); f++)
             {
-                memcpy(&tx_frame[pos], &item->ranges[2 * f], 4);
-                pos += 4;
-                memcpy(&tx_frame[pos], &item->ranges[2 * f + 1], 4);
-                pos += 4;
+                const uint8_t sz = value_size(item->data_type[f]); // str/other 为 0：无范围
+                memcpy(&tx_frame[pos], &raw[src], sz);             // min
+                pos += sz;
+                src += sz;
+                memcpy(&tx_frame[pos], &raw[src], sz); // max
+                pos += sz;
+                src += sz;
             }
         }
+        // 回写内容长度（不含这两个长度字节本身），小端
+        const uint16_t content_len = static_cast<uint16_t>(pos - 4);
+        tx_frame[2] = static_cast<uint8_t>(content_len & 0xFFu);
+        tx_frame[3] = static_cast<uint8_t>(content_len >> 8);
         send_frame(Post_CMD_Directory, pos - 2);
     }
 }

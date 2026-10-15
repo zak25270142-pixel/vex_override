@@ -37,6 +37,10 @@ double MyMotorGroup::velocity()
 
 void MyMotorGroup::stop()
 {
+    // 幂等：已经停着就什么都不做。摇杆回中时上层每拍都会调 stop()，
+    // 不挡住的话等于每 10ms 对组内每台电机白下发一次 SDK stop()。
+    if (spin_state == Stopped)
+        return;
     spin_state = Stopped;
     target = 0.0f;
     integral = 0.0f;
@@ -45,6 +49,13 @@ void MyMotorGroup::stop()
     pre_v = 0.0f;
     pre_a = 0.0f;
     transit_start_us = 0;
+    
+    // 停车即解除同步：下一轮起步从满力开始重新观察谁掉队，
+    // 否则旧车况下压出来的系数会拖慢下一次起步。
+    dyn_factor = 1.0f;
+    achieve = 1.0f;
+    achieve_valid = false;
+    limited = false;
     for (uint8_t i = 0; i < motor_count; i++)
     {
         motors[i].volt_output = 0.0f;
@@ -64,6 +75,8 @@ void MyMotorGroup::my_spin()
     else if (dt_us > 20000)
         dt_us = 20000;
     const float dt_s = static_cast<float>(dt_us) / 1000000.0f;
+    // 达标率低通系数：由时间常数换算，本组被调用的周期变了不用改参数
+    const float alpha = 1.0f - expf(-dt_s * 1000000.0f / achieve_tau_us);
 
     last_time_us = now_us;
 
@@ -73,6 +86,10 @@ void MyMotorGroup::my_spin()
     // 目标速为0：输出0V惰行。(在drive中归一)
     if (fabs_target == 0.0f)
     {
+        // 没有目标就没有达标可言：本组不参与同步（不会被当成短板拖慢全车）。
+        achieve_valid = false;
+        achieve += (1.0f - achieve) * alpha;
+        limited = false;
         previous_error = -speed;
         for (uint8_t i = 0; i < motor_count; i++)
         {
@@ -102,6 +119,24 @@ void MyMotorGroup::my_spin()
     else if (spin_state == Stable && fabs_error > err_out_dead)
         spin_state = Track;
 
+    // ---------- 达标率：本组此刻实际跟上了多少目标转速 ----------
+    // 只在稳态跟踪(Track/Stable)且目标足够大时判定。起步窗内速度还没起来、换向瞬间、
+    // 打滑/腾空（速度突变会落回 Transit）、以及低速目标，这些期间一律判不准 → 同步冻结。
+    // 注意：pct 是 float（由 rpm 换算），SDK 底层也已对编码器速度滤过一次，这里的低通
+    // 只是让"慢性"的同步判定更稳，不是救量化噪声。
+    achieve_valid = (spin_state == Track || spin_state == Stable) && fabs_target > achieve_min_target;
+    if (achieve_valid)
+    {
+        // 比值夹到 [0,1]：被外力反拖时 speed 与 target 反号、比值为负 → 按完全跟不上(0)算；
+        // 超速(>1)按满达标算——同步是降级器，只关心"谁跟不上"，超速不需要被奖励
+        //（dyn_factor 上限本来就是 1，夹不夹结果一样；夹住只是避免"比满力还强"的怪值）。
+        float ratio = fmaxf(0.0f, fminf(speed / target, 1.0f));
+        achieve += (ratio - achieve) * alpha;
+        achieve = fmaxf(0.0f, fminf(achieve, 1.0f));
+    }
+    else
+        achieve += (1.0f - achieve) * alpha; // 判不准就漂回满力（同步侧会冻结系数，不吃这个值）
+
     // ---------- 连续摩擦补偿 ----------
     const float friction = dynamic_deadzone + (static_deadzone - dynamic_deadzone) * expf(-fabs_target / 3.0f);
 
@@ -128,6 +163,12 @@ void MyMotorGroup::my_spin()
     if (spin_state == Recover && fabs_error <= error_for_i && fabsf(output) < 1) // 误差小且输出没拉满
         spin_state = Track;
 
+    // 顶住：归一输出被裁剪（电压已到本组此刻的上限）或处于堵转。**只进监控，同步不读它**。
+    // （ki 有抗饱和，output 顶满基本是 kf 叠 kp 造成的。）
+    // "稳态永远达不到"不靠它判：那种情况 output 没顶满、limited=false，
+    // 靠 achieve < 1 → capability < 1 判，这才是达标率存在的意义。
+    limited = (output > 1.0f || output < -1.0f) || (spin_state == Recover);
+
     if (output > 1)
         output = 1;
     else if (output < -1)
@@ -141,7 +182,11 @@ void MyMotorGroup::my_spin()
     {
         const float base_voltage = friction + motors[i].volt_min;
         const float controllable_voltage = motors[i].volt_max - base_voltage;
-        float volt = target_sign * base_voltage + output * controllable_voltage * motors[i].volt_factor;
+        // volt_factor 是出厂标定的静态个体差异，dyn_factor 是 Chassis 每拍下发的在线同步，
+        // 两者都 ≤1 且相乘生效：把本组此刻"允许跑到多快"压到全车的短板水平。
+        // 摩擦垫(base_voltage)不参与缩放，否则低速时压不住、同步失效。
+        float volt = target_sign * base_voltage +
+                     output * controllable_voltage * motors[i].volt_factor * dyn_factor;
         const float dv = volt - motors[i].volt_output;
         if (spin_state != Recover)
         {

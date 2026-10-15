@@ -550,9 +550,13 @@ class BackendLink:
         for mid in range(8):
             self.set_volt(mid, volts)
 
-    def spin_target(self, left: float, right: float) -> dict:
-        """下发"设置底盘目标速度"：left/right 为左、右两侧的目标速度（走速度环）。"""
-        return self.cmd("设置底盘目标速度", float(left), float(right))
+    def spin_target(self, forward: float, side: float, turn: float) -> dict:
+        """下发"设置底盘目标速度"：全向底盘三通道（前向/侧向/转向，pct），走混控+速度环。
+
+        差速底盘时期这是左右两轮目标速度；改全向轮后命令改为 3 参数，顺序与
+        robot_and_control.cpp 的 cmd_set_spin 字段表一致。
+        """
+        return self.cmd("设置底盘目标速度", float(forward), float(side), float(turn))
 
     def set_tunable(self, name: str, value: float) -> dict:
         """写调参项（转发 VexScript.set_tunable）；下位机回显后上位机表格自会更新。"""
@@ -601,7 +605,7 @@ class BackendLink:
         每步单独 try：上位机刚按了停车（后端 abort）时也保证把连接和订阅清干净。
         """
         try:
-            self.spin_target(0.0, 0.0)
+            self.spin_target(0.0, 0.0, 0.0)
         except Exception:
             pass
         for mid in range(8):

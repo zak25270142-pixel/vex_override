@@ -8,9 +8,16 @@
       </span>
       <span class="chart-view__tip">点击分图选中通道，在右侧「曲线设置」添加追踪曲线（每通道最多 4 条）</span>
 
-      <!-- 导出通道追踪历史（环形缓冲内最近3分钟）为 txt，供离线/AI 分析 -->
-      <button class="chart-view__export" title="导出通道追踪数据（最近3分钟）为 txt 文件" @click="onExport">
-        导出数据
+      <!-- 导出通道追踪历史（环形缓冲内最近3分钟），三种格式与后端 print_log 对齐 -->
+      <span class="chart-view__label">导出</span>
+      <button class="chart-view__export" title="导出为 CSV：宽表，Excel / pandas 直读" @click="onExport('csv')">
+        CSV
+      </button>
+      <button class="chart-view__export" title="导出为 JSON：元信息 + 宽表，适合丢给 AI 或离线脚本" @click="onExport('json')">
+        JSON
+      </button>
+      <button class="chart-view__export" title="把所有追踪曲线画成一张 PNG（不受当前分图/大图影响）" @click="onExport('png')">
+        PNG
       </button>
 
       <div class="chart-view__switch">
@@ -55,7 +62,8 @@ import type { ECharts } from 'echarts/core'
 import { CHANNELS, PLOT_REFRESH_MS, TRACE_BUF_CAP } from '@/config/workspace'
 import {
   bigView,
-  buildExportText,
+  buildExportCsv,
+  buildExportJson,
   channelCfg,
   channelTraces,
   connected,
@@ -286,17 +294,22 @@ type SaveFilePicker = (opts: {
   types?: { description: string; accept: Record<string, string[]> }[]
 }) => Promise<{ createWritable: () => Promise<SaveWritable> }>
 
-async function saveTextFile(name: string, text: string): Promise<'saved' | 'canceled' | 'download'> {
+/** 落盘：优先弹"另存为"对话框（选得到路径），不支持就退回浏览器下载 */
+async function saveFile(
+  name: string,
+  blob: Blob,
+  accept: { description: string; mime: string; ext: string },
+): Promise<'saved' | 'canceled' | 'download'> {
   const picker = (window as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker
   if (picker) {
     try {
       const handle = await picker({
         suggestedName: name,
         startIn: 'desktop',
-        types: [{ description: '文本文件', accept: { 'text/plain': ['.txt'] } }],
+        types: [{ description: accept.description, accept: { [accept.mime]: [accept.ext] } }],
       })
       const w = await handle.createWritable()
-      await w.write(text)
+      await w.write(blob)
       await w.close()
       return 'saved'
     } catch (e) {
@@ -304,7 +317,7 @@ async function saveTextFile(name: string, text: string): Promise<'saved' | 'canc
       // 其它错误（权限等）落到下方普通下载
     }
   }
-  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
+  const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = name
@@ -313,19 +326,103 @@ async function saveTextFile(name: string, text: string): Promise<'saved' | 'canc
   return 'download'
 }
 
-async function onExport(): Promise<void> {
-  const text = buildExportText()
-  if (!text) {
-    statusText.value = '没有可导出的数据（先在通道中添加追踪项并等到曲线出点）'
-    return
-  }
+function exportName(ext: string): string {
   const d = new Date()
   const pad = (n: number) => String(n).padStart(2, '0')
-  const name = `v5-trace-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.txt`
-  const r = await saveTextFile(name, text)
+  return `v5-trace-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${ext}`
+}
+
+function reportSaved(r: 'saved' | 'canceled' | 'download', name: string): void {
   if (r === 'saved') statusText.value = `已保存 ${name} 到所选位置`
   else if (r === 'download') statusText.value = `已下载 ${name}（到浏览器下载目录）`
   else statusText.value = '已取消导出'
+}
+
+const EMPTY_TIP = '没有可导出的数据（先在通道中添加追踪项并等到曲线出点）'
+
+/** 被追踪且真出过点的量（去重、按通道顺序），PNG 与导出共用 */
+function tracedWithData(): number[] {
+  const out: number[] = []
+  const seen = new Set<number>()
+  for (const list of channelTraces) {
+    for (const idx of list) {
+      if (seen.has(idx)) continue
+      seen.add(idx)
+      if ((getSeries(idx)?.len ?? 0) > 0) out.push(idx)
+    }
+  }
+  return out
+}
+
+/** 某条曲线的完整历史点（不受显示窗口限制），t 换算成"距现在的秒数" */
+function allPoints(index: number): [number, number][] {
+  const buf = getSeries(index)
+  if (!buf || buf.len < 2) return []
+  const now = performance.now() / 1000
+  const start = (buf.head - buf.len + TRACE_BUF_CAP) % TRACE_BUF_CAP
+  const out: [number, number][] = []
+  for (let k = 0; k < buf.len; k++) {
+    const pos = (start + k) % TRACE_BUF_CAP
+    out.push([buf.t[pos]! - now, buf.v[pos]!])
+  }
+  return out
+}
+
+/**
+ * PNG：把所有追踪曲线画在一张离屏图里（不依赖当前是分图还是大图），
+ * 等价于后端 print_log 的 .png 分支——每项一条曲线、x 轴为距现在的秒。
+ */
+async function exportPng(): Promise<void> {
+  const idxs = tracedWithData()
+  if (idxs.length === 0) {
+    statusText.value = EMPTY_TIP
+    return
+  }
+  const div = document.createElement('div')
+  div.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:720px'
+  document.body.appendChild(div)
+  const chart = echarts.init(div, undefined, { renderer: 'canvas' })
+  chart.setOption({
+    backgroundColor: '#ffffff',
+    animation: false,
+    title: { text: 'V5 追踪曲线', left: 10, top: 8 },
+    tooltip: { trigger: 'axis' },
+    legend: { top: 8, right: 12, type: 'scroll' },
+    grid: { left: 60, right: 20, top: 48, bottom: 40 },
+    xAxis: { type: 'value', name: '秒（右0=现在）', max: 0, splitLine: { show: false } },
+    yAxis: { type: 'value', scale: true },
+    series: idxs.map((idx) => ({
+      name: traceName(idx),
+      type: 'line' as const,
+      showSymbol: false,
+      data: allPoints(idx),
+    })),
+  })
+  const url = chart.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: '#ffffff' })
+  chart.dispose()
+  div.remove()
+
+  const blob = await (await fetch(url)).blob()
+  const name = exportName('png')
+  reportSaved(await saveFile(name, blob, { description: 'PNG 图片', mime: 'image/png', ext: '.png' }), name)
+}
+
+async function onExport(fmt: 'csv' | 'json' | 'png'): Promise<void> {
+  if (fmt === 'png') {
+    await exportPng()
+    return
+  }
+  const text = fmt === 'csv' ? buildExportCsv() : buildExportJson()
+  if (!text) {
+    statusText.value = EMPTY_TIP
+    return
+  }
+  const name = exportName(fmt)
+  const accept =
+    fmt === 'csv'
+      ? { description: 'CSV 表格', mime: 'text/csv', ext: '.csv' }
+      : { description: 'JSON 数据', mime: 'application/json', ext: '.json' }
+  reportSaved(await saveFile(name, new Blob([text], { type: `${accept.mime};charset=utf-8` }), accept), name)
 }
 
 onMounted(() => {

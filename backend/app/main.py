@@ -244,7 +244,7 @@ def api_tunable(body: TunableBody):
     """写一个调参项的值。
 
     body: TunableBody（index_or_name + value）
-    返回: SetTunableResult；名字不存在 → 404；abort 中 → 409
+    返回: SetTunableResult；名字不存在 → 404；abort 中 → 409；取值越界 → 400
     """
     try:
         return hub.set_tunable_value(body.index_or_name, body.value)
@@ -252,6 +252,10 @@ def api_tunable(body: TunableBody):
         raise HTTPException(404, str(e))
     except RuntimeError as e:
         raise HTTPException(409, str(e))
+    except ValueError as e:
+        # 400 = 取值越界。set_tunable_value 当前未做范围校验，但与 api_cmd 对称
+        # 保留此分支以备将来给调参目录加 ranges 时直接生效
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/log/start")

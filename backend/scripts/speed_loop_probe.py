@@ -46,9 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.script_api import BackendLink  # noqa: E402
 
 # 关心的监控项中文名（来自 LCD_menu.cpp 注册表）
-MON_OPEN = ["左0转速", "右0转速", "左0实际电压", "右0实际电压", "全局X", "全局Y", "航向"]
-MON_CLOSED = ["左指令转速", "右指令转速", "左0转速", "右0转速",
-              "左0指令电压", "右0指令电压", "左0实际电压", "全局X", "全局Y", "航向"]
+MON_OPEN = ["左前转速", "右前转速", "左前0实际电压", "右前0实际电压", "全局X", "全局Y", "航向"]
+MON_CLOSED = ["左前指令", "右前指令", "左前转速", "右前转速",
+              "左前0指令电压", "右0指令电压", "左前0实际电压", "全局X", "全局Y", "航向"]
 NAME_X, NAME_Y, NAME_YAW = "全局X", "全局Y", "航向"
 
 # 调参项中文名（调参目录下发的是 Chinese_name，不是代码里的 item_name）
@@ -184,7 +184,7 @@ class Watchdog:
     def _emergency(self, reason):
         # 不依赖主流程，直接三重收车
         try:
-            self.L.spin_target(0.0, 0.0)
+            self.L.spin_target(0.0, 0.0, 0.0)
             self.L.drive_volt(0.0)
             self.L.stop_move()
         except Exception:
@@ -224,8 +224,8 @@ class Watchdog:
             elif self.pb is not None and abs(xn - self.px) > self.pb:
                 self._emergency(f"单脉冲位移 {xn - self.px:+.3f}m 超过预算 {self.pb}m")
         if self.vlim is not None:
-            spd = max(abs(self.L.latest("左0转速")),
-                      abs(self.L.latest("右0转速")))
+            spd = max(abs(self.L.latest("左前转速")),
+                      abs(self.L.latest("右前转速")))
             now = time.perf_counter()
             if spd > self.vlim:
                 if self._v_since is None:
@@ -270,7 +270,7 @@ class Probe:
 
     def halt(self):
         """静止：先0目标惰行，再stop挂起速度环，再8电机0V（开环压测定心用）"""
-        self.L.spin_target(0.0, 0.0)
+        self.L.spin_target(0.0, 0.0, 0.0)
         time.sleep(0.05)
         self.L.stop_move()
         time.sleep(0.05)
@@ -282,7 +282,7 @@ class Probe:
         quiet = 0.0
         while time.perf_counter() < t_end:
             self.wd.check()
-            spd = max(abs(self.L.latest("左0转速")), abs(self.L.latest("右0转速")))
+            spd = max(abs(self.L.latest("左前转速")), abs(self.L.latest("右前转速")))
             quiet = quiet + WD_PERIOD_S if spd < 2.0 else 0.0
             if quiet >= 0.2:
                 return True
@@ -301,14 +301,14 @@ class Probe:
             dx = self.L.latest(NAME_X) - self.wd.ox
             if abs(dx) > RETURN_TOL_M:
                 target = -RETURN_SPEED if dx > 0 else RETURN_SPEED
-                self.L.spin_target(target, target)
+                self.L.spin_target(target, 0.0, 0.0)  # 全向：直行只需前向通道
                 t_end = time.perf_counter() + 4.0
                 while time.perf_counter() < t_end:
                     self.wd.check()
                     if abs(self.L.latest(NAME_X) - self.wd.ox) <= RETURN_EARLY_M:
                         break
                     time.sleep(WD_PERIOD_S)
-                self.L.spin_target(0.0, 0.0)  # 提前断电滑行剩余 3~6cm
+                self.L.spin_target(0.0, 0.0, 0.0)  # 提前断电滑行剩余 3~6cm
                 self._sleep(0.4)
         finally:
             self.wd.end_pulse()
@@ -363,8 +363,8 @@ class Probe:
             self.wd.end_pulse()
             w = L.wave(MON_OPEN)
             self.save_wave("open_up", w)
-            lv = [x for _, x in w["左0转速"]][3:]
-            rv = [x for _, x in w["右0转速"]][3:]
+            lv = [x for _, x in w["左前转速"]][3:]
+            rv = [x for _, x in w["右前转速"]][3:]
             lm, _, _, ls = stats(lv)
             rm, _, _, rs = stats(rv)
             dx = L.latest(NAME_X) - x_pre
@@ -390,8 +390,8 @@ class Probe:
                 L.end_log()
                 w = L.wave(MON_OPEN)
                 self.save_wave("open_down", w)
-                lv = [x for _, x in w["左0转速"]][2:]
-                rv = [x for _, x in w["右0转速"]][2:]
+                lv = [x for _, x in w["左前转速"]][2:]
+                rv = [x for _, x in w["右前转速"]][2:]
                 lm, lmin, _, ls = stats(lv)
                 rm, rmin, _, rs = stats(rv)
                 state = "维持" if (lm + rm) / 2 > 3.0 else "快停"
@@ -465,9 +465,10 @@ class Probe:
                     self.wd.begin_pulse(vlim=tgt * 1.8 + 6.0, budget=budget)
                     ltgt, rtgt = tgt, tgt
                 try:
-                    L.spin_target(ltgt, rtgt)
+                    # 差速时代的 (左,右) 折算到全向三通道：前向=(左+右)/2、转向=(左-右)/2
+                    L.spin_target((ltgt + rtgt) / 2.0, 0.0, (ltgt - rtgt) / 2.0)
                     self._sleep(PULSE_SPIN_S)
-                    L.spin_target(0.0, 0.0)
+                    L.spin_target(0.0, 0.0, 0.0)
                     self._sleep(ROTATE_SETTLE_S if rotate else HOME_GUARD_S)
                 except RuntimeError:
                     reason = self.wd.tripped or ""
@@ -475,8 +476,8 @@ class Probe:
                     w = L.wave(MON_CLOSED)
                     self.save_wave(f"closed_{gname}_t{tgt:g}_ABORT", w)
                     self.wd.end_pulse()
-                    lv2 = [abs(v) for tt, v in w["左0转速"] if tt >= 0.2]
-                    rv2 = [abs(v) for tt, v in w["右0转速"] if tt >= 0.2]
+                    lv2 = [abs(v) for tt, v in w["左前转速"] if tt >= 0.2]
+                    rv2 = [abs(v) for tt, v in w["右前转速"] if tt >= 0.2]
                     lm2, _, _, ls2 = stats(lv2)
                     rm2, _, _, rs2 = stats(rv2)
                     self.sum_rows.append([f"closed_{gname}", f"tgt={tgt:g}",
@@ -501,9 +502,9 @@ class Probe:
                 # 时间轴从 start_log 起算，所以稳态窗起点就是 PULSE_SPIN_S 的一半
                 tw = PULSE_SPIN_S * 0.5
                 win_len = PULSE_SPIN_S * 0.5
-                lv = [v for t, v in w["左0转速"] if t >= tw]
-                rv = [(abs(v) if rotate else v) for t, v in w["右0转速"] if t >= tw]
-                vcmd = [v for t, v in w["左0指令电压"] if t >= tw]
+                lv = [v for t, v in w["左前转速"] if t >= tw]
+                rv = [(abs(v) if rotate else v) for t, v in w["右前转速"] if t >= tw]
+                vcmd = [v for t, v in w["左前0指令电压"] if t >= tw]
                 lm, _, _, lstd = stats(lv)
                 rm, _, _, rstd = stats(rv)
                 vm, vmin, vmax, _ = stats(vcmd)
@@ -564,7 +565,7 @@ def main():
             # 围栏以世界坐标原点0为中心；车在 +0.3m 处起步、向 0 倒，不触发围栏
             link.sub(MON_CLOSED)
             time.sleep(0.3)
-            link.spin_target(0.0, 0.0)
+            link.spin_target(0.0, 0.0, 0.0)
             time.sleep(0.1)
             link.stop_move()
             time.sleep(0.1)
@@ -572,14 +573,14 @@ def main():
             wd.tripped, wd.armed = None, True
             wd.begin_pulse(vlim=15.0, budget=None)
             print(f"[recover] 从 x={link.latest(NAME_X):+.3f} 慢速倒回 x≈0 ...")
-            link.spin_target(-6.0, -6.0)
+            link.spin_target(-6.0, 0.0, 0.0)
             t_end = time.perf_counter() + 8.0
             while time.perf_counter() < t_end:
                 wd.check()
                 if abs(link.latest(NAME_X)) < RETURN_TOL_M:
                     break
                 time.sleep(WD_PERIOD_S)
-            link.spin_target(0.0, 0.0)
+            link.spin_target(0.0, 0.0, 0.0)
             time.sleep(0.3)
             link.stop_move()
             time.sleep(0.1)

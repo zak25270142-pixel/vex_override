@@ -70,8 +70,10 @@ void my_Init()
     screen_refresh_event.broadcast();
     comm_rx_event.broadcast(); // 接收任务：调度器就绪后启动
 
+    // 全向底盘手动模式要读三根轴：左杆 Y/X 与右杆 X，都设为 only_value（不当方向键用）。
     robot_action.manual();
     left_axis.state = Remote_Control::only_value;
+    right_axis.state = Remote_Control::only_value;
 }
 
 void my_while()

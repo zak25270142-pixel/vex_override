@@ -3,8 +3,9 @@
 
 #include "my_main.h"
 
-// 里程计读数只取motor1
-// MotorGroup 里的电机都用齿轮串连传动，物理等速
+// 电机组 = 一个轮：组内两台电机用齿轮串连传动、物理等速，速度环只取 motors[0] 的读数作反馈。
+// 整车里程计不看电机编码器，由两个定位轮 + IMU 独立测量（见 Chassis::update），
+// 所以驱动轮打滑不会污染定位——这一点是全向底盘最值钱的地方。
 
 // 单台电机的个体属性：一台电机实例 + 逐台标定的电压参数 + 上一拍输出电压。
 // 电机组按数组元素逐台读写这几个属性，外界（LCD调参/监控）也直接取其字段地址。
@@ -12,11 +13,11 @@
 struct MyMotor
 {
     vex::motor *motor; // 电机实例指针（vex::motor 不可拷贝，只能持指针）
-    // 电压缩放因子：让组内各电机同指令下输出的轮速一致。
-    // 各台斜率 k(pct/V) 有个体差异，且经齿轮传动的电机轮速 = 轴速/r，
-    // 等效轮速斜率 = k/r（r=1直连 / 1.25齿轮）。只能削峰填谷——以全局最慢
-    // 等效轮速为基准，factor = k_min_等效 / (k_i/r_i)，全部 ≤1，
-    // 组内输出上限 1/max(factor) 才不损失极速。
+    // 电压缩放因子：静态标定值，一次性吃掉"各电机天生快慢不同"（组内两台的对齐也在这里）。
+    // 各台斜率 k(pct/V) 有个体差异，且经齿轮传动的电机轮速 = 轴速/r，等效轮速斜率 = k/r。
+    // **组间允许 >1**：把偏慢的轮抬起来本来就该由标定解决，硬压成 ≤1 会把组间差异
+    // 全丢给在线同步去压，起步前几拍姿态就白偏了。约束只有一条——
+    // volt_factor·dyn_factor 不能让最终电压超过 volt_max（满指令时撞顶只是损失一点极速）。
     float volt_factor;
     float volt_max;    // 最大电压
     float volt_min;    // 最小电压（个体死区补偿，对齐各电机开始转动的起点）
@@ -60,6 +61,27 @@ public:
     float static_deadzone = 1.5f;  // 静止时补偿电压上限(整车下,单位V)
     float dynamic_deadzone = 0.8f; // 高速时补偿电压下限(整车下,单位V)
     float output_deadzone = 0.5f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
+
+    // ---- 同步：volt_factor 标定的"在线动态版" ----
+    // 静态 volt_factor（可 >1）吃掉"各电机天生快慢不同"；
+    // dyn_factor 只补"此刻负载/地面/姿态造成的慢性差异"，由 Chassis 每拍下发。
+    // ∈[dyn_floor, 1]，与本组静态 volt_factor 相乘后一起生效：只削峰、不超频。
+    // 生效方式：可电压调节区间被整体压缩（volt = 摩擦垫 + 归一输出·可调区间·volt_factor·dyn_factor），
+    // 压到低于维持当前目标所需时，速度环的归一输出会顶满，该轮实际转速就跟着降下来。
+    // 它是**慢性量**，调整速度比 PID 的 I 项还慢（见 Chassis 的 dyn_*_per_s），
+    // 目的就是不抢在速度环前面动作。
+    float dyn_factor = 1.0f;
+
+    // 达标率：稳态跟踪下 实际转速/目标转速 的低通值，∈[0,1]。1=跟得上，<1=掉队或被压。
+    // 注：pct 是 float（由 rpm 换算，会出现 1.01 这种），且 SDK 底层已对编码器速度滤过一次，
+    // 这里再滤一次只是让同步的慢性判定更稳，不是救量化噪声。
+    // 起步(Transit)、换向、目标过小这些判不准的期间本值无效，同步**冻结**（不跟也不压），
+    // 打滑/腾空也落在这段里——不引入错误方向的学习，少量误差交给位置环和操作手。
+    float achieve = 1.0f;
+    bool achieve_valid = false; // 本拍达标率是否有效（稳态跟踪 且 目标足够大）
+    bool limited = false;       // 本拍是否顶住：归一输出被顶满 或 处于 Recover（堵转）。仅进监控，同步不读它
+    float achieve_tau_us = 30000.0f; // 达标率低通时间常数(us)：约 30ms 跟上，调用周期变了不用改
+    float achieve_min_target = 8.0f; // 目标速度低于此值(pct)不参与达标判定
 
     // ---- target 突变进入 Transit 状态的判态参数 ----
     // target 变化量超过该固定阈值即视为大幅跳变，强制进入提速态（清积分、重新观察）。
@@ -125,8 +147,9 @@ class Chassis
 {
 private:
     // 硬件由具体车辆创建，Chassis 只保存实际使用的电机组和惯性传感器。
-    MyMotorGroup &left_motors;
-    MyMotorGroup &right_motors;
+    // 四个轮组：0=左前 1=右前 2=左后 3=右后。每组两台电机齿轮串连，组内物理等速。
+    // 用指针数组：MyMotorGroup 不可默认构造，引用数组没法在初始化列表里逐个绑定。
+    MyMotorGroup *wheels[4];
     vex::rotation &forward_tracking_sensor;
     vex::rotation &left_tracking_sensor;
     vex::inertial &inertial_sensor;
@@ -146,10 +169,38 @@ private:
 public:
     /* 以下调参区间 */
 
-    // 底盘物理参数。轮距预留。
-    float wheel_r = 0.0254f;      // 定位轮半径，单位 m（旧车定位轮直径 5.08cm，即 2 英寸）。
-    float track_width = 0.28694f; // 左右驱动轮接地点之间的距离，单位 m，实测。
+    // 底盘物理参数
+    float wheel_r = 0.0254f; // 定位轮半径，单位 m（旧车定位轮直径 5.08cm，即 2 英寸）。
     // 速比现在恰好为1，故没写，后续若不为一需新增。
+
+    // X 布局全向轮混控参数：
+    // 单轮可达满速上限，单位 pct；混控结果超出时按它整体等比缩回（保留指令向量方向）。
+    float max_wheel_speed = 100.0f;
+    // 转向通道折算系数：把"转向通道 pct"折成轮速 pct，等效力臂 (半轴距+半轮距)/轮半径 已折算在内。
+    // 默认 1.0 = 与平移通道同权；上车按"同样数值下转向与平移的实际效果"实测标定。
+    float turn_ratio = 1.0f;
+
+    // ---- 同步（在线降级）调参：全部按"每秒"给，与调用周期无关 ----
+    // dyn_floor 兜两层：
+    //   ① 保证 capability = achieve/dyn 的折算假设（转速 ∝ dyn）还成立——dyn 太低时可控电压段
+    //      被压到与摩擦垫同量级，转速不再随它线性下降，折算失真 → 闭锁从后门回来；
+    //   ② 限制"为一个短板轮把全车拖到多慢"，并给转向通道留纠偏余量——同步只削天花板，
+    //      压到地板后"把这一侧提起来"这条路就没了，偏航修正只剩"把另一侧压慢"。
+    float dyn_floor = 0.40f;
+    // 压低/回升都是慢性的：应比 I 项积分还慢，别抢在速度环前面动作。
+    // 1.0→0.4 约 0.5s，0.4→1.0 约 3s（恢复更慢，留观察窗，避免在门槛上抖）。
+    float dyn_down_per_s = 1.2f;
+    float dyn_up_per_s = 0.2f;
+    float cap_min = 0.10f; // 达标能力下限：达标率趋零时防止算出的系数炸掉（纯数值兜底）
+
+    // ---- 受力不均（手柄推挤/对撞/地面差异）----
+    // 判据不看"整车动没动"：整车顶死时四组都进 Recover，用不着专门判；
+    // 两组卡死时车还能动，判"不动"也说明不了问题。真正要防的是各轮受力不均 → 内耗 + 姿态歪，
+    // 主要发生在手柄操控期间（自动程序几乎不会堵）。
+    float fight_disp_min = 0.15f;   // 各轮 capability 的 (max−min) 超阈值即认为受力不均
+    float fight_force_min = 8.0f;   // 或内耗 |internal_force|(pct) 超阈值：四轮已经在不一致地跑
+    float fight_trans_floor = 0.5f; // 受力不均时平移通道最多降到原来的多少（转向通道不降，姿态优先）
+    uint32_t fight_enter_us = 100000; // 连续判定成立多久才进（us），退出是立即的
 
     // 定位轮到车体旋转中心的有符号距离，单位 m，实测。
     // 前向轮读数只受其右向偏移影响：偏右为正（其偏前 74.315mm 不影响前向读数，无需参数）。
@@ -157,12 +208,28 @@ public:
     // 侧向轮读数只受其前向偏移影响：偏前为正、偏后为负（其左右居中，无侧向偏移）。
     float side_tracking_offset = -0.021262f; // 侧向定位轮偏后 21.262mm。
 
-    // 左右两侧各自的可达满速，单位 pct，取值 (0,100]，随整车配重分布不同而不同，实测标定。
-    // output() 等比限幅以此为基准；位置环 max_output 不应超过两侧较小值。
-    float left_max_speed = 100.0f;
-    float right_max_speed = 100.0f;
-
     /* 以上调参区间 */
+
+    // 混控结果：四轮目标速度(pct)，等比缩回后的最终下发值。同步算法与监控都读它。
+    // stop() 必须把它清零——否则停车后同步还拿着旧指令当"在使劲"，会误判受力不均。
+    float wheel_target[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    
+    // 每组"满力时的达标能力" = achieve / dyn_factor，∈(0,1]。1=满力能跟上，<1=这块是短板。
+    // 用它而不是直接用达标率，是为了把"我们压过它"折回满力，否则同步会把自己压出来的
+    // 慢当成短板，全车一起锁死在低速（闭锁）。
+    float capability[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    // 内耗指标，单位 pct：轮速在运动学矩阵左零空间方向上的分量 =(左前+右前−左后−右后)/2。
+    // 4 轮只有 3 个自由度，多出来的那一个约束就是它：任何刚体运动都投影不到这个方向上，
+    // 所以非零即代表轮速互不一致——打架或打滑的直接读数，差速底盘没有这个量（无冗余）。
+    float internal_force = 0.0f;
+
+    // 受力不均标志：true 时平移通道降幅、转向通道不降（姿态优先），同步改按指令向量守合力方向。
+    bool fight_mode = false;
+    // 平移通道本拍的降幅系数 ∈[fight_trans_floor, 1]，由 sync_tick 按能力离散度算出。
+    float fight_trans_scale = 1.0f;
+
+    uint32_t fight_time_us = 0; // 连续判定"受力不均"已持续多久(us)
 
     // reset() 保存的本次动作起点，只在调用 reset() 时改变。
     // 编码器里程已废弃（恢复点：打滑检测），左右驱动轮路程起点一并注释：
@@ -176,9 +243,8 @@ public:
     // 编码器里程已废弃（恢复点：打滑检测）：
     // float left_distance = 0.0f; // 累积路程，单位 m。
     // float right_distance = 0.0f;
-    float left_speed = 0.0f; // 电机组编码器测得的转速，单位 rpm。
-    float right_speed = 0.0f;
     float linear_speed = 0.0f;   // 车体中心沿自身前方的线速度，单位 m/s。
+    float side_speed = 0.0f;     // 车体中心沿自身右方的线速度，单位 m/s（侧向定位轮增量/间隔）。
     float heading = 0.0f;        // 全局航向角 = IMU 读数 + heading_offset，向右转为正，单位 deg。
     float heading_offset = 0.0f; // 全局航向相对 IMU 零点的软件偏置，单位 deg；上位机 0x86 改航向即改它。
     float imu_heading = 0.0f;    // update() 维护的 IMU 原始累计航向，单位 deg；里程计增量只从它差分。
@@ -212,8 +278,11 @@ public:
     float side_distance_from_reset = 0.0f; // 当前坐标沿起始车体右方相对起点的有符号距离，单位 m。
     float heading_from_reset = 0.0f;       // 当前航向相对起始航向的角度变化，向右为正，单位 deg。
 
-    Chassis(MyMotorGroup &left,
-            MyMotorGroup &right,
+    // 四个轮组按 左前、右前、左后、右后 的顺序传入，顺序错了整车运动方向就错。
+    Chassis(MyMotorGroup &left_front,
+            MyMotorGroup &right_front,
+            MyMotorGroup &left_back,
+            MyMotorGroup &right_back,
             vex::rotation &forward_tracking,
             vex::rotation &left_tracking,
             vex::inertial &inertial);
@@ -240,14 +309,26 @@ public:
     // 仅供没有周期 update 的场景（如 finish_init）使用，周期内禁止调用（会二次 update）。
     void reset(uint32_t now);
 
-    // 速度环唯一目标入口：位置环 PID 与手柄映射都走这里，入参是左右轮目标速度（pct，±100）。
-    // 允许输入超过 100 的叠加值，内部按比例缩回；本函数只写目标，闭环由 speed_tick() 常驻任务执行。
-    void output(float left_output, float right_output);
+    // 混控唯一目标入口：车体坐标系三通道，单位 pct（转向向右为正）。
+    //   forward 车头方向、side 车体右方、turn 绕车体中心右转。
+    // 内部一次性线性映射到四轮：四轮目标速度永远由同一个向量生成，也就永远落在
+    // 刚体运动的可行子空间里——这是"指令层面不会打架"的根源。
+    // 超出单轮上限时整体等比缩回（保留平移方向与转向比例），绝不各轮独立截断：
+    // 独立截断会破坏向量方向，正是全向轮内耗的来源之一。
+    // 本函数只写目标，闭环由 speed_tick() 推进。
+    void output(float forward, float side, float turn);
 
     // 速度环每轮推进：由独立常驻任务短周期调用。停车状态下各组内部直接返回。
     void speed_tick();
 
-    // 按 init() 设置的停车方式停止左右电机组。
+    // 同步节拍：每个 refresh 周期在 speed_tick() **之前**调用一次（先决策后执行）。
+    // 读四组的达标情况 → 折算满力达标能力 → 重算各组的 dyn_factor 并下发，本拍 speed_tick 就用新值。
+    // （放在之前/之后都是 1 拍延迟，等价；放前面读着顺，且不会用到"旧 target 下"的达标率。）
+    // 全向轮没有胶轮的横向约束去"平均"掉队量，这份耦合只能在控制器里人为造出来：
+    // 谁跑得快就让谁，谁真跑不动就全车一起按它的水平慢下来，姿态因此不变形。
+    void sync_tick();
+
+    // 按 init() 设置的停车方式停止四个轮组（连带把同步状态复位为"满力"）。
     void stop();
 };
 
