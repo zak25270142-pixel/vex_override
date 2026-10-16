@@ -61,13 +61,17 @@ const struct MENU_ITEM menu_item[] =
         {"R_vf3", type_float, &right_motors.motors[3].volt_factor, "右3电压系数", ""},
         {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
-        {"L_slewB", type_float, &left_motors.slew_boost, "左提速斜率", "V/s"},
-        {"R_slewB", type_float, &right_motors.slew_boost, "右提速斜率", "V/s"},
+        {"L_slewB", type_float, &left_motors.slew_boost, "左升压斜率", "V/s"},
+        {"R_slewB", type_float, &right_motors.slew_boost, "右升压斜率", "V/s"},
+        {"L_slewR", type_float, &left_motors.slew_release, "左撤压斜率", "V/s"},
+        {"R_slewR", type_float, &right_motors.slew_release, "右撤压斜率", "V/s"},
         {"L_errI", type_float, &left_motors.error_for_i, "左I误差阈值", "pct"},
         {"R_errI", type_float, &right_motors.error_for_i, "右I误差阈值", "pct"},
+        {"L_recA", type_float, &left_motors.recover_accel, "左反常加速度", "pct/s"},
+        {"R_recA", type_float, &right_motors.recover_accel, "右反常加速度", "pct/s"},
 
         // 手柄松杆减速缓冲：太小会点头前倾，太大松杆后滑行太久
-        {"man_decay", type_float, &robot_action.manual_stop_delay, "松杆停车延迟", "us"},
+        {"man_decay", type_uint32_t, &robot_action.manual_stop_delay, "松杆停车延迟", "us"},
 
         // // ========== 位置环 ==========
         // {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp", ""},

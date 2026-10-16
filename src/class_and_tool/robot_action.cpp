@@ -194,6 +194,8 @@ void RobotAction::update_manual(uint32_t now)
 
     if (forward != 0.0f || turn != 0.0f)
     {
+        manual_stop_start = 0; // 清零后代表未停止，下次松杆重新计时
+
         // 摇杆合成半径 r ∈ [0, 1]（用原始轴值算，避免 square_map 二次非线性）
         float r = sqrtf(static_cast<float>((*move_axis) * (*move_axis) + (*turn_axis) * (*turn_axis))) / 127.0f;
 
@@ -302,4 +304,5 @@ void RobotAction::manual()
 {
     // 建议外部手动设置only_value状态,避免误触
     chassis_task_ptr = &RobotAction::update_manual;
+    manual_stop_start = 0;
 }
