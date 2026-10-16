@@ -6,6 +6,9 @@
 // 通用位置式 PID 控制器。
 // 需保证先reset()，再update()。包括中途改变目标也需reset()
 // 需保证每次update()至少间隔1ms(最好5ms+)，不能连续调用。本身也没有连续调用的必要
+// reset() 与 update() 不得用同一时间戳（"reset 完紧接着 update"也算）：
+//   gap_time_s = 0 会让 D 项算出 (err−pre_err)/0 = NaN，NaN 会顺着调用链一路污染下去。
+//   换目标那一拍就只取 reset() 的返回值当输出，下一拍再 update()。
 //
 // 参数量纲（外部传入）：
 //   kp : 输出 / 误差

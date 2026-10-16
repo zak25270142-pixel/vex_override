@@ -140,6 +140,8 @@ void MyMotorGroup::my_spin()
     }
     float output = feedforward + p_output + ki * integral + d_output;
 
+    // 顶格必须在夹紧**之前**取：夹紧后 output 恒在 [-1,1]，再判断就永远判不到（恒 false）。
+    const bool output_saturated = output > 1.0f || output < -1.0f;
     if (output > 1)
         output = 1;
     else if (output < -1)
@@ -150,9 +152,14 @@ void MyMotorGroup::my_spin()
     //   giving_max  归一输出已经顶到上限（我们要给的全给了）
     //   wheel_low   轮胎基本没在转
     //   pulled_away 车在本拍输出想推的方向的反方向上运动 —— 我在推它往这走，它偏往那走
+    //   error_grow  车速正被拉离目标（误差在扩大）—— 用来把"外力"和"我们自己在收速"分开：
+    //     主动减速（松杆缓冲、位置环收速）时速度是**趋向**目标的，error 与 now_a 同号；
+    //     外力带偏时速度是**离开**目标的，两者反号。少了这一条，正常减速也会被判成 Recover，
+    //     而一进 Recover 就解除斜率限制、同步又强制满力，反而抖一下、冲一下。
     const bool giving_max = fabsf(output) >= stall_output;
     const bool wheel_low = fabsf(speed) <= stall_speed;
     const bool pulled_away = (output > 0.0f && now_a < 0.0f) || (output < 0.0f && now_a > 0.0f);
+    const bool error_grow = error * now_a < 0.0f;
 
     if (spin_state == Stall)
     {
@@ -193,13 +200,14 @@ void MyMotorGroup::my_spin()
                 spin_state = Transit;
             }
         }
-        else if (spin_state != Transit && pulled_away &&
+        else if (spin_state != Transit && pulled_away && error_grow &&
                  (fabsf(now_a) > recover_accel || (giving_max && fabsf(now_a) > speed_stable)))
         {
             // Recover 进入：多因素取或 —— 成因不止一种，没有单因素能断言。
             //   (a) 车速被猛地带偏（撞击 / 被抓 / 被推 / 突然打滑）
             //   (b) 已经给满是却在往后退（(a) 的兜底：渐进负载把 I 顶到饱和之后的版本）
             // 前置"不在 Transit"：Transit 里 error 大是操作手造成的，不是外力证据。
+            // 前置 error_grow：主动收速时速度是趋向目标的，不是外力证据。
             spin_state = Recover;
         }
     }
@@ -208,7 +216,7 @@ void MyMotorGroup::my_spin()
     // （ki 有抗饱和，output 顶满基本是 kf 叠 kp 造成的。）
     // "稳态永远达不到"不靠它判：那种情况 output 没顶满、limited=false，
     // 靠 achieve < 1 → capability < 1 判，这才是达标率存在的意义。
-    limited = (output > 1.0f || output < -1.0f) || (spin_state == Recover) || (spin_state == Stall);
+    limited = output_saturated || (spin_state == Recover) || (spin_state == Stall);
 
     // ---------- 归一输出映射到各路电压 + 电压斜率限制 ----------
     // 斜率不对称：升压要慢（加压过快会打滑、拉大电流），撤压要快
@@ -227,9 +235,13 @@ void MyMotorGroup::my_spin()
         const float controllable_voltage = motors[i].volt_max - base_voltage;
         // volt_factor 是出厂标定的静态个体差异，dyn_factor 是 Chassis 每拍下发的在线同步，
         // 两者相乘生效：把本组此刻"允许跑到多快"压到全车的短板水平。
+        // 乘积夹 1：标定约定 volt_factor ≤1、dyn_factor ≤1，理论上不会越界；夹住只是防标定填错
+        //   时算出的电压超过 volt_max——那样实际只发到 volt_max，可 volt_output 记的是超限值，
+        //   撤压斜率会从一个虚高的起点往下走（该快撤的时候慢半拍）。
         // 摩擦垫(base_voltage)不参与缩放，否则低速时压不住、同步失效。
+        const float factor = fminf(motors[i].volt_factor * dyn_factor, 1.0f);
         float volt = target_sign * base_voltage +
-                     output * controllable_voltage * motors[i].volt_factor * dyn_factor;
+                     output * controllable_voltage * factor;
         const float dv = volt - motors[i].volt_output;
         if (spin_state == Recover)
             ; // 不限
@@ -251,6 +263,14 @@ void MyMotorGroup::my_spin()
     previous_error = error;
     pre_v = speed;
     pre_a = now_a;
+}
+
+float MyMotorGroup::dyn_ceil() const
+{
+    float vf_max = motors[0].volt_factor;
+    for (uint8_t i = 1; i < motor_count; i++)
+        vf_max = fmaxf(vf_max, motors[i].volt_factor);
+    return 1.0f / vf_max;
 }
 
 void MyMotorGroup::drive(float target)

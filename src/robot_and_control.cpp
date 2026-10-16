@@ -31,6 +31,8 @@ static vex::motor rb_chassis_2(vex::PORT19, vex::ratio6_1, false);
 // 原数值是旧车的实测结果，对本车无意义，已重置为默认（factor 全 1、max 12V、min 0.5V），
 // 上车后必须逐台重新标定再用于比赛。组内速度环始终以 [0] 号电机（与轮轴直连）的速度为反馈。
 // 注意：volt_factor 是"静态个体差异"，全向底盘另有一层 dyn_factor（在线同步）由 Chassis 每拍下发。
+// volt_factor 标定方向：同一指令下量八台轮速，最慢那台填 1.0，其余填 (最慢轮速 / 本台轮速)，恒 ≤1；
+//   填反（给最慢的台 >1 想把它抬起来）会让它满指令撞 volt_max，归一输出上段整段失效。
 static const MyMotor lf_motor_list[2] = {
     {&lf_chassis_1, 1.0f, 12.0f, 0.5f, 0.0f},
     {&lf_chassis_2, 1.0f, 12.0f, 0.5f, 0.0f},
@@ -122,6 +124,10 @@ static void cmd_goto(const uint8_t *p)
 // ===== 调试/遥控命令（0x84~0x86）：不经动作层，直接操控底盘 =====
 // 与运动类命令同样只用 is_busy() 拦截，不主动停车：调用前提是底盘无任务、已处于停车状态。
 // 其中 set_spin 是给上位机/AI 模拟手柄连续下达速度环指令用的，可高频反复下发。
+// 注意：上电默认进手柄模式（main 里调 manual()），此后 is_busy() 恒为真，本组命令一律被静默忽略。
+//   这是**故意的互斥**（手柄与 USB 点动不能同时给底盘目标），不是通信故障：
+//   上位机要先发"停止运动"(cmd_stop → stop_move) 退出手柄、回到空闲，命令才开始生效。
+//   被忽略时下位机不回错误帧，上位机侧表现为"点了没反应"。
 
 static void cmd_set_volt(const uint8_t *p)
 {

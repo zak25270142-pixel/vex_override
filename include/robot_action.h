@@ -42,6 +42,11 @@ private:
 
     void update_manual(uint32_t now); // 手动控制每轮执行
 
+    // 清掉手动控制残留（松杆缓冲量 + 航向保持锁）。进入手动、停车、打断都要清：
+    // 不清的话，手动中锁过航向 → stop_move() → 再 manual()，第一拍杆回中会拿着旧的
+    // hold_heading 立刻纠偏，可能猛打一把方向。
+    void clear_manual_state();
+
     // 转向通道取值：转向杆有输入就直接用，回中则由航向保持接管（松杆减速缓冲期间也要它）。
     float turn_hold(float turn, uint32_t now);
 
@@ -139,6 +144,10 @@ public:
     void turn(float angle);
 
     // 直行，单位 m，负值倒车。
+    // 航向目标是**段内相对量 0** = 保持发起动作那一刻的航向（不是"保持某个全局航向"）。
+    // 这不是约定而是强制：每个动作发起时都先 begin_segment()（reset() 拆出来的那半，存起点快照、
+    // 清段内相对量），段起点就是发起时刻的实测位姿，所以 0 天然等于"当时朝哪就一直朝哪"。
+    // 因此动作发起后外部再改 heading_offset（上位机改航向），本段仍按段起点纠，不会跟着改。
     // 已在容差内时不起步，按完成处理。限速直接改 distance_pid.max_output。
     void move(float distance);
 

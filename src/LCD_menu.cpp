@@ -49,7 +49,8 @@ const struct MENU_ITEM menu_item[] =
         // ========== 电压映射（速度环归一输出 → 各台实际电压）==========
         // V = 目标方向·(摩擦+volt_min) + out·(volt_max-摩擦-volt_min)·volt_factor·dyn_factor
         // 摩擦垫只认目标方向，out 是双极性连续修正，过零不再翻转摩擦电压；
-        // volt_factor 是出厂标定的个体差异，dyn_factor 是每拍下发的在线同步（两者都 ≤1）。
+        // volt_factor 是出厂标定的个体差异（恒 ≤1，以全车最慢那台为 1，只往下压不往上抬），
+        // dyn_factor 是每拍下发的在线同步（恒 ≤1，只削峰）。两者相乘恒 ≤1，谁也别把谁抬过 volt_max。
         {"LF_vmin0", type_float, &lf_motors.motors[0].volt_min, "左前0最小电压", "V"},
         {"LF_vmin1", type_float, &lf_motors.motors[1].volt_min, "左前1最小电压", "V"},
         {"RF_vmin0", type_float, &rf_motors.motors[0].volt_min, "右前0最小电压", "V"},
@@ -99,14 +100,14 @@ const struct MENU_ITEM menu_item[] =
 
         // ========== 同步：达标率判定（每组）==========
         // alpha 越大跟得越快但也越抖；min_target 以下的目标不参与判定（低速比值噪声大）
-        {"LF_ach_t", type_float, &lf_motors.achieve_tau_us, "左前达标时间常数", "us"},
-        {"RF_ach_t", type_float, &rf_motors.achieve_tau_us, "右前达标时间常数", "us"},
-        {"LB_ach_t", type_float, &lb_motors.achieve_tau_us, "左后达标时间常数", "us"},
-        {"RB_ach_t", type_float, &rb_motors.achieve_tau_us, "右后达标时间常数", "us"},
-        {"LF_ach_t", type_float, &lf_motors.achieve_min_target, "左前达标门槛", "pct"},
-        {"RF_ach_t", type_float, &rf_motors.achieve_min_target, "右前达标门槛", "pct"},
-        {"LB_ach_t", type_float, &lb_motors.achieve_min_target, "左后达标门槛", "pct"},
-        {"RB_ach_t", type_float, &rb_motors.achieve_min_target, "右后达标门槛", "pct"},
+        {"LF_ach_tau", type_float, &lf_motors.achieve_tau_us, "左前达标时间常数", "us"},
+        {"RF_ach_tau", type_float, &rf_motors.achieve_tau_us, "右前达标时间常数", "us"},
+        {"LB_ach_tau", type_float, &lb_motors.achieve_tau_us, "左后达标时间常数", "us"},
+        {"RB_ach_tau", type_float, &rb_motors.achieve_tau_us, "右后达标时间常数", "us"},
+        {"LF_ach_min", type_float, &lf_motors.achieve_min_target, "左前达标门槛", "pct"},
+        {"RF_ach_min", type_float, &rf_motors.achieve_min_target, "右前达标门槛", "pct"},
+        {"LB_ach_min", type_float, &lb_motors.achieve_min_target, "左后达标门槛", "pct"},
+        {"RB_ach_min", type_float, &rb_motors.achieve_min_target, "右后达标门槛", "pct"},
 
         // ========== 混控与同步（底盘级）==========
         {"mix_max", type_float, &chassis.max_wheel_speed, "单轮满速", "pct"},
@@ -178,7 +179,7 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"internal", type_float, &chassis.internal_force, "内耗", "pct", monitor_tag_fast},
         {"fight", type_bool, &chassis.fight_mode, "受力不均", "", monitor_tag_fast},
         {"fight_tr", type_float, &chassis.fight_trans_scale, "受力不均平移系数", "", monitor_tag_fast},
-        {"fight_t", type_uint32_t, &chassis.fight_time_us, "受力不均计时", "us", monitor_tag_fast},
+        {"fight_tm", type_uint32_t, &chassis.fight_time_us, "受力不均计时", "us", monitor_tag_fast},
 
         // 定位轮原始累计（第4步正负与尺度）
         {"trk_fwd", type_float, &chassis.forward_tracking_distance, "前向轮里程", "m", monitor_tag_slow},

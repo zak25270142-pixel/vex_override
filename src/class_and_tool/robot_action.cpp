@@ -181,7 +181,7 @@ void RobotAction::update_manual(uint32_t now)
     if (manual_forward == 0.0f && manual_side == 0.0f)
     {
         chassis.stop(); // 指令已收到 0，实际速度也跟下来了，此时刹车不会点头
-        hold_active = false;
+        clear_manual_state();
         return;
     }
     chassis.output(manual_forward, manual_side, turn_hold(0.0f, now));
@@ -201,7 +201,11 @@ float RobotAction::turn_hold(float turn, uint32_t now)
     {
         hold_active = true;
         hold_heading = chassis.heading;
-        heading_pid.reset(0.0f, now);
+        // 锁的这一拍只能要 reset() 的首轮输出，不能再跟一次 update()：
+        // 两者用同一个时间戳 → gap_time_s = 0 → D 项 (0−0)/0 = NaN，
+        // NaN 顺着转向通道进混控（f±s±t 四项都含 t）会把四个轮目标全带成 NaN。
+        // 锁定瞬间误差恒为 0（目标就是此刻航向），reset 返回的 P 项也是 0，语义一致。
+        return heading_pid.reset(0.0f, now);
     }
     return heading_pid.update(remainderf(hold_heading - chassis.heading, 360.0f), now);
 }
@@ -215,8 +219,7 @@ void RobotAction::refresh()
     // 指针为空即空闲。
     if (chassis_task_ptr != nullptr)
         (this->*chassis_task_ptr)(now);
-    chassis.sync_tick();  // 先同步：读上拍实测的达标情况，算好各组 dyn_factor
-    chassis.speed_tick(); // 再跑速度环：本拍就用上新系数
+    chassis.speed_tick(); // 内部先同步（读上拍达标情况、算各组 dyn_factor），再跑四组速度环
 }
 
 void RobotAction::turn(float angle)
@@ -259,6 +262,7 @@ void RobotAction::action_finished()
 {
     // 自然结束统一收尾：停车、清指针，最后通知回调（此时本动作已收尾，回调可直接发起下一个）。
     chassis.stop();
+    clear_manual_state();
     chassis_task_ptr = nullptr;
     if (move_end_callback != nullptr)
         move_end_callback();
@@ -268,11 +272,22 @@ void RobotAction::stop_move()
 {
     // 外部主动打断：只停车、清指针，不触发回调。
     chassis.stop();
+    clear_manual_state();
     chassis_task_ptr = nullptr;
+}
+
+void RobotAction::clear_manual_state()
+{
+    manual_forward = 0.0f;
+    manual_side = 0.0f;
+    hold_active = false;
 }
 
 void RobotAction::manual()
 {
     // 建议外部手动设置only_value状态,避免误触
+    clear_manual_state();
+    // 缓冲步长要有真实起点：留 0 的话首个松杆拍 dt_s 会走兜底值 0.01，一步收得偏大。
+    manual_prev_us = get_time_us();
     chassis_task_ptr = &RobotAction::update_manual;
 }

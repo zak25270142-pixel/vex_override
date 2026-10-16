@@ -256,6 +256,8 @@ void Chassis::output(float forward, float side, float turn)
 void Chassis::speed_tick()
 {
     // 速度环唯一执行点：由短周期常驻任务调用。
+    // 同步在这里带着跑（先决策后执行），调用方每周期只调本函数一次即可。
+    sync_tick();
     // 停车后各组 spin_state 为 Stopped，my_spin 立即返回；下次 output() 下目标时自动起步。
     for (int i = 0; i < 4; i++)
         wheels[i]->my_spin();
@@ -293,8 +295,13 @@ void Chassis::sync_tick()
     // ---- 1. 折算"满力达标能力" capability = achieve / dyn_factor ----
     // 关键一步：被我们压着的组折回 ≈1（它其实有能力），真跑不动的组才是短板。
     // 若直接用达标率取最小值，我们压出来的慢会被当成新短板，全车一起锁死在低速（闭锁）。
+    // 同时求 level = 四组能"共同达到"的最高水平：取各组 capability·dyn_ceil() 里最小的那个，
+    // 也就是"短板组把自己的 dyn 拉到顶之后能到的高度"。level 天然带出处置顺序——
+    // 短板组先被提速（dyn>1，用掉标定冗余），拉到顶还不够时 level 才落到它的真实水平上，
+    // 才轮到其余各组被压下来。没人掉队时 level 停在 1，四组都 want=1，什么都不做。
     float c_min = 1.0f;
     float c_max = 0.0f;
+    float level = 1.0f;
     bool any_valid = false;
     for (int i = 0; i < 4; i++)
     {
@@ -307,6 +314,7 @@ void Chassis::sync_tick()
         capability[i] = fmaxf(cap_min, fminf(g.achieve / g.dyn_factor, 1.0f));
         c_min = fminf(c_min, capability[i]);
         c_max = fmaxf(c_max, capability[i]);
+        level = fminf(level, capability[i] * g.dyn_ceil());
         any_valid = true;
     }
 
@@ -338,7 +346,8 @@ void Chassis::sync_tick()
             // 被外力顶住 / 带偏的轮必须给满力。这两态下速度环要的是"顶着不放"，
             // 同步要是按指令比例把它的电压压下来，等于替外力松劲——车直接被弹开。
             // 它同时也排在最前面：fight_mode 的按向量分配会破坏这个唯一目的。
-            want = 1.0f;
+            // "满力"是本组的 dyn_ceil()（volt_factor<1 的组可以越过 1 用到标定冗余）。
+            want = g.dyn_ceil();
         }
         else if (fight_mode)
         {
@@ -347,7 +356,11 @@ void Chassis::sync_tick()
             // 且 X 布局下 JᵀJ 是对角的，λ 按 |w_i| 取就能让合力方向对上指令方向。
             // 分支必须在 !achieve_valid 之前：否则处于 Transit/小目标的轮会被给到满力，
             // 其余轮按比例打折，正好破坏"守合力方向"这个唯一目的。
-            want = fabsf(wheel_target[i]) / fmaxf(cmd, 1e-3f);
+            // 本拍没让它出力的轮（斜移时指令为 0 的那两个）不参与分配：把它的系数压到
+            // 地板换不来任何好处，而等要它出力时 dyn 得按 dyn_up_per_s 爬 3 秒才回得来，
+            // 这 3 秒里它就是全车的短板，姿态一直歪着。保持原值不动。
+            const float share = fabsf(wheel_target[i]) / fmaxf(cmd, 1e-3f);
+            want = (share <= 0.0f) ? g.dyn_factor : share;
         }
         else if (!g.achieve_valid)
         {
@@ -357,11 +370,13 @@ void Chassis::sync_tick()
         }
         else
         {
-            // 跟踪：能力强的让出（压到短板的水平），短板保持满力(1)。
-            // 于是四轮达成率一致 → 实际运动是"指令方向的等比缩小版"，姿态不变形。
-            want = c_min / capability[i];
+            // 跟踪：先提速、后压缩。level/capability 对短板组自己就是"往 dyn_ceil() 抬"，
+            // 抬到顶仍不够时 level 才等于它的真实水平，其余各组才被压到同一水平。
+            // 四轮达成率一致 → 实际运动是"指令方向的等比缩小版"，姿态不变形。
+            want = level / capability[i];
         }
-        want = fmaxf(dyn_floor, fminf(want, 1.0f));
+        // 上限是本组的 dyn_ceil() 而不是 1：volt_factor<1 的组有标定冗余，允许往上用。
+        want = fmaxf(dyn_floor, fminf(want, g.dyn_ceil()));
 
         const float step = (want < g.dyn_factor) ? down_step : up_step;
         const float delta = fmaxf(-step, fminf(want - g.dyn_factor, step));
