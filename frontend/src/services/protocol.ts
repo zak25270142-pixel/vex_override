@@ -161,7 +161,8 @@ export interface DirItem {
 
 /**
  * 动作命令的一个输入字段（类型用于渲染控件和编码，name 是字段中文标签）。
- * min/max：目录 tag bit7=1 时下发的取值范围（float），未下发时为 undefined
+ * min/max：目录 tag bit7=1 时下发的取值范围，**按本字段 type 解码、与字段同型**
+ * （整型字段为整数，float/double 为小数），未下发时为 undefined。
  */
 export interface CmdField {
   type: ValueType
@@ -437,23 +438,15 @@ function dirLen(p: Uint8Array, len: number): number {
 }
 
 /**
- * 试算动作命令目录帧的 payload 总长：
- *   [命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[tag bit7=1时:(min,max)×参数量]
- * 当前已收字节不足以走查完全部字段时返回 -1（继续等），走查完返回总长。
+ * 动作命令目录帧的 payload 总长：
+ *   [内容长度2B][命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[tag bit7=1时:(min,max)×N]
+ * 头 2B 是"后续内容长度"（小端 uint16），收够 2B 即可定长，不必遍历字段走查。
+ * 由下位机给长度是因为：min/max 按字段类型定宽后，长度要按各字段 valueSize 累加，
+ * 上位机再实现一遍这套走查既啰嗦又容易与下位机不一致。
  */
 function cmdDirLen(p: Uint8Array, len: number): number {
-  if (len < 3) return -1
-  let off = 3 + p[2]! // 越过 命令字 + tag + 名长 + 名字
-  if (len < off + 1) return -1
-  const fieldNum = p[off]!
-  off++
-  for (let i = 0; i < fieldNum; i++) {
-    if (len < off + 2) return -1 // 类型+字段名长还没收齐
-    off += 2 + p[off + 1]!
-  }
-  // tag bit7=1：字段后还有每字段一对min/max（float各4B）
-  if (p[1]! & CMD_TAG_RANGE) off += 8 * fieldNum
-  return off
+  if (len < 2) return -1 // 长度前缀还没收齐
+  return 2 + (p[0]! | (p[1]! << 8))
 }
 
 export class FrameParser {
@@ -555,7 +548,7 @@ export class FrameParser {
               const types = this.cmd === CmdPost.MonitorValue ? this.monitorType : this.tunableType
               if (this.len >= 1) this.expect = 1 + valueSize(types[this.payload[0]!]!)
             } else if (this.cmd === CmdPost.CMDDirectory) {
-              // 命令目录：字段数量嵌在帧里，要沿 [类型+名长+名] 逐步走查才知道总长
+              // 命令目录：payload 头 2B 就是内容长度，收够 2B 即定长
               const total = cmdDirLen(this.payload, this.len)
               if (total >= 0) this.expect = total
             } else {
@@ -629,15 +622,17 @@ export class FrameParser {
         break
       }
       case CmdPost.CMDDirectory: {
-        // [命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[tag bit7=1时:(min,max)×参数量]
-        if (this.len < 3) return
-        const index = p[0]!
-        const tag = p[1]!
-        const nameLen = p[2]!
-        if (this.len < 3 + nameLen + 1) return
+        // [内容长度2B][命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×N]
+        if (this.len < 5) return
+        let off = 2 // 跳过 payload 头的 2B 内容长度
+        const index = p[off]!
+        const tag = p[off + 1]!
+        const nameLen = p[off + 2]!
+        const nameAt = off + 3
+        off = nameAt + nameLen
+        if (this.len < off + 1) return
         const decoder = new TextDecoder('utf-8')
-        const name = decoder.decode(p.subarray(3, 3 + nameLen))
-        let off = 3 + nameLen
+        const name = decoder.decode(p.subarray(nameAt, off))
         const fieldNum = p[off]!
         off++
         const fields: CmdField[] = []
@@ -650,13 +645,17 @@ export class FrameParser {
           fields.push({ type, name: decoder.decode(p.subarray(off, off + flen)) })
           off += flen
         }
-        // tag bit7=1：读取每字段一对min/max（float小端各4B），按字段顺序配对
+        // tag bit7=1：每字段一对 min/max，与该字段同类型、同宽度（valueSize），按字段顺序排列
         if (tag & CMD_TAG_RANGE) {
-          for (let i = 0; i < fieldNum && off + 8 <= this.len; i++) {
+          for (const f of fields) {
+            const sz = valueSize(f.type)
+            if (sz === 0 || off + 2 * sz > this.len) break // str/other 无范围；或帧被截断
             const d = new DataView(p.buffer, p.byteOffset + off)
-            fields[i]!.min = d.getFloat32(0, true)
-            fields[i]!.max = d.getFloat32(4, true)
-            off += 8
+            const mn = decodeValue(d, 0, f.type)
+            const mx = decodeValue(d, sz, f.type)
+            if (typeof mn === 'number') f.min = mn
+            if (typeof mx === 'number') f.max = mx
+            off += 2 * sz
           }
         }
         onEvent(new CmdDirectoryEvent({ index, tag, name, fields }))

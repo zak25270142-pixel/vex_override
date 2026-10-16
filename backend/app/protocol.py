@@ -274,11 +274,15 @@ def command_send(cmd_index: int, field_types: list[int], values: list[CellValue]
 
 @dataclass
 class CmdField:
-    """动作命令的一个参数。min/max 只在 tag 的 bit7(RANGE) 置位时才有值。"""
+    """动作命令的一个参数。
+
+    min/max 只在 tag 的 bit7(RANGE) 置位时才有值，且**按本字段的 type 解码、与字段同型**：
+    整型字段解成 int、float/double 解成 float，不再一律当 float32。
+    """
     type: int
     name: str
-    min: float | None = None # 需支持 int 类型 先标记更改点
-    max: float | None = None # 需支持 int 类型 先标记更改点
+    min: float | int | None = None
+    max: float | int | None = None
 
 
 @dataclass
@@ -410,22 +414,16 @@ def _dir_len(p: bytes, length: int) -> int:
 
 
 def _cmd_dir_len(p: bytes, length: int) -> int:
-    """试算动作命令目录帧 payload 总长；不够返回 -1。
-    [命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×参数量]"""
-    if length < 3:
+    """动作命令目录帧 payload 总长；不够返回 -1。
+
+    帧头 2B 就是"后续内容长度"（小端 uint16），所以直接 2 + 该值，不用遍历字段走查：
+    [内容长度2B][命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×N]
+    之所以由下位机给长度：min/max 改成按字段类型定宽后，长度要按各字段 value_size 累加，
+    让上位机再实现一遍这套走查纯属折磨（且容易与下位机不一致）。
+    """
+    if length < 2:
         return -1
-    off = 3 + p[2]
-    if length < off + 1:
-        return -1
-    field_num = p[off]
-    off += 1
-    for _ in range(field_num):
-        if length < off + 2:
-            return -1
-        off += 2 + p[off + 1]
-    if p[1] & CMD_TAG_RANGE:
-        off += 8 * field_num  # 每个参数 8 字节：float32 min + float32 max
-    return off
+    return 2 + int.from_bytes(p[0:2], "little")
 
 
 def scan_dir_frames(chunk: bytes) -> tuple[list[tuple[int, bytes]], int]:
@@ -649,15 +647,18 @@ class FrameParser:
             return
 
         if cmd == CmdPost.CMDDirectory:
-            if self.len < 3:
+            # payload 头 2B 是内容长度，内容从 off=2 起：[命令字][tag][名长][名][参数量][字段...]
+            if self.len < 5:
                 return
-            index = p[0]
-            tag = p[1]
-            name_len = p[2]
-            off = 3 + name_len
+            off = 2
+            index = p[off]
+            tag = p[off + 1]
+            name_len = p[off + 2]
+            name_at = off + 3
+            off = name_at + name_len
             if self.len < off + 1:
                 return
-            name = p[3:off].decode("utf-8", errors="replace")
+            name = p[name_at:off].decode("utf-8", errors="replace")
             field_num = p[off]
             off += 1
             fields: list[CmdField] = []
@@ -670,15 +671,15 @@ class FrameParser:
                 fname = p[off : off + fname_len].decode("utf-8", errors="replace")
                 off += fname_len
                 fields.append(CmdField(type=ftype, name=fname))
-            # RANGE 置位时后面紧跟每个参数 8 字节的 (min,max) float32 对
+            # RANGE 置位：后面紧跟每个参数一对 (min,max)，宽度与类型与该字段一致
             if tag & CMD_TAG_RANGE:
-                for i in range(field_num):
-                    if self.len < off + 8:
-                        break
-                    mn, mx = struct.unpack_from("<ff", p, off)
-                    fields[i].min = mn
-                    fields[i].max = mx
-                    off += 8
+                for f in fields:
+                    sz = value_size(f.type)
+                    if sz == 0 or self.len < off + 2 * sz:
+                        break  # str/other 无范围；或帧被截断
+                    f.min = decode_value(p, off, f.type)
+                    f.max = decode_value(p, off + sz, f.type)
+                    off += 2 * sz
             on_event(
                 CmdDirectoryEvent(
                     item=CmdDirItem(index=index, tag=tag, name=name, fields=fields),

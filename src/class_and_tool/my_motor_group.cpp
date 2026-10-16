@@ -95,7 +95,8 @@ void MyMotorGroup::my_spin()
     //   退出：电压从顶满回落即脱离堵转（高 target 时速度回升、低 target 时电压被 P 压回）。
     if (spin_state == Transit && (fabs_error <= error_for_i || (now_us - transit_start_us >= transit_freeze_us && fabsf(now_a) <= speed_stable && fabsf(pre_a) <= speed_stable)))
         spin_state = Track;
-    else if ((error > error_for_i && derivative > 0.0f && now_a < 0.0f || error < -error_for_i && derivative < 0.0f && now_a > 0.0f))
+    else if ((error > error_for_i && derivative > 0.0f && now_a < 0.0f) ||
+             (error < -error_for_i && derivative < 0.0f && now_a > 0.0f))
         spin_state = Recover;
     else if (spin_state == Track && fabs_error <= err_in_dead)
         spin_state = Stable;

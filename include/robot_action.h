@@ -49,6 +49,8 @@ private:
     int32_t *move_axis;
     int32_t *turn_axis;
 
+    int32_t manual_stop_start = 0;
+
     // 动作自然结束的统一收尾（含发起时已在容差内、一步未动的瞬间完成）：
     // 停车、清指针、触发 move_end_callback。
     void action_finished();
@@ -102,6 +104,9 @@ public:
     // ---- 手动控制----
     float turn_atten = 0.5f;  // 转向衰减系数，0=无衰减，1=全衰减
     int manual_deadzone = 16; // 手动摇杆输入死区
+
+    // 松杆后0V惰行时间，防急刹
+    uint32_t manual_stop_delay = 50000;
 
     // 进入手动模式：把注入的摇杆设为 only_value（不触发方向键），
     // 接力指针指向 update_manual，refresh() 每轮自动执行手动控制。

@@ -69,8 +69,12 @@ struct CMD_ITEM
     const char *const *field_name; // 输入字段中文名表（无参时可为nullptr）
     const char *name;              // 命令中文名，目录帧与诊断用
     uint8_t tag;                   // tag位域：bit6~4参数个数 bit3~0特化命令（bit7恒0，发送时自动置位）
-    const float *ranges;           // 取值范围表{min1,max1,min2,max2,...}：非空时目录帧自动追加min/max并置tag bit7
-                                   // ！！！取值范围这里用float 不正确，范围类型应和VALUE_TYPE对齐！！！
+    // 取值范围：按字段顺序紧凑排列的{min1,max1,min2,max2,...}，每个值占 value_size(data_type[f])
+    // 字节、小端——min/max 的类型与宽度必须和它那个字段的 VALUE_TYPE 对齐，不能一律当 float。
+    // 用 void* 正是因为各字段类型可以不同（例如 uint8_t 编号 + float 电压）；
+    // 定义端用同型数组（字段同型）或 __attribute__((packed)) 结构体（字段异型）给出这段字节流。
+    // 非空时目录帧自动在字段描述后追加全部 min/max 并置 tag bit7；str/other 宽度为 0，无范围。
+    const void *ranges;
 };
 
 class USB_Comm
@@ -84,7 +88,7 @@ private:
         Post_Monitor_Directory, // 监控目录；其中 tag 为位域字节（见 my_main.h）
         Monitor_Post,           // 有内容命令 [CMD 1B][index索引1B][当前数值?B取决于type][XOR]
         Tunable_Echo,           // 有内容命令 [CMD 1B][index索引1B][实际生效值?B取决于type][XOR]
-        Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][tag 1B][名长][名][参数量][每参:类型+字段名长+字段名][bit7=1时:每参min/max]，一命令一帧
+        Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][tag 1B][名长][名][参数量][每参:类型+字段名长+字段名][bit7=1时:每参min+max，各按该参类型定宽]，一命令一帧
         Pong = 0xFF,
     };
     enum Cmd_Get

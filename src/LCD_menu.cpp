@@ -66,6 +66,9 @@ const struct MENU_ITEM menu_item[] =
         {"L_errI", type_float, &left_motors.error_for_i, "左I误差阈值", "pct"},
         {"R_errI", type_float, &right_motors.error_for_i, "右I误差阈值", "pct"},
 
+        // 手柄松杆减速缓冲：太小会点头前倾，太大松杆后滑行太久
+        {"man_decay", type_float, &robot_action.manual_stop_delay, "松杆停车延迟", "us"},
+
         // // ========== 位置环 ==========
         // {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp", ""},
         // {"d_ki", type_float, &robot_action.distance_pid.ki, "距离ki", ""},

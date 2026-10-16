@@ -192,29 +192,40 @@ void RobotAction::update_manual(uint32_t now)
     float forward = square_map_axis(*move_axis);
     float turn = square_map_axis(*turn_axis);
 
-    // 两杆都回中 → 停车（清积分由 chassis.stop → MyMotorGroup::stop 完成）
-    if (forward == 0.0f && turn == 0.0f)
+    if (forward != 0.0f || turn != 0.0f)
     {
-        chassis.stop();
+        // 摇杆合成半径 r ∈ [0, 1]（用原始轴值算，避免 square_map 二次非线性）
+        float r = sqrtf(static_cast<float>((*move_axis) * (*move_axis) + (*turn_axis) * (*turn_axis))) / 127.0f;
+
+        float turn_scaled = turn * (1.0f - turn_atten * r);
+
+        float left_cmd = forward + turn_scaled;
+        float right_cmd = forward - turn_scaled;
+
+        float max_abs = fmaxf(fabsf(left_cmd), fabsf(right_cmd));
+        if (max_abs > 1e-3f)
+        {
+            float scale = r * 100 / max_abs;
+            left_cmd *= scale;
+            right_cmd *= scale;
+        }
+        chassis.output(left_cmd, right_cmd);
+        // 记住本拍指令：松杆后要按它做减速缓冲
         return;
     }
 
-    // 摇杆合成半径 r ∈ [0, 1]（用原始轴值算，避免 square_map 二次非线性）
-    float r = sqrtf(static_cast<float>((*move_axis) * (*move_axis) + (*turn_axis) * (*turn_axis))) / 127.0f;
-
-    float turn_scaled = turn * (1.0f - turn_atten * r);
-
-    float left_cmd = forward + turn_scaled;
-    float right_cmd = forward - turn_scaled;
-
-    float max_abs = fmaxf(fabsf(left_cmd), fabsf(right_cmd));
-    if (max_abs > 1e-3f)
+    if (manual_stop_start == 0)
     {
-        float scale = r * 100 / max_abs;
-        left_cmd *= scale;
-        right_cmd *= scale;
+        if (now == 0)
+            now++;
+        manual_stop_start = now;
     }
-    chassis.output(left_cmd, right_cmd);
+    else if (now - manual_stop_start >= manual_stop_delay)
+    {
+        chassis.stop(); // 指令已收到 0，实际速度也跟下来了，此时刹车不会点头
+        return;
+    }
+    chassis.output(0, 0);
 }
 
 void RobotAction::refresh()
