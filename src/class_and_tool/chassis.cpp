@@ -311,7 +311,9 @@ void Chassis::sync_tick()
     }
 
     // ---- 2. 受力不均判定：看各轮能力的离散度 / 内耗，不看"车动没动" ----
-    // 整车顶死时四组都进 Recover，用不着专门判；两组卡死车还能动，判"不动"也说明不了问题。
+    // 单轮被外力带偏(Recover)或顶死(Stall)时该轮 achieve_valid 为假 → capability 置 1，
+    // 不会被当成短板，也就不会把全车拖到它的水平（外力不是"这轮天生弱"，学它没有意义）。
+    // 那种轮靠 internal_force 兜：它不转而别的轮转，本身就是内耗，会进 fight_mode。
     // 要防的是各轮受力不均 → 内耗 + 姿态歪，主要发生在手柄推挤期间。
     float cmd = 0.0f;
     for (int i = 0; i < 4; i++)
@@ -331,7 +333,14 @@ void Chassis::sync_tick()
     {
         MyMotorGroup &g = *wheels[i];
         float want;
-        if (fight_mode)
+        if (g.spin_state == MyMotorGroup::Stall || g.spin_state == MyMotorGroup::Recover)
+        {
+            // 被外力顶住 / 带偏的轮必须给满力。这两态下速度环要的是"顶着不放"，
+            // 同步要是按指令比例把它的电压压下来，等于替外力松劲——车直接被弹开。
+            // 它同时也排在最前面：fight_mode 的按向量分配会破坏这个唯一目的。
+            want = 1.0f;
+        }
+        else if (fight_mode)
         {
             // 受力不均：改按指令向量的方向分配电压 → 合力方向不变，姿态不丢。
             // 原理：全向轮的力只沿轮轴方向，力向量取成 λ·J·v 一定落在 J 的像空间里（不打架），

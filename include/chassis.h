@@ -30,22 +30,34 @@ private:
 public:
     enum SpinState
     {
-        Stopped, // 停车或目标死区：0V，环休眠
-        Transit, // 目标事件窗：起步 / 换向 / target 大跳，I 不工作   特征:error大且加速度较大
+        Stopped, // 停车：0V + 刹车，环休眠
+        Transit, // 目标事件窗：起步 / 换向 / 目标大跳，I 不工作   特征:error大，但是我们自己刚改的主意
         Track,   // 正常跟踪：I 工作                               特征:error(较)小或加速度(较)小
         Stable,  // 目标稳定：I 大砍,尽量保持稳定                    特征:error小且加速度小
-        Recover  // 目标未大跳，但 error 被拉大：负载或跟不上，I 工作  特征:error大且加速度小->突然大->小(经常会推到100%电压)
-        // 进入:error大且仍在拉大、加速度与error反向; 堵转中换向不清积分、不限电压斜率，电压随目标过零慢释放
-        // 堵转：负载顶住，电压顶满(≈100%)对抗，I 工作
-        // 退出:电压从顶满回落(负载松开)
+        Recover, // 非预期运动：车被外力带偏                         特征:error大且车速被拉向输出的反方向
+        Stall    // 堵转：给满了车也不动                            特征:output 接近上限且轮速低且持续
 
-        // other -> Stopped 仅手动停车 (0pct target不算Stopped)
-        // Stop -> Transit  启动
+        // ===== 三类处境，按"误差是谁造成的"分 =====
+        //   Transit  —— 目标（操作手）造成的：重新建立输出，积分清零，升压受限
+        //   Track    —— 没人在闹，或只是小扰动：交给 I 自己吸收
+        //   Recover  —— 外力造成的，车还在动：两方向都不限斜率，抢时间补力矩
+        //   Stall    —— 外力造成的，车已经不动：顶住电压，松劲方向限速（松了会被弹回来）
+
+        // other -> Stopped  仅手动停车；0 pct 的 target 不算 Stopped，0 由速度环自己收敛
+        // Stop -> Transit   启动
+        // Other -> Transit  目标事件（见 drive()）：目标大跳且离实际速度远 / 换向
         // Transit -> Track  error小到一定程度 或加速度小到一定程度(加速度小了还没进入小error区间说明缺I不够，得加上I进行追踪)
-        // Track -> Stable  在不断追踪后error小且加速度小(说明稳定了,砍kI减小震荡)
-        // Other -> Transit  targrt突变，需先等kf释放完
-        // Track/Stable -> Recover  负荷突增/被顶:error大且仍在拉大、加速度与error反向
-        // Recover -> Track/Stable   ？？
+        // Track -> Stable   error小且加速度小(说明稳定了,砍kI减小震荡)
+        // Stable -> Track   error 超出死区
+        // Track/Stable -> Recover  外力把车速拉向输出的反方向
+        // Recover -> Transit  误差回到 I 工作区（积分已不可信，冻结重新观察）
+        // Track/Recover -> Stall  给满 + 轮速低，并持续够久
+        // Stall -> Transit  轮速起来了，或操作手松杆
+
+        // Transit 与 Stall 互斥：起步那几十毫秒 output 也满、轮速也 0，靠 stall_time 滤掉
+        // Recover 不从 Transit 进：Transit 里 error 大是操作手造成的，不是外力证据
+        // 全向底盘注意：Recover/Stall 不在 {Track,Stable} 里 → achieve_valid 自动为假 → 同步冻结，
+        //   外力造成的慢不会被当成"这轮天生弱"学进去；同时 sync_tick 会给这两个态强制满力。
     };
 
     SpinState spin_state = Stopped;
@@ -60,7 +72,7 @@ public:
     // 中间连续过渡（target 每增大 3pct，静态→动态多衰减约 63%），全程无跳变。
     float static_deadzone = 1.5f;  // 静止时补偿电压上限(整车下,单位V)
     float dynamic_deadzone = 0.8f; // 高速时补偿电压下限(整车下,单位V)
-    float output_deadzone = 0.5f;  // 目标速度死区，单位 pct，目标绝对值小于它时按0处理
+    float output_deadzone = 0.5f;  // 目标速度死区，单位 pct；绝对值小于它按下发0处理（收敛到0由速度环负责，停车由外界 stop()）
 
     // ---- 同步：volt_factor 标定的"在线动态版" ----
     // 静态 volt_factor（可 >1）吃掉"各电机天生快慢不同"；
@@ -77,18 +89,21 @@ public:
     // 这里再滤一次只是让同步的慢性判定更稳，不是救量化噪声。
     // 起步(Transit)、换向、目标过小这些判不准的期间本值无效，同步**冻结**（不跟也不压），
     // 打滑/腾空也落在这段里——不引入错误方向的学习，少量误差交给位置环和操作手。
+    // Recover/Stall 同样落在冻结段里：那是外力造成的慢，不是"这轮天生弱"，
+    // 学进去只会让全车被一个临时被顶住的轮拖慢。
     float achieve = 1.0f;
     bool achieve_valid = false; // 本拍达标率是否有效（稳态跟踪 且 目标足够大）
-    bool limited = false;       // 本拍是否顶住：归一输出被顶满 或 处于 Recover（堵转）。仅进监控，同步不读它
+    bool limited = false;       // 本拍是否顶住：归一输出被顶满 或 处于 Recover/Stall。仅进监控，同步不读它
     float achieve_tau_us = 30000.0f; // 达标率低通时间常数(us)：约 30ms 跟上，调用周期变了不用改
     float achieve_min_target = 8.0f; // 目标速度低于此值(pct)不参与达标判定
 
-    // ---- target 突变进入 Transit 状态的判态参数 ----
-    // target 变化量超过该固定阈值即视为大幅跳变，强制进入提速态（清积分、重新观察）。
-    // 用固定值：各速度段行为一致，不会出现低速敏感、高速迟钝的割裂感。单位 pct。
+    // ---- 目标事件（Transit）判据 ----
+    // 目标变化量超过它才算"目标大跳"，单位 pct。因为是在相邻两拍上比的，
+    // 它实际是个**速率**门槛：10ms 周期下 12 pct/拍 ≈ 操作手在 83ms 内推完整个行程。
+    // 慢慢拨杆（每拍变化小于它）不会进 Transit——那本就不需要重新建立输出。
     float target_jump_abs = 12.0f;
     // ---- 稳定态判态参数 ----
-    float speed_stable = 50.0f; // Transit->Track加速度阈值，单位 pct/s方
+    float speed_stable = 50.0f; // Transit->Track加速度阈值，单位 pct/s；同时作为 Recover/Stall 里的最小加速度门槛
     float err_in_dead = 2.0f;   // Track->Stable 误差死区，进入该范围内后，I 大砍，减少震荡
     float err_out_dead = 3.0f;  // Stable->Track  误差死区，退出该范围内后，I 大砍，减少震荡
 
@@ -96,10 +111,31 @@ public:
 
     // I 项工作范围（误差阈值）：|error| 落在它以内算小误差——I 才开始工作、Transit 才可进 Track。单位 pct。
     // 固定值即可：I 的波动幅度天生与 error 同量纲、与 target 无关，稳定态抖动靠调小 ki 抑制。
+    // 同时是 Recover 的退出条件：误差被拉出这个范围才谈得上"非预期"。
     float error_for_i = 8.0f;
 
-    // 提速态电压斜率上限：比稳定态宽，让电压快速跟上目标跳变，
-    float slew_boost = 25.0f; // V/s
+    // ---- 非预期运动（Recover）判据 ----
+    // 车速被外力带离目标时的加速度门槛，单位 pct/s。
+    // 物理参照：传动系统自身在反向满电压下能造成的最大减速度，超过它就不可能是我们做的。
+    // 注意 kf 标定到 target=100 时 ff 正好等于 1.0，满杆下没有余量可给、Recover 收益为 0，
+    // 所以这个门槛不需要很灵敏。实车标定。
+    float recover_accel = 200.0f;
+    // 归一化输出达到它算"已经给到上限"，用于 Recover 的兜底项和 Stall 的合取项。
+    float stall_output = 0.99f;
+    // 轮速低于它算"轮胎基本没转"，单位 pct。
+    float stall_speed = 8.0f;
+    // "给满 + 轮速低"要同时成立这么久才认 Stall，单位 us。
+    // 它必须大于整车满载起步到 stall_speed 的时间：起步那段 output 本来就是满的、轮速本来就是 0，
+    // 没有这个延时的话每次起步都会误判成堵转。实车标定。
+    uint32_t stall_time = 300000;
+
+    // 电压斜率上限，两个方向不对称：
+    //   升压侧：加压过快会让起步打滑、电流拉爆，必须慢。
+    float slew_boost = 25.0f; // 升压斜率上限，单位 V/s
+    //   撤压侧：收油/制动没有打滑风险，电机那端本来就是被动负载，
+    //   撤压慢等于迟收油、继续推着车走。初值按"松杆后 manual_stop_delay 内能从
+    //   满压收到 0"取：12V / 0.05s = 240 V/s。改 manual_stop_delay 时一并复核。
+    float slew_release = 240.0f; // 撤压斜率上限，单位 V/s
 
     int8_t target_sign = 0; // 上一轮目标方向，用于检测换向与双极性映射；0 表示起步前未知
     float target = 0.0f;    // 目标速度，单位 pct（±100）,外界禁止直接修改
@@ -119,6 +155,7 @@ public:
     // 新进入 Transit 后先冻结这么久（窗内只采样加速度），避免起步第一拍速度仍为 0 时直接误进 Track。
     uint32_t transit_freeze_us = 20000; // 冻结时长，单位 us（约合 10ms 周期的两拍）
     uint32_t transit_start_us = 0;      // 进入 Transit 的时刻，单位 us
+    uint32_t stall_since_us = 0;        // "给满 + 轮速低"开始成立的时刻；不成立时为 0
 
     // motor_list/count 为本组电机表（构造时拷入，上限 4）；后四个为速度环增益。
     MyMotorGroup(const MyMotor *motor_list, uint8_t count,
