@@ -52,37 +52,36 @@ MON_CLOSED = ["左前指令", "右前指令", "左前转速", "右前转速",
 NAME_X, NAME_Y, NAME_YAW = "全局X", "全局Y", "航向"
 
 # 调参项中文名（调参目录下发的是 Chinese_name，不是代码里的 item_name）
-GAIN_KEYS = ["左kf 输出/pct", "左kp 输出/pct", "左ki 输出/(pct·s)", "左kd 输出·s/pct",
-             "右kf 输出/pct", "右kp 输出/pct", "右ki 输出/(pct·s)", "右kd 输出·s/pct"]
-GAIN_NAME = {"L": {"kf": "左kf 输出/pct", "kp": "左kp 输出/pct",
-                   "ki": "左ki 输出/(pct·s)", "kd": "左kd 输出·s/pct"},
-             "R": {"kf": "右kf 输出/pct", "kp": "右kp 输出/pct",
-                   "ki": "右ki 输出/(pct·s)", "kd": "右kd 输出·s/pct"}}
+# 注意不含 kf：前馈是插值表（下位机 chassis.h 的 KfTable），由电机测算后手动填在
+# robot_and_control.cpp 里重新烧录，调参目录和本脚本都不改它；要动前馈请走开环电压
+# 实验、回来改表。另注意固件里表的占位值是各节点 0.01，与历史实验的 0.006 不同，
+# 复现旧数据前先把表填成对应值。
+GAIN_KEYS = ["左kp 输出/pct", "左ki 输出/(pct·s)", "左kd 输出·s/pct",
+             "右kp 输出/pct", "右ki 输出/(pct·s)", "右kd 输出·s/pct"]
+GAIN_NAME = {"L": {"kp": "左kp 输出/pct", "ki": "左ki 输出/(pct·s)", "kd": "左kd 输出·s/pct"},
+             "R": {"kp": "右kp 输出/pct", "ki": "右ki 输出/(pct·s)", "kd": "右kd 输出·s/pct"}}
 
-# 闭环增益组：(组名, kf, kp, ki每秒, kd每秒, 摩擦垫设置)
+# 闭环增益组：(组名, kp, ki每秒, kd每秒, 摩擦垫设置)
 # 摩擦垫设置=None 用当前调参值；否则为 (静摩擦V, 动摩擦V, volt_min V×8台)
 # 注意 ki/kd 调参表里存的就是每秒量纲值，脚本原样下发，无需换算。
+# kf 不在此扫：固件里的插值表整个实验期间保持不变（见 robot_and_control.cpp）。
 GAIN_GROUPS = [
-    # --- 前馈扫掠（ki=0，看纯前馈残差分布）---
-    ("ff05_hi",  0.005, 0.0,   0.0, 0.0, (2.0, 1.0, 0.5)),
-    ("ff06_hi",  0.006, 0.0,   0.0, 0.0, (2.0, 1.0, 0.5)),
-    ("ff07_hi",  0.007, 0.0,   0.0, 0.0, (2.0, 1.0, 0.5)),
-    ("ff05_lo",  0.005, 0.0,   0.0, 0.0, (1.3, 0.6, 0.5)),
-    ("ff06_lo",  0.006, 0.0,   0.0, 0.0, (1.3, 0.6, 0.5)),
-    ("ff07_lo",  0.007, 0.0,   0.0, 0.0, (1.3, 0.6, 0.5)),
-    # --- 积分扫掠（kf=0.006 主候选，ki 从 0.1 到 0.4）---
-    ("pi01_hi",  0.006, 0.01,  0.1, 0.0, (2.0, 1.0, 0.5)),
-    ("pi02_hi",  0.006, 0.01,  0.2, 0.0, (2.0, 1.0, 0.5)),
-    ("pi04_hi",  0.006, 0.01,  0.4, 0.0, (2.0, 1.0, 0.5)),
-    ("pi01_lo",  0.006, 0.01,  0.1, 0.0, (1.3, 0.6, 0.5)),
-    ("pi02_lo",  0.006, 0.01,  0.2, 0.0, (1.3, 0.6, 0.5)),
-    ("pi04_lo",  0.006, 0.01,  0.4, 0.0, (1.3, 0.6, 0.5)),
+    # --- 纯前馈对照（PID 全 0，看当前 kf 表单独能把各档目标推到多少）---
+    ("ffonly_hi", 0.0, 0.0, 0.0, (2.0, 1.0, 0.5)),
+    ("ffonly_lo", 0.0, 0.0, 0.0, (1.3, 0.6, 0.5)),
+    # --- 积分扫掠（ki 从 0.1 到 0.4）---
+    ("pi01_hi",  0.01, 0.1, 0.0, (2.0, 1.0, 0.5)),
+    ("pi02_hi",  0.01, 0.2, 0.0, (2.0, 1.0, 0.5)),
+    ("pi04_hi",  0.01, 0.4, 0.0, (2.0, 1.0, 0.5)),
+    ("pi01_lo",  0.01, 0.1, 0.0, (1.3, 0.6, 0.5)),
+    ("pi02_lo",  0.01, 0.2, 0.0, (1.3, 0.6, 0.5)),
+    ("pi04_lo",  0.01, 0.4, 0.0, (1.3, 0.6, 0.5)),
     # --- kp 扫掠（确认比例项必要性）---
-    ("kp005",    0.006, 0.005, 0.2, 0.0, (1.3, 0.6, 0.5)),
-    ("kp010",    0.006, 0.01,  0.2, 0.0, (1.3, 0.6, 0.5)),
-    ("kp020",    0.006, 0.02,  0.2, 0.0, (1.3, 0.6, 0.5)),
+    ("kp005",    0.005, 0.2, 0.0, (1.3, 0.6, 0.5)),
+    ("kp010",    0.01, 0.2, 0.0, (1.3, 0.6, 0.5)),
+    ("kp020",    0.02, 0.2, 0.0, (1.3, 0.6, 0.5)),
     # --- 基准对照（原固件默认值）---
-    ("baseline", 0.008, 0.01,  0.3, 0.0, None),
+    ("baseline", 0.01, 0.3, 0.0, None),
 ]
 PAD_NAMES = ["左静摩擦", "左动摩擦", "右静摩擦", "右动摩擦"] + \
             [f"左{i}最小电压" for i in range(4)] + [f"右{i}最小电压" for i in range(4)]
@@ -410,10 +409,10 @@ class Probe:
             self.return_home()
 
     # ---------------- 实验2：闭环增益扫掠（每脉冲后倒车回原点） ----------------
-    def apply_settings(self, kf, kp, ki_s, kd_s, pads, remember=True):
-        val = {"kf": kf, "kp": kp, "ki": ki_s, "kd": kd_s}
+    def apply_settings(self, kp, ki_s, kd_s, pads, remember=True):
+        val = {"kp": kp, "ki": ki_s, "kd": kd_s}
         for side in ("L", "R"):
-            for k in ("kf", "kp", "ki", "kd"):
+            for k in ("kp", "ki", "kd"):
                 self.L.set_tunable(GAIN_NAME[side][k], val[k])
         if pads is not None:
             st, dy, vmin = pads
@@ -425,7 +424,7 @@ class Probe:
                     self.L.set_tunable(f"左{i}最小电压", vmin)
                     self.L.set_tunable(f"右{i}最小电压", vmin)
         if remember:
-            self.cur_settings = (kf, kp, ki_s, kd_s, pads)
+            self.cur_settings = (kp, ki_s, kd_s, pads)
 
     def phase_closed(self, no_prompt=False, group_filter=None, rotate=False):
         L = self.L
@@ -434,11 +433,11 @@ class Probe:
         time.sleep(0.3)
         self.halt()
         groups = [g for g in GAIN_GROUPS if group_filter is None or g[0] in group_filter]
-        for gname, kf, kp, ki, kd, pads in groups:
+        for gname, kp, ki, kd, pads in groups:
             self.wd.check()
-            self.apply_settings(kf, kp, ki, kd, pads)
+            self.apply_settings(kp, ki, kd, pads)
             if not no_prompt:
-                print(f"\n>>> 下一组: {gname}  kf={kf} kp={kp} ki={ki} kd={kd} pads={pads}")
+                print(f"\n>>> 下一组: {gname}  kp={kp} ki={ki} kd={kd} pads={pads}")
                 print("    车应已在原点附近；回车开始（q 结束闭环实验）")
                 ans = input("    > ").strip().lower()
                 if ans == "q":
@@ -446,7 +445,7 @@ class Probe:
                 self.wd.arm(rotate=rotate)
             else:
                 mode_txt = "  [原地旋转：正反转交替/脉冲≤270°/飘移0.15m收车]" if rotate else ""
-                print(f"\n===== 增益组 {gname}  kf={kf} kp={kp} ki={ki} pads={pads}{mode_txt} =====")
+                print(f"\n===== 增益组 {gname}  kp={kp} ki={ki} kd={kd} pads={pads}{mode_txt} =====")
                 self.wd.arm(rotate=rotate)
                 time.sleep(0.3)
             for pulse_i, tgt in enumerate(SPEED_TARGETS):
@@ -615,7 +614,7 @@ def main():
             probe.phase_closed(args.no_prompt, gf, rotate=args.rotate)
         probe.write_summary()
 
-        # 还原调参（闭环实验改过 kf/kp/ki/kd）
+        # 还原调参（闭环实验改过 kp/ki/kd 与摩擦垫；kf 表不动，无需还原）
         if saved_gains:
             for k, v in saved_gains.items():
                 if v is not None:

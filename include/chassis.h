@@ -62,7 +62,7 @@ class MyMotorGroup
 {
 private:
 public:
-    enum SpinState
+    enum SpinState : uint8_t
     {
         Stopped, // 停车：0V + 刹车，环休眠
         Transit, // 目标事件窗：起步 / 换向 / 目标大跳，I 不工作   特征:error大，但是我们自己刚改的主意
