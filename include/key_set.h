@@ -24,6 +24,7 @@ extern Control_key key_add;
 extern Control_key key_reduce;
 extern Control_key key_back;
 extern Control_key key_shift;
+extern Control_key key_joy_menu; // 手柄控屏开关（只由脑屏按钮触发，不绑手柄按键）
 
 // 屏幕按钮对象
 extern Screen_Button button1;

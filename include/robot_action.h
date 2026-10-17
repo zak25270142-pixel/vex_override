@@ -55,11 +55,6 @@ private:
     // 停车、清指针、触发 move_end_callback。
     void action_finished();
 
-    // 摇杆值平方映射：保留符号的平方，把 [-127, 127] 映射到 [-100, 100]。
-    // 输入绝对值小于 manual_deadzone 时输出 0；
-    // 否则把 [deadzone^2, 127^2] 线性映射到 [0, 100]，再加符号。
-    float square_map_axis(int v);
-
 public:
     // 底盘实例由 .cpp 用本车硬件构造后传入；里程与速度数据可供 monitor 等直接读取。
     Chassis &chassis;
@@ -102,19 +97,21 @@ public:
     void stop_move();
 
     // ---- 手动控制----
-    float turn_atten = 0.5f;  // 转向衰减系数，0=无衰减，1=全衰减
-    int manual_deadzone = 16; // 手动摇杆输入死区
+    // 45° 倾角时的转弯半径(m)，决定方向→半径曲线 ρ=C/tanθ，越小转向越贼；必须 >0
+    float turn_radius_45 = 1.2f;
+    int manual_deadzone = 16; // 摇杆死区，平方域判据
 
-    // 松杆后0V惰行时间，防急刹
+    // 松杆到硬刹之间的延时，单位 us（当前 50ms）。
     uint32_t manual_stop_delay = 50000;
 
     // 进入手动模式：把注入的摇杆设为 only_value（不触发方向键），
     // 接力指针指向 update_manual，refresh() 每轮自动执行手动控制。
     // is_busy() 此后为真，调用方可据此挡住自动动作。
     // 退出用 stop_move()。
-    // 当前实现为 Arcade（单左手摇杆：value_y 前后、value_x 转向）。
-    // 迁移到 Tank：改读 manual_right_axis 的 value_y，与左手摇杆的 value_y
-    // 分别作为左右轮速度，去掉 turn 项，直接 chassis.output(left, right)。
+    // 当前实现为 Arcade（单左手摇杆：value_y 前后、value_x 转向）：杆量→外侧轮速度，
+    // 方向→转弯半径，两者互不干扰（见 update_manual）。
+    // 迁移到 Tank（两杆独立）：两轴各自过平方曲线后直接 chassis.output(left, right)，
+    // 无合成半径、无缩放——两侧天然解耦，各侧满偏即本侧 100。
     void manual();
 
     // ---- 可直接调用的动作 ----

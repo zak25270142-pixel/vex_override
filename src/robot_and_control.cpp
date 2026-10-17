@@ -15,9 +15,29 @@ static vex::motor right_chassis_2(vex::PORT20, vex::ratio6_1, false);
 static vex::motor right_chassis_3(vex::PORT18, vex::ratio6_1, true);
 static vex::motor right_chassis_4(vex::PORT19, vex::ratio6_1, true);
 
-// 后四个为速度环增益（秒量纲，误差单位 pct）：kf 阻力前馈(输出/pct)、kp(输出/pct)、
-// ki(输出/(pct·秒))、kd(输出·秒/pct)。
-// 当前为接通链路用的占位值，两组相同，必须在实车上重新标定后再用于比赛。
+// 后三个为速度环增益（秒量纲，误差单位 pct）：kp(输出/pct)、ki(输出/(pct·秒))、
+// kd(输出·秒/pct)；前馈 kf 是插值表，见下方 kf_table 定义，不走标量入参。
+
+// kf 阻力前馈插值表（左右各一份）：node 为 |target| 节点(pct，升序)，k 为各节点斜率
+// (归一输出/pct)。当前是接通链路用的占位值——6 个节点全填 0.01，等价于改造前的常数 kf。
+// 实车标定（手动填表在此处完成，改完重新烧录；调参目录与上位机脚本都不含 kf，它不是在
+// 线调参拧出来的量）：开环逐档扫电压得 V(v)，反解该转速下稳态所需归一输出
+// out(v)=(V(v)-sign·(friction(v)+volt_min))/((volt_max-friction(v)-volt_min)·volt_factor)
+// （volt 参数取 motors[0]，与速度反馈同台），再取 k[i]=out(v_i)/v_i。
+// 口径：v 是电机 SDK pct 转速，node 是相对本侧 max_speed 归一后的目标速度
+// （target = v/max_speed×100，output() 已把外部指令缩到这个口径），换算别搞混。
+// out(v) 被 1.0 顶住（阻力小、前馈先饱和）时该式自动给出 ff 平台，无需特殊节点；
+// 曲线只要求随 |target| 单调不减。用监控项"左前馈/右前馈"逐档核对。详见 chassis.h 的 KfTable。
+static const KfTable left_kf_table = {
+    {0.0f, 10.0f, 25.0f, 50.0f, 75.0f, 100.0f}, // node：低速段密（摩擦过渡在这段）
+    {0.01f, 0.01f, 0.01f, 0.01f, 0.01f, 0.01f}, // k：占位，实车逐节点标定
+    6,
+};
+static const KfTable right_kf_table = {
+    {0.0f, 10.0f, 25.0f, 50.0f, 75.0f, 100.0f},
+    {0.01f, 0.01f, 0.01f, 0.01f, 0.01f, 0.01f},
+    6,
+};
 
 // 逐台电机的个体属性（构造种子，组内会拷走一份）：volt_factor 让同一指令下各轮轮速
 // 一致，volt_min 对齐各轮开始转动的最低电压，volt_max 为该电机可达最高电压（V）。
@@ -36,20 +56,12 @@ static const MyMotor right_motor_list[4] = {
     {&right_chassis_4, 1.0f, 12.0f, 0.5f, 0.0f},
 };
 
-// 速度环默认增益（连续摩擦补偿+斜率限制架构下标定）：
-// kf=0.006 前馈按开环 V(tgt)≈1.15+0.065·pct 反推斜率；
-// kp=0.01 使 1pct 量化台阶只产生 ~0.1V 电压扰动；
-// ki=0.1/s 是实测安全上限（0.2 在 tgt10 已积分超调截停）；
-// kd=0 不用（量化反馈下微分只放大噪声）。
-// 实测单个电机裸转速度环发现:要约0.01才能达到步进(可能是因为我把最大电压改成了10V？)
-// 我发现他电压经常容易达不到(应该是达到最大功率什么的了),但电压改小了他会变得更小，然后就一直达不到，不知道怎么解决
-// 我感觉我可能，写程序写上位机可以，但调车与最底层的运动逻辑真不行？
 MyMotorGroup left_motors(
     left_motor_list, 4,
-    0.01f, 0.006f, 0.08f, 0.0f);
+    left_kf_table, 0.006f, 0.08f, 0.0f);
 MyMotorGroup right_motors(
     right_motor_list, 4,
-    0.01f, 0.006f, 0.08f, 0.0f);
+    right_kf_table, 0.006f, 0.08f, 0.0f);
 
 // 定位轮端口与转向取自旧车工程：PORT1 为前向轮（旧工程 RotationY），
 // PORT2 为侧向轮（旧工程 RotationX），均反转。首次试车需核对滚动方向：

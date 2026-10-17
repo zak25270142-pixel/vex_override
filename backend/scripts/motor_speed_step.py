@@ -4,7 +4,8 @@
 
 与 motor_v_test.py（0x84 开环直加电压）互补：
   - 本脚本经速度环：chassis.output(left, right) → 5ms my_spin 追踪
-  - 用于标定 kf/kp/ki/kd、核对 volt_min/factor 在闭环下的表现
+  - 用于标定 kp/ki/kd、核对 volt_min/factor 在闭环下的表现
+    （kf 前馈是手动填的插值表，不在此脚本扫，见 robot_and_control.cpp）
 
 默认流程（单侧）：
   对侧目标=0，本侧按阶跃序列 0→30→60→0（pct），每段保持固定时间；

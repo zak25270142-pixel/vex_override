@@ -172,47 +172,28 @@ void RobotAction::update_goto(uint32_t now)
 
 // ---- 手动控制（驾驶员开环）----
 
-float RobotAction::square_map_axis(int v)
-{
-    // 保留符号的平方：把摇杆小值压低、大值保留，低速更可控。
-    // 输入 -127~127，输出 -100~100。
-    // 输入平方小于 manual_deadzone 时输出 0；
-    // 否则把 [deadzone^2, 127^2] 线性映射到 [0, 100]，再加符号。
-    // 平方后的有效范围即 [-(127*127)+deadzone, 127*127-deadzone]。
-    int sign = v < 0 ? -1 : 1;
-    int v2 = v * v;
-    if (v2 < manual_deadzone)
-        return 0.0f;
-    return (float)sign * (v2 - manual_deadzone) / (16129 - manual_deadzone) * 100;
-}
-
 void RobotAction::update_manual(uint32_t now)
 {
-    // square_map_axis 已把单轴做成低速更细（死区 + 平方映射），输出约 ±100
-    float forward = square_map_axis(*move_axis);
-    float turn = square_map_axis(*turn_axis);
+    // 摇杆值只在本函数开头读一次：changed 回调在另一线程更新 now_x/now_y，
+    // 分开解引用可能混用到两拍的值
+    int32_t mv = *move_axis;
+    int32_t tn = *turn_axis;
+    int32_t mv2tn2 = mv * mv + tn * tn;
 
-    if (forward != 0.0f || turn != 0.0f)
+    if (mv2tn2 > manual_deadzone)
     {
         manual_stop_start = 0; // 清零后代表未停止，下次松杆重新计时
 
-        // 摇杆合成半径 r ∈ [0, 1]（用原始轴值算，避免 square_map 二次非线性）
-        float r = sqrtf(static_cast<float>((*move_axis) * (*move_axis) + (*turn_axis) * (*turn_axis))) / 127.0f;
+        // 方向→半径 ρ=C·mv/tn（κ=tanθ/C 展开即原始轴的线性混合）：半径只随方向
+        float k = chassis.track_width / (2.0f * turn_radius_45); // K=轮距/(2C)
+        float left_cmd = mv + k * tn;
+        float right_cmd = mv - k * tn;
 
-        float turn_scaled = turn * (1.0f - turn_atten * r);
-
-        float left_cmd = forward + turn_scaled;
-        float right_cmd = forward - turn_scaled;
-
-        float max_abs = fmaxf(fabsf(left_cmd), fabsf(right_cmd));
-        if (max_abs > 1e-3f)
-        {
-            float scale = r * 100 / max_abs;
-            left_cmd *= scale;
-            right_cmd *= scale;
-        }
-        chassis.output(left_cmd, right_cmd);
-        // 记住本拍指令：松杆后要按它做减速缓冲
+        // 杆量→外侧轮速度：杆量² 从死区到 127² 线性映射（小值压低，低速更可控）。
+        // 平方曲线只许在这里——进混合段会把 κ 变成 tan²θ，半径就被杆量污染了
+        float speed = (mv2tn2 - manual_deadzone) / (16129.0f - manual_deadzone) * 100.0f;
+        float scale = speed / fmaxf(fabsf(left_cmd), fabsf(right_cmd));
+        chassis.output(left_cmd * scale, right_cmd * scale);
         return;
     }
 
@@ -224,7 +205,9 @@ void RobotAction::update_manual(uint32_t now)
     }
     else if (now - manual_stop_start >= manual_stop_delay)
     {
-        chassis.stop(); // 指令已收到 0，实际速度也跟下来了，此时刹车不会点头
+        if (chassis.left_motors.spin_state == MyMotorGroup::SpinState::Stopped &&
+            chassis.right_motors.spin_state == MyMotorGroup::SpinState::Stopped)
+            chassis.stop(); // 指令已收到 0，实际速度也跟下来了，此时刹车不会点头
         return;
     }
     chassis.output(0, 0);

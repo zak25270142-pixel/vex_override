@@ -17,12 +17,9 @@ static MENU_state menu_state = pre;
 const struct MENU_ITEM menu_item[] =
     {
         // ========== 速度环（左右）==========
-        // kf/kp/ki/kd 成员均与构造入参同量纲（秒量纲），不再有 1e6 内部换算
-        {"L_kf", type_float, &left_motors.kf, "左kf", ""},
         {"L_kp", type_float, &left_motors.kp, "左kp", ""},
         {"L_ki", type_float, &left_motors.ki, "左ki", ""},
         {"L_kd", type_float, &left_motors.kd, "左kd", ""},
-        {"R_kf", type_float, &right_motors.kf, "右kf", ""},
         {"R_kp", type_float, &right_motors.kp, "右kp", ""},
         {"R_ki", type_float, &right_motors.ki, "右ki", ""},
         {"R_kd", type_float, &right_motors.kd, "右kd", ""},
@@ -72,6 +69,8 @@ const struct MENU_ITEM menu_item[] =
 
         // 手柄松杆减速缓冲：太小会点头前倾，太大松杆后滑行太久
         {"man_decay", type_uint32_t, &robot_action.manual_stop_delay, "松杆停车延迟", "us"},
+        // 45° 倾角时的转弯半径(m)：越小转向越贼，越大越钝。方向定半径，与杆量无关
+        {"turn_r45", type_float, &robot_action.turn_radius_45, "45度转弯半径", "m"},
 
         // // ========== 位置环 ==========
         // {"d_kp", type_float, &robot_action.distance_pid.kp, "距离kp", ""},
@@ -138,10 +137,16 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"R_tgt", type_float, &right_motors.target, "右指令转速", "pct", monitor_tag_fast},
         {"L_integral", type_float, &left_motors.integral, "左PID积分", "", monitor_tag_fast},
         {"R_integral", type_float, &right_motors.integral, "右PID积分", "", monitor_tag_fast},
+        // 本拍前馈输出 = kf插值表(|target|)·target：标定 kf 表时直接看它，比看 Vcmd 少一层映射
+        {"L_ff", type_float, &left_motors.feedforward, "左前馈", "", monitor_tag_fast},
+        {"R_ff", type_float, &right_motors.feedforward, "右前馈", "", monitor_tag_fast},
         {"L_error", type_float, &left_motors.previous_error, "左PID误差", "", monitor_tag_fast},
         {"R_error", type_float, &right_motors.previous_error, "右PID误差", "", monitor_tag_fast},
-        {"L_boost", type_bool, &left_motors.spin_state, "左模式", "", monitor_tag_fast},
-        {"R_boost", type_bool, &right_motors.spin_state, "右模式", "", monitor_tag_fast},
+        // 速度环状态机（见 chassis.h 的 SpinState）：
+        // 0=Stopped停车 1=Transit起步/换向 2=Track跟踪 3=Stable稳定 4=Recover外力 5=Stall堵转
+        // 判"有没有真的切成停车态"就看这两项是不是 0。
+        {"L_state", type_uint8_t, &left_motors.spin_state, "左环状态", "", monitor_tag_fast},
+        {"R_state", type_uint8_t, &right_motors.spin_state, "右环状态", "", monitor_tag_fast},
 
         // 转速/电流/编码器：无捕获 lambda 直接转 MenuFloatGetter，构造自动置 GETTER；
         // SDK 读数是 double，cast 成 float 匹配签名。加/删一项只动这一行
@@ -275,6 +280,32 @@ void refresh_menu()
         {
             menu_state = ai_vision;
             ai_vision_menu.init();
+        }
+        else if (key_joy_menu.read())
+        {
+            // 手柄控屏开关：默认关。
+            //   关：两根摇杆都是 only_value，只当数据源、绝不产生菜单按键；
+            //   开：摇杆转为方向键语义可操作菜单，同时交出底盘（手动模式停车并置空闲）。
+            // 两者互斥是刻意的——改参数和开车不能同时发生，否则边开边把参数捅坏。
+            static bool joystick_menu_on = false;
+            joystick_menu_on = !joystick_menu_on;
+            if (joystick_menu_on)
+            {
+                left_axis.state = Remote_Control::middle;
+                right_axis.state = Remote_Control::middle;
+                robot_action.stop_move();
+                button3.reset_button_name("remote:on", 14, 16);
+                button3.reset_button_color(vex::color(0x00cc44), vex::color(0x005511));
+            }
+            else
+            {
+                left_axis.state = Remote_Control::only_value;
+                right_axis.state = Remote_Control::only_value;
+                robot_action.manual();
+                button3.reset_button_name("remote:off", 14, 16);
+                button3.reset_button_color(vex::color(0x777777), vex::color(0x222222));
+            }
+            button3.draw_button(Screen_Button::draw_released);
         }
         break;
 

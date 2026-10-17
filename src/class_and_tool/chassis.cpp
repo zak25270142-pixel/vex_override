@@ -6,11 +6,11 @@ Chassis::Chassis(MyMotorGroup &left,
                  vex::rotation &forward_tracking,
                  vex::rotation &left_tracking,
                  vex::inertial &inertial)
-    : left_motors(left),
-      right_motors(right),
-      forward_tracking_sensor(forward_tracking),
+    : forward_tracking_sensor(forward_tracking),
       left_tracking_sensor(left_tracking),
-      inertial_sensor(inertial)
+      inertial_sensor(inertial),
+      left_motors(left),
+      right_motors(right)
 {
 }
 
@@ -210,8 +210,7 @@ void Chassis::output(float left_output, float right_output)
 
 void Chassis::speed_tick()
 {
-    // 速度环唯一执行点：由 5ms 常驻任务短周期调用。
-    // 停车后 is_stoped 为真，my_spin 立即返回；下次 output() 下目标时 drive 自动清积分起步。
+    // 速度环唯一执行点：停车状态下各组内部直接返回；下次 output() 下目标时 drive 自动清积分起步。
     left_motors.my_spin();
     right_motors.my_spin();
 }

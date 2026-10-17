@@ -6,6 +6,36 @@
 // 里程计读数只取motor1
 // MotorGroup 里的电机都用齿轮串连传动，物理等速
 
+// kf 阻力前馈插值表：单条 kf·target 直线在高低速两端不能同时贴合
+// （实测满速目标实际只到 1/3 速），故前馈斜率随 |target| 分段线性变化。
+// 与电压域摩擦垫的分工：斜率（反电动势 + 传动损耗）归本表，截距（静/动摩擦）归
+// friction 垫，故曲线必然过原点 ff = at(|target|)·target；低速段的固定偏置不要
+// 在这里造，去调 static/dynamic_deadzone。
+// 表由调用方（robot_and_control.cpp）定义、构造时整表传入，MyMotorGroup 只拷一份自己用。
+// 节点口径：node 是“相对本侧可达满速归一后的目标速度”（target=100 即该侧 max_speed，
+// 见 Chassis::output 的缩回），不是电机 SDK 的 pct 转速；拿 SDK 转速标定时要换算。
+// 表值是标定量（开环 V(v) 反解离线算出后写入），不是在线调参拧出来的；
+// 写入侧无约束、输出侧有 [-1,1] clamp，故表值超出没有副作用——阻力小、前馈在
+// 到达满速前就饱和的车，按 k[i]=out(v_i)/v_i 算出来高速段斜率自然变小，形成
+// ff 平台（前馈恒为 1），不需要也不应该为此设特殊节点。
+// 无默认初值：作为聚合体由调用方逐字段显式填好（gnu++11 要求）。
+// 易踩坑：
+//   node[] 必须严格升序，否则 at() 的区间查找会漏段；
+//   num 之后的 node/k 槽位不参与插值，填 0 占位即可；
+//   标定后曲线须随 |target| 单调不减（ff 不许下降，平台合法），否则推大杆前馈
+//   反降，my_spin 的 Recover/Stall 判据（看 output 与加速度的配合）会误触发。
+struct KfTable
+{
+    static constexpr uint8_t MAX_NODE = 8; // 容量上限；调参目录项数 = 实际节点数×2 侧，别贪多
+    float node[MAX_NODE];                  // 节点位置，|target| 单位 pct，升序
+    float k[MAX_NODE];                     // 节点处前馈斜率，单位 归一输出/pct
+    uint8_t num;                           // 实际节点数，≤MAX_NODE
+
+    // 按 |target| 分段线性插值取前馈斜率；低于首节点取首值，超出表尾沿用表尾（不外插，
+    // 免得目标超量程时 ff 飞掉）。节点仅数个，10ms 拍直接算即可，不另存中间状态。
+    float at(float abs_target) const;
+};
+
 // 单台电机的个体属性：一台电机实例 + 逐台标定的电压参数 + 上一拍输出电压。
 // 电机组按数组元素逐台读写这几个属性，外界（LCD调参/监控）也直接取其字段地址。
 // 无默认初值：作为聚合体由调用方（robot_and_control.cpp）逐台显式填好（gnu++11 要求）。
@@ -27,7 +57,7 @@ class MyMotorGroup
 {
 private:
 public:
-    enum SpinState
+    enum SpinState : uint8_t
     {
         Stopped, // 停车：0V + 刹车，环休眠
         Transit, // 目标事件窗：起步 / 换向 / 目标大跳，I 不工作   特征:error大，但是我们自己刚改的主意
@@ -91,9 +121,10 @@ public:
 
     // ---- 非预期运动（Recover）判据 ----
     // 车速被外力带离目标时的加速度门槛，单位 pct/s。
-    // 物理参照：传动系统自身在反向满电压下能造成的最大减速度，超过它就不可能是我们做的。
-    // 注意 kf 标定到 target=100 时 ff 正好等于 1.0，满杆下没有余量可给、Recover 收益为 0，
-    // 所以这个门槛不需要很灵敏。实车标定。
+    // 物理参照：传动系统自身在反向满电压下能造成的最大减速度——这是满电压能力，
+    // 与 kf 表填多少无关，超过它就不可能是我们做的。
+    // 另外满杆时前馈+P 往往已把输出顶满，Recover 解除斜率限幅也挤不出额外力矩，
+    // 收益天然小，所以这个门槛不需要很灵敏。实车标定。
     float recover_accel = 200.0f;
     // 归一化输出达到它算"已经给到上限"，用于 Recover 的兜底项和 Stall 的合取项。
     float stall_output = 0.99f;
@@ -116,7 +147,9 @@ public:
     float target = 0.0f;    // 目标速度，单位 pct（±100）,外界禁止直接修改
     float fabs_target = 0.0f;
 
-    float kf;                    // 阻力前馈，单位：归一输出 / pct
+    KfTable kf_table;         // 阻力前馈插值表（构造时从入参拷入）；kf_table.k[i] 供外界调参/LCD/监控直接读写
+    float feedforward = 0.0f; // 本拍前馈输出（= kf_table.at(|target|)·target），供监控读取，标定表时直接看它
+
     float kp;                    // 比例项，单位：归一输出 / pct
     float ki;                    // 积分项，单位：归一输出 / (pct·秒)，与构造入参一致
     float kd;                    // 微分项，单位：归一输出·秒 / pct，与构造入参一致
@@ -132,9 +165,10 @@ public:
     uint32_t transit_start_us = 0;      // 进入 Transit 的时刻，单位 us
     uint32_t stall_since_us = 0;        // "给满 + 轮速低"开始成立的时刻；不成立时为 0
 
-    // motor_list/count 为本组电机表（构造时拷入，上限 4）；后四个为速度环增益。
+    // motor_list/count 为本组电机表（构造时拷入，上限 4）；kf 为前馈插值表（拷入），
+    // 后三个为速度环增益。
     MyMotorGroup(const MyMotor *motor_list, uint8_t count,
-                 float f, float p, float ki, float kd);
+                 const KfTable &kf, float p, float ki, float kd);
 
     void setStopping(vex::brakeType brake); // 设置电机刹车类型
 
@@ -159,8 +193,6 @@ class Chassis
 {
 private:
     // 硬件由具体车辆创建，Chassis 只保存实际使用的电机组和惯性传感器。
-    MyMotorGroup &left_motors;
-    MyMotorGroup &right_motors;
     vex::rotation &forward_tracking_sensor;
     vex::rotation &left_tracking_sensor;
     vex::inertial &inertial_sensor;
@@ -178,6 +210,8 @@ private:
     float sin_i = 0.0f; // 起始航向的正弦，用于计算从起点开始的位移
 
 public:
+    MyMotorGroup &left_motors;
+    MyMotorGroup &right_motors;
     /* 以下调参区间 */
 
     // 底盘物理参数。轮距预留。
@@ -278,7 +312,7 @@ public:
     // 允许输入超过 100 的叠加值，内部按比例缩回；本函数只写目标，闭环由 speed_tick() 常驻任务执行。
     void output(float left_output, float right_output);
 
-    // 速度环每轮推进：由独立常驻任务短周期调用。停车状态下各组内部直接返回。
+    // 速度环每轮推进：停车状态下各组内部直接返回。
     void speed_tick();
 
     // 按 init() 设置的停车方式停止左右电机组。

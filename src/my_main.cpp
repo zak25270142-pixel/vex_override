@@ -72,6 +72,7 @@ void my_Init()
 
     robot_action.manual();
     left_axis.state = Remote_Control::only_value;
+    right_axis.state = Remote_Control::only_value;
 }
 
 void my_while()
