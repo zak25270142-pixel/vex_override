@@ -287,8 +287,13 @@ void Chassis::stop()
 // 目的就是不抢在 PID 前面动作——同步只削天花板，不碰增益、不清积分、不改目标。
 void Chassis::sync_tick()
 {
-    // 本拍时长取里程计那一拍的间隔（us）；为 0 表示还没跑过 update，本拍不动系数。
-    const float dt_s = static_cast<float>(update_gap) / 1000000.0f;
+    // 同步自己计时（us），不吃 update_gap：
+    //   ① begin_segment() 会把 update_gap 清零，于是每段动作的首拍 dt=0，同步白停一拍；
+    //   ② update_gap 是里程计的间隔，速度环一旦改到别的周期上，dyn_*_per_s 的实际速率会跟着错。
+    const uint32_t sync_now_us = get_time_us();
+    const uint32_t sync_gap_us = (sync_last_us == 0) ? 0 : (sync_now_us - sync_last_us);
+    sync_last_us = sync_now_us;
+    const float dt_s = static_cast<float>(sync_gap_us) / 1000000.0f;
     if (dt_s <= 0.0f)
         return;
 
@@ -329,14 +334,15 @@ void Chassis::sync_tick()
     const bool uneven = any_valid &&
                         ((c_max - c_min) > fight_disp_min ||
                          fabsf(internal_force) > fight_force_min);
-    fight_time_us = uneven ? fight_time_us + update_gap : 0;
+    fight_time_us = uneven ? fight_time_us + sync_gap_us : 0;
     fight_mode = fight_time_us >= fight_enter_us;
     // 平移通道降幅系数：受力越不均降得越多，下限 fight_trans_floor；转向通道不降（姿态优先）。
     fight_trans_scale = fight_mode ? fmaxf(fight_trans_floor, 1.0f - (c_max - c_min)) : 1.0f;
 
     // ---- 3. 每轮下发新系数 ----
-    const float down_step = dyn_down_per_s * dt_s; // 本拍最多压低多少
-    const float up_step = dyn_up_per_s * dt_s;     // 本拍最多回升多少
+    const float down_step = dyn_down_per_s * dt_s;   // 本拍最多压低多少
+    const float up_step = dyn_up_per_s * dt_s;       // 本拍最多恢复多少（→1.0，慢）
+    const float boost_step = dyn_boost_per_s * dt_s; // 本拍最多提速多少（→dyn_ceil()，快）
     for (int i = 0; i < 4; i++)
     {
         MyMotorGroup &g = *wheels[i];
@@ -373,12 +379,19 @@ void Chassis::sync_tick()
             // 跟踪：先提速、后压缩。level/capability 对短板组自己就是"往 dyn_ceil() 抬"，
             // 抬到顶仍不够时 level 才等于它的真实水平，其余各组才被压到同一水平。
             // 四轮达成率一致 → 实际运动是"指令方向的等比缩小版"，姿态不变形。
-            want = level / capability[i];
+            // level==1 就是"四组都跟得上"，此时目标直接写 1.0：用掉的标定余量要还回去。
+            // 不能写成 level/capability —— achieve 被夹在 1，那个式子算出来恰好是 dyn 本身，
+            // 于是 dyn 一旦被抬到 dyn_ceil() 就再也下不来（棘轮），
+            // 一次瞬时扰动会把这一组的提速余量永久吃掉，下次真吃力时只剩"压别人"一条路。
+            want = (level >= 1.0f) ? 1.0f : level / capability[i];
         }
         // 上限是本组的 dyn_ceil() 而不是 1：volt_factor<1 的组有标定冗余，允许往上用。
         want = fmaxf(dyn_floor, fminf(want, g.dyn_ceil()));
 
-        const float step = (want < g.dyn_factor) ? down_step : up_step;
+        // 往 1.0 以上走 = 给短板用余量，必须走快档；往 1.0 走 = 被压过后恢复，走慢档留观察窗。
+        const float step = (want < g.dyn_factor) ? down_step
+                          : (want > 1.0f)        ? boost_step
+                                                 : up_step;
         const float delta = fmaxf(-step, fminf(want - g.dyn_factor, step));
         g.dyn_factor += delta;
     }

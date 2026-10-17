@@ -1,15 +1,31 @@
 #include "chassis.h"
 
 MyMotorGroup::MyMotorGroup(const MyMotor *motor_list, uint8_t count,
-                           float f, float p, float i, float d)
+                           const KfTable &kf, float p, float i, float d)
 {
-    kf = f;
+    kf_table = kf;
     kp = p;
     ki = i;
     kd = d;
     motor_count = count;
     for (uint8_t j = 0; j < count; j++)
         motors[j] = motor_list[j];
+}
+
+// 前馈斜率插值：|target| 落在哪两节点之间就按距离加权。
+float KfTable::at(float abs_target) const
+{
+    if (abs_target <= node[0])
+        return k[0];
+    for (uint8_t i = 1; i < num; i++)
+    {
+        if (abs_target <= node[i])
+        {
+            const float t = (abs_target - node[i - 1]) / (node[i] - node[i - 1]);
+            return k[i - 1] + (k[i] - k[i - 1]) * t;
+        }
+    }
+    return k[num - 1];
 }
 
 void MyMotorGroup::setStopping(vex::brakeType brake)
@@ -123,7 +139,7 @@ void MyMotorGroup::my_spin()
     // ---------- PID ----------
     const float p_output = kp * error;
     const float d_output = kd * derivative;
-    const float feedforward = kf * target;
+    feedforward = kf_table.at(fabs_target) * target;
 
     // ---------- I 项：Transit 不工作；Stable 只缩小新增积分，避免已有 I 输出跳变 ---------
     if (spin_state != Transit)
@@ -151,14 +167,18 @@ void MyMotorGroup::my_spin()
     // 三个中间量：
     //   giving_max  归一输出已经顶到上限（我们要给的全给了）
     //   wheel_low   轮胎基本没在转
-    //   pulled_away 车在本拍输出想推的方向的反方向上运动 —— 我在推它往这走，它偏往那走
+    //   pulled_away 车在"目标想让它去的方向"的反方向上运动 —— 我要它往这走，它偏往那走。
+    //     判"我想让它往哪走"必须用 target 的符号，不能用 output 的：
+    //       制动时 output 是负的，那是在刹车，不是"想让它往后退"；
+    //       target=0 时 output 只剩 P/I 在 0 附近抖动、符号随机，用它判意图必然误触发。
+    //     于是 target=0 时本项恒为 false——松杆就是要它停，车速在降是期望行为，不是非预期运动。
     //   error_grow  车速正被拉离目标（误差在扩大）—— 用来把"外力"和"我们自己在收速"分开：
     //     主动减速（松杆缓冲、位置环收速）时速度是**趋向**目标的，error 与 now_a 同号；
     //     外力带偏时速度是**离开**目标的，两者反号。少了这一条，正常减速也会被判成 Recover，
     //     而一进 Recover 就解除斜率限制、同步又强制满力，反而抖一下、冲一下。
     const bool giving_max = fabsf(output) >= stall_output;
     const bool wheel_low = fabsf(speed) <= stall_speed;
-    const bool pulled_away = (output > 0.0f && now_a < 0.0f) || (output < 0.0f && now_a > 0.0f);
+    const bool pulled_away = (target > 0.0f && now_a < 0.0f) || (target < 0.0f && now_a > 0.0f);
     const bool error_grow = error * now_a < 0.0f;
 
     if (spin_state == Stall)
@@ -312,10 +332,11 @@ void MyMotorGroup::drive(float target)
         spin_state = Transit;
     }
 
-    // target 落进死区时不改 target_sign：摩擦补偿按上一次的方向继续给，
-    // 免得杆在死区边缘抖动时反复翻极性。
-    if (new_target_sign != 0)
-        target_sign = new_target_sign;
+    // target_sign 直接跟随 target 的符号：target=0 时为 0，摩擦垫随之消失。
+    // 车要停就不该再按上一拍的方向垫电压——那等于常驻一股推着车走的力矩。
+    // 抖动导致的 ±2V 翻极性交给斜率不对称吸收：升压 25V/s 慢、撤压 240V/s 快，
+    // 抖动的净电压趋近于 0，真过零起步还有升压斜率挡着不会打滑。
+    target_sign = new_target_sign;
 
     this->target = target;
 }

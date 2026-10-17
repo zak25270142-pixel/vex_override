@@ -22,8 +22,8 @@ static vex::motor rf_chassis_2(vex::PORT20, vex::ratio6_1, false);
 static vex::motor rb_chassis_1(vex::PORT18, vex::ratio6_1, false);
 static vex::motor rb_chassis_2(vex::PORT19, vex::ratio6_1, false);
 
-// 后四个为速度环增益（秒量纲，误差单位 pct）：kf 阻力前馈(输出/pct)、kp(输出/pct)、
-// ki(输出/(pct·秒))、kd(输出·秒/pct)。
+// 后三个为速度环增益（秒量纲，误差单位 pct）：kp(输出/pct)、ki(输出/(pct·秒))、
+// kd(输出·秒/pct)；前馈 kf 是插值表，见下方 kf_table 定义，不走标量入参。
 // 当前为接通链路用的占位值，四组相同，必须在实车上重新标定后再用于比赛。
 
 // 逐台电机的个体属性（构造种子，组内会拷走一份）：volt_factor 让同一指令下各轮轮速
@@ -50,18 +50,49 @@ static const MyMotor rb_motor_list[2] = {
     {&rb_chassis_2, 1.0f, 12.0f, 0.5f, 0.0f},
 };
 
+// kf 阻力前馈插值表（四组各一份）：node 为 |target| 节点(pct，升序)，k 为各节点斜率
+// (归一输出/pct)。当前是接通链路用的占位值——6 个节点全填 0.006，等价于改造前的常数 kf
+// （按开环 V(tgt)≈1.15+0.065·pct 反推斜率：100pct→7.65V→归一输出≈0.57；填 0.01 的话
+// 100pct 时前馈单独就把归一输出顶满 12V，闭环没有向下调节余量）。
+// 实车标定（手动填表在此处完成，改完重新烧录；调参目录与上位机脚本都不含 kf，它不是在
+// 线调参拧出来的量）：开环逐档扫电压得 V(v)，反解该转速下稳态所需归一输出
+// out(v)=(V(v)-sign·(friction(v)+volt_min))/((volt_max-friction(v)-volt_min)·volt_factor)
+// （volt 参数取 motors[0]，与速度反馈同台），再取 k[i]=out(v_i)/v_i。
+// 口径：v 是电机 SDK pct 转速，node 是相对本侧可达满速归一后的目标速度，换算别搞混。
+// out(v) 被 1.0 顶住（阻力小、前馈先饱和）时该式自动给出 ff 平台，无需特殊节点；
+// 曲线只要求随 |target| 单调不减。用监控项"左前前馈/右前前馈/…"逐档核对。详见 chassis.h 的 KfTable。
+// 注：全向轮横移时滚子摩擦明显大于直行，四组标定出来大概率不同，故各持一份。
+static const KfTable lf_kf_table = {
+    {0.0f, 10.0f, 25.0f, 50.0f, 75.0f, 100.0f},       // node：低速段密（摩擦过渡在这段）
+    {0.006f, 0.006f, 0.006f, 0.006f, 0.006f, 0.006f}, // k：占位，实车逐节点标定
+    6,
+};
+static const KfTable rf_kf_table = {
+    {0.0f, 10.0f, 25.0f, 50.0f, 75.0f, 100.0f},
+    {0.006f, 0.006f, 0.006f, 0.006f, 0.006f, 0.006f},
+    6,
+};
+static const KfTable lb_kf_table = {
+    {0.0f, 10.0f, 25.0f, 50.0f, 75.0f, 100.0f},
+    {0.006f, 0.006f, 0.006f, 0.006f, 0.006f, 0.006f},
+    6,
+};
+static const KfTable rb_kf_table = {
+    {0.0f, 10.0f, 25.0f, 50.0f, 75.0f, 100.0f},
+    {0.006f, 0.006f, 0.006f, 0.006f, 0.006f, 0.006f},
+    6,
+};
+
 // 速度环默认增益（连续摩擦补偿+斜率限制架构下标定）。
-// 注意构造签名是 (motor_list, count, kf, kp, ki, kd)——前两个增益是 kf 在前、kp 在后，别写反：
-// kf=0.006 前馈按开环 V(tgt)≈1.15+0.065·pct 反推斜率（100pct→7.65V→归一输出≈0.57）；
-//         写反成 0.01 的话，100pct 时前馈单独就把归一输出顶满 12V，闭环没有向下调节余量。
+// 注意构造签名是 (motor_list, count, kf表, kp, ki, kd)——kf 表在前、kp 在后，别写反。
 // kp=0.01 使 1pct 误差产生约 0.1V 电压扰动（写反成 0.006 则修正力少 40%）。
 // ki=0.08/s 是实测安全上限（0.2 在 tgt10 已积分超调截停）；
 // kd=0 不用（SDK 底层已对编码器速度滤过一次，微分只放大噪声）。
 // 注：全向轮横移时滚子摩擦明显大于直行，四组的 static/dynamic_deadzone 要按方向重新标定。
-MyMotorGroup lf_motors(lf_motor_list, 2, 0.006f, 0.01f, 0.08f, 0.0f);
-MyMotorGroup rf_motors(rf_motor_list, 2, 0.006f, 0.01f, 0.08f, 0.0f);
-MyMotorGroup lb_motors(lb_motor_list, 2, 0.006f, 0.01f, 0.08f, 0.0f);
-MyMotorGroup rb_motors(rb_motor_list, 2, 0.006f, 0.01f, 0.08f, 0.0f);
+MyMotorGroup lf_motors(lf_motor_list, 2, lf_kf_table, 0.01f, 0.08f, 0.0f);
+MyMotorGroup rf_motors(rf_motor_list, 2, rf_kf_table, 0.01f, 0.08f, 0.0f);
+MyMotorGroup lb_motors(lb_motor_list, 2, lb_kf_table, 0.01f, 0.08f, 0.0f);
+MyMotorGroup rb_motors(rb_motor_list, 2, rb_kf_table, 0.01f, 0.08f, 0.0f);
 
 // 定位轮端口与转向取自旧车工程：PORT1 为前向轮（旧工程 RotationY），
 // PORT2 为侧向轮（旧工程 RotationX），均反转。首次试车需核对滚动方向：

@@ -3,6 +3,36 @@
 
 #include "my_main.h"
 
+// kf 阻力前馈插值表：单条 kf·target 直线在高低速两端不能同时贴合
+// （实测满速目标实际只到 1/3 速），故前馈斜率随 |target| 分段线性变化。
+// 与电压域摩擦垫的分工：斜率（反电动势 + 传动损耗）归本表，截距（静/动摩擦）归
+// friction 垫，故曲线必然过原点 ff = at(|target|)·target；低速段的固定偏置不要
+// 在这里造，去调 static/dynamic_deadzone。
+// 表由调用方（robot_and_control.cpp）定义、构造时整表传入，MyMotorGroup 只拷一份自己用。
+// 节点口径：node 是“相对本侧可达满速归一后的目标速度”（target=100 即该侧 max_speed，
+// 见 Chassis::output 的缩回），不是电机 SDK 的 pct 转速；拿 SDK 转速标定时要换算。
+// 表值是标定量（开环 V(v) 反解离线算出后写入），不是在线调参拧出来的；
+// 写入侧无约束、输出侧有 [-1,1] clamp，故表值超出没有副作用——阻力小、前馈在
+// 到达满速前就饱和的车，按 k[i]=out(v_i)/v_i 算出来高速段斜率自然变小，形成
+// ff 平台（前馈恒为 1），不需要也不应该为此设特殊节点。
+// 无默认初值：作为聚合体由调用方逐字段显式填好（gnu++11 要求）。
+// 易踩坑：
+//   node[] 必须严格升序，否则 at() 的区间查找会漏段；
+//   num 之后的 node/k 槽位不参与插值，填 0 占位即可；
+//   标定后曲线须随 |target| 单调不减（ff 不许下降，平台合法），否则推大杆前馈
+//   反降，my_spin 的 Recover/Stall 判据（看 output 与加速度的配合）会误触发。
+struct KfTable
+{
+    static constexpr uint8_t MAX_NODE = 8; // 容量上限；调参目录项数 = 实际节点数×2 侧，别贪多
+    float node[MAX_NODE];                  // 节点位置，|target| 单位 pct，升序
+    float k[MAX_NODE];                     // 节点处前馈斜率，单位 归一输出/pct
+    uint8_t num;                           // 实际节点数，≤MAX_NODE
+
+    // 按 |target| 分段线性插值取前馈斜率；低于首节点取首值，超出表尾沿用表尾（不外插，
+    // 免得目标超量程时 ff 飞掉）。节点仅数个，10ms 拍直接算即可，不另存中间状态。
+    float at(float abs_target) const;
+};
+
 // 电机组 = 一个轮：组内两台电机用齿轮串连传动、物理等速，速度环只取 motors[0] 的读数作反馈。
 // 整车里程计不看电机编码器，由两个定位轮 + IMU 独立测量（见 Chassis::update），
 // 所以驱动轮打滑不会污染定位——这一点是全向底盘最值钱的地方。
@@ -149,7 +179,8 @@ public:
     float target = 0.0f;    // 目标速度，单位 pct（±100）,外界禁止直接修改
     float fabs_target = 0.0f;
 
-    float kf;                    // 阻力前馈，单位：归一输出 / pct
+    KfTable kf_table;         // 阻力前馈插值表（构造时从入参拷入）；kf_table.k[i] 供外界调参/监控直接读写
+    float feedforward = 0.0f; // 本拍前馈输出（= kf_table.at(|target|)·target），供监控读取，标定表时直接看它
     float kp;                    // 比例项，单位：归一输出 / pct
     float ki;                    // 积分项，单位：归一输出 / (pct·秒)，与构造入参一致
     float kd;                    // 微分项，单位：归一输出·秒 / pct，与构造入参一致
@@ -165,9 +196,10 @@ public:
     uint32_t transit_start_us = 0;      // 进入 Transit 的时刻，单位 us
     uint32_t stall_since_us = 0;        // "给满 + 轮速低"开始成立的时刻；不成立时为 0
 
-    // motor_list/count 为本组电机表（构造时拷入，上限 4）；后四个为速度环增益。
+    // motor_list/count 为本组电机表（构造时拷入，上限 4）；kf 为前馈插值表（拷入），
+    // 后三个为速度环增益。
     MyMotorGroup(const MyMotor *motor_list, uint8_t count,
-                 float f, float p, float ki, float kd);
+                 const KfTable &kf, float p, float ki, float kd);
 
     void setStopping(vex::brakeType brake); // 设置电机刹车类型
 
@@ -210,6 +242,11 @@ private:
     // 上一次 update() 的系统时间戳，单位 ms。
     uint32_t previous_time = 0;
 
+    // 上一次 sync_tick() 的系统时间戳，单位 us；0 表示还没跑过。
+    // 同步自己计时：update_gap 会被 begin_segment() 清零，拿它当 dt 会让每段动作
+    // 的首拍同步白停一次；且它是里程计的间隔，速度环若改到别的周期上速率会跟着错。
+    uint32_t sync_last_us = 0;
+
     // // 陀螺残余零偏，单位 deg/s；finish_init 静止采样得到，update 每拍从航向中扣除。
     // float gyro_bias = 0.0f;
     // // 零偏补偿的计时起点（finish_init 时刻），单位 us，与传入 update 的 now 同时基。
@@ -242,9 +279,14 @@ public:
     float dyn_floor = 0.40f;
     // 压低/抬升都是慢性的：应比 I 项积分还慢，别抢在速度环前面动作。
     // 1.0→0.4 约 0.5s，0.4→1.0 约 3s（恢复更慢，留观察窗，避免在门槛上抖）。
-    // 抬到 dyn_ceil()（可能 >1）按同一个速率走，故冗余越大、提速到位越慢——上车按实感重定。
+    // 但"抬升"必须分两种速率——它们是完全不同的处境，共用一个会把处置顺序搞反：
+    //   ① 恢复（→1.0）：被压过的组往回爬。慢，避免在门槛上抖。
+    //   ② 提速（→dyn_ceil() > 1）：短板组用掉标定余量。必须快——level 是按"抬完之后"
+    //      算的，其余组按 dyn_down 约 0.1s 就压到位，短板若按 0.2/s 爬要 1 秒多，
+    //      这 1 秒里"整车已慢、短板还没补上"，正是要靠同步消掉的那段姿态歪。
     float dyn_down_per_s = 1.2f;
-    float dyn_up_per_s = 0.2f;
+    float dyn_up_per_s = 0.2f;    // 恢复：往 1.0 走（慢，防抖）
+    float dyn_boost_per_s = 1.2f; // 提速：往 dyn_ceil() 走，与压低同量级（快）
     float cap_min = 0.10f; // 达标能力下限：达标率趋零时防止算出的系数炸掉（纯数值兜底）
 
     // ---- 受力不均（手柄推挤/对撞/地面差异）----

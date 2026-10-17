@@ -18,20 +18,18 @@ static MENU_state menu_state = pre;
 const struct MENU_ITEM menu_item[] =
     {
         // ========== 速度环（四个轮组）==========
-        // kf/kp/ki/kd 成员均与构造入参同量纲（秒量纲），不再有 1e6 内部换算
-        {"LF_kf", type_float, &lf_motors.kf, "左前kf", ""},
+        // kp/ki/kd 成员均与构造入参同量纲（秒量纲），不再有 1e6 内部换算。
+        // kf 不在这里：它是离线标定的插值表（robot_and_control.cpp 里填，改完重新烧录），
+        // 不是在线拧的量；要在线核对看监控项"左前前馈/…"（= kf表(|target|)·target）。
         {"LF_kp", type_float, &lf_motors.kp, "左前kp", ""},
         {"LF_ki", type_float, &lf_motors.ki, "左前ki", ""},
         {"LF_kd", type_float, &lf_motors.kd, "左前kd", ""},
-        {"RF_kf", type_float, &rf_motors.kf, "右前kf", ""},
         {"RF_kp", type_float, &rf_motors.kp, "右前kp", ""},
         {"RF_ki", type_float, &rf_motors.ki, "右前ki", ""},
         {"RF_kd", type_float, &rf_motors.kd, "右前kd", ""},
-        {"LB_kf", type_float, &lb_motors.kf, "左后kf", ""},
         {"LB_kp", type_float, &lb_motors.kp, "左后kp", ""},
         {"LB_ki", type_float, &lb_motors.ki, "左后ki", ""},
         {"LB_kd", type_float, &lb_motors.kd, "左后kd", ""},
-        {"RB_kf", type_float, &rb_motors.kf, "右后kf", ""},
         {"RB_kp", type_float, &rb_motors.kp, "右后kp", ""},
         {"RB_ki", type_float, &rb_motors.ki, "右后ki", ""},
         {"RB_kd", type_float, &rb_motors.kd, "右后kd", ""},
@@ -115,7 +113,8 @@ const struct MENU_ITEM menu_item[] =
         // 同步是慢性回路：压低/回升都比 I 项慢，别抢在速度环前面
         {"dyn_floor", type_float, &chassis.dyn_floor, "同步系数下限", ""},
         {"dyn_down", type_float, &chassis.dyn_down_per_s, "同步压低速率", "/s"},
-        {"dyn_up", type_float, &chassis.dyn_up_per_s, "同步回升速率", "/s"},
+        {"dyn_up", type_float, &chassis.dyn_up_per_s, "同步恢复速率", "/s"},
+        {"dyn_boost", type_float, &chassis.dyn_boost_per_s, "同步提速速率", "/s"},
         {"cap_min", type_float, &chassis.cap_min, "达标能力下限", ""},
 
         // 受力不均（手柄推挤/对撞/地面差异）：看各轮能力离散度与内耗，不看"车动没动"
@@ -225,6 +224,12 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"RF1_Vcmd", type_float, &rf_motors.motors[1].volt_output, "右前1指令电压", "V", monitor_tag_slow},
         {"LB1_Vcmd", type_float, &lb_motors.motors[1].volt_output, "左后1指令电压", "V", monitor_tag_slow},
         {"RB1_Vcmd", type_float, &rb_motors.motors[1].volt_output, "右后1指令电压", "V", monitor_tag_slow},
+
+        // 本拍前馈输出 = kf插值表(|target|)·target：标定 kf 表时直接看它，比看 Vcmd 少一层映射
+        {"LF_ff", type_float, &lf_motors.feedforward, "左前前馈", "", monitor_tag_fast},
+        {"RF_ff", type_float, &rf_motors.feedforward, "右前前馈", "", monitor_tag_fast},
+        {"LB_ff", type_float, &lb_motors.feedforward, "左后前馈", "", monitor_tag_fast},
+        {"RB_ff", type_float, &rb_motors.feedforward, "右后前馈", "", monitor_tag_fast},
 
         // PID 内部量：调速度环时看积分有没有顶住、误差有没有收敛
         {"LF_error", type_float, &lf_motors.previous_error, "左前PID误差", "", monitor_tag_fast},
@@ -346,6 +351,32 @@ void refresh_menu()
         {
             menu_state = ai_vision;
             ai_vision_menu.init();
+        }
+        else if (key_joy_menu.read())
+        {
+            // 手柄控屏开关：默认关。
+            //   关：两根摇杆都是 only_value，只当数据源、绝不产生菜单按键；
+            //   开：摇杆转为方向键语义可操作菜单，同时交出底盘（手动模式停车并置空闲）。
+            // 两者互斥是刻意的——改参数和开车不能同时发生，否则边开边把参数捅坏。
+            static bool joystick_menu_on = false;
+            joystick_menu_on = !joystick_menu_on;
+            if (joystick_menu_on)
+            {
+                left_axis.state = Remote_Control::middle;
+                right_axis.state = Remote_Control::middle;
+                robot_action.stop_move();
+                button3.reset_button_name("remote:on", 14, 16);
+                button3.reset_button_color(vex::color(0x00cc44), vex::color(0x005511));
+            }
+            else
+            {
+                left_axis.state = Remote_Control::only_value;
+                right_axis.state = Remote_Control::only_value;
+                robot_action.manual();
+                button3.reset_button_name("remote:off", 14, 16);
+                button3.reset_button_color(vex::color(0x777777), vex::color(0x222222));
+            }
+            button3.draw_button(Screen_Button::draw_released);
         }
         break;
 
