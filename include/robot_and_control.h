@@ -13,8 +13,8 @@ extern MyMotorGroup left_motors;
 extern MyMotorGroup right_motors;
 // 逐台电机属性数组：组内持指针共用本数组；菜单/监控表直接绑本数组字段取址
 // （数组基址是链接期常量，不依赖组构造时序，勿改回经 left_motors.motors[i] 绑址）
-extern MyMotor left_motor_list[4];
-extern MyMotor right_motor_list[4];
+extern MyMotor left_motor_list[3];
+extern MyMotor right_motor_list[3];
 
 // 本车动作命令总表（停止/转向/直行/局部移动）：构造USB_Comm时整张传入。
 extern const CMD_ITEM robot_cmds[];

@@ -84,7 +84,7 @@ GAIN_GROUPS = [
     ("baseline", 0.01, 0.3, 0.0, None),
 ]
 PAD_NAMES = ["左静摩擦", "左动摩擦", "右静摩擦", "右动摩擦"] + \
-            [f"左{i}最小电压" for i in range(4)] + [f"右{i}最小电压" for i in range(4)]
+            [f"左{i}最小电压" for i in range(3)] + [f"右{i}最小电压" for i in range(3)]
 SPEED_TARGETS = [3.0, 5.0, 10.0, 20.0]   # pct；3/5pct 是低速重点，10/20pct 验证高速不欠速
 
 # 指标汇总 CSV 的列名（sum_rows 每行按顺序落位，短行后面留空）
@@ -420,7 +420,7 @@ class Probe:
                           ("左动摩擦", dy), ("右动摩擦", dy)]:
                 self.L.set_tunable(nm, v)
             if vmin is not None:
-                for i in range(4):
+                for i in range(3):
                     self.L.set_tunable(f"左{i}最小电压", vmin)
                     self.L.set_tunable(f"右{i}最小电压", vmin)
         if remember:

@@ -543,11 +543,11 @@ class BackendLink:
         return self.cmd("设置电机电压", int(motor_id), float(volts))
 
     def drive_volt(self, volts: float) -> None:
-        """8 个电机全给同一个电压（开环测试用，绕开速度环直接看电机响应）。
+        """6 个电机全给同一个电压（开环测试用，绕开速度环直接看电机响应）。
 
         标速度环前通常先跑这个，摸清"电压→转速"的静态映射和死区。
         """
-        for mid in range(8):
+        for mid in range(6):
             self.set_volt(mid, volts)
 
     def spin_target(self, left: float, right: float) -> dict:
@@ -592,11 +592,11 @@ class BackendLink:
             raise RuntimeError("已紧急停车 / 脚本被中止（后端 abort 置位）")
 
     def close_safely(self) -> None:
-        """收车收尾：目标归零 → 8 电机 0V → 0x80 刹车 → 结束记录 → 退订 → 关连接。
+        """收车收尾：目标归零 → 6 电机 0V → 0x80 刹车 → 结束记录 → 退订 → 关连接。
 
         顺序有讲究：
           1. 先把目标转速归零（让速度环平滑收，不要急刹）
-          2. 再直接把 8 个电机电压写 0（绕开速度环，确保真的不动）
+          2. 再直接把 6 个电机电压写 0（绕开速度环，确保真的不动）
           3. 最后发 0x80 刹车（动作层状态机归位）
         每步单独 try：上位机刚按了停车（后端 abort）时也保证把连接和订阅清干净。
         """
@@ -604,7 +604,7 @@ class BackendLink:
             self.spin_target(0.0, 0.0)
         except Exception:
             pass
-        for mid in range(8):
+        for mid in range(6):
             try:
                 self.set_volt(mid, 0.0)
             except Exception:

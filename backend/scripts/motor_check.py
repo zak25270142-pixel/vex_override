@@ -24,16 +24,16 @@ def main() -> None:
     ap.add_argument("--csv", default="pytest/motor_check.csv", help="结果 CSV，空字符串跳过")
     args = ap.parse_args()
 
-    rpm_names = ["%s%d转速" % (s, n) for s in "左右" for n in range(4)]
-    cur_names = ["%s%d电流" % (s, n) for s in "左右" for n in range(4)]
+    rpm_names = ["%s%d转速" % (s, n) for s in "左右" for n in range(3)]
+    cur_names = ["%s%d电流" % (s, n) for s in "左右" for n in range(3)]
     pos_names = ["全局X", "全局Y", "航向"]
 
-    # with 退出时 __exit__ 自动收车收尾（8电机0V / 刹车 / 停记录 / 退订 / 断连接）
+    # with 退出时 __exit__ 自动收车收尾（6电机0V / 刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
         bl.sub(rpm_names + cur_names + pos_names)  # 登记要记录的项
         rows = []
-        for mid in range(8):
-            name = "%s%d" % ("L" if mid < 4 else "R", mid % 4)
+        for mid in range(6):
+            name = "%s%d" % ("L" if mid < 3 else "R", mid % 3)
             bl.stop_move()
             bl.sleep(0.15)
             bl.start_log()  # 每台一段独立曲线

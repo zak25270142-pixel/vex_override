@@ -32,7 +32,7 @@ def motor_id(motor: str) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description="单电机开环电压特性（升/降压扫描 + 高压点检）")
     ap.add_argument("--base", default="http://127.0.0.1:8000")
-    ap.add_argument("--motors", default="L0,L1,L2,L3,R0,R1,R2,R3")
+    ap.add_argument("--motors", default="L0,L1,L2,R0,R1,R2")
     ap.add_argument("--step", type=float, default=0.02)
     ap.add_argument("--vmax", type=float, default=1.20)
     ap.add_argument("--hold", type=float, default=0.35)

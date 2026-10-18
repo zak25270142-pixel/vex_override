@@ -157,12 +157,12 @@ public:
     /* 以下调参区间 */
 
     // 底盘物理参数
-    float wheel_r = 0.0254f;      // 定位轮半径，单位 m（旧车定位轮直径 5.08cm，即 2 英寸）。
-    float track_width = 0.28694f; // 左右驱动轮接地点之间的距离，单位 m，实测。
+    float wheel_r = 0.0381f;      // 定位轮半径，单位 m（新车定位轮直径 3 英寸）。
+    float track_width = 0.29223f; // 左右驱动轮接地点之间的距离，单位 m。
 
-    // 定位轮到车体旋转中心的有符号距离，单位 m，实测。
-    float forward_tracking_offset = 0.012434f; // 前向定位轮偏右 12.434mm。
-    float side_tracking_offset = -0.021262f;   // 侧向定位轮偏后 21.262mm。
+    // 定位轮到车体旋转中心的有符号距离，单位 m。
+    float forward_tracking_offset = 0.01023f; // 前向轮的横向偏移，向右为正
+    float side_tracking_offset = -0.0889f;  // 侧向轮的纵向偏移，向前为正
 
     // 左右两侧各自的可达满速，pct
     float left_max_speed = 100.0f;

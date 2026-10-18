@@ -48,7 +48,7 @@ def sustained(stats):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:8000")
-    ap.add_argument("--motors", default="L0,L1,L2,L3,R0,R1,R2,R3")
+    ap.add_argument("--motors", default="L0,L1,L2,R0,R1,R2")
     ap.add_argument("--trials", type=int, default=6)
     ap.add_argument("--step", type=float, default=0.02)
     ap.add_argument("--vstart", type=float, default=0.20)
