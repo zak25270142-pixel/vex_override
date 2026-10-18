@@ -43,7 +43,6 @@ void AI_VISION_MENU::draw_box_view()
                           BOX_VIEW_SIZE.start_p.y + BOX_VIEW_SIZE.height / 2,
                           BOX_VIEW_SIZE.start_p.x + BOX_VIEW_SIZE.width,
                           BOX_VIEW_SIZE.start_p.y + BOX_VIEW_SIZE.height / 2);
-
 }
 
 // 同一个对象的文字与检测框同帧绘制
@@ -132,5 +131,4 @@ void AI_VISION_MENU::refresh()
     {
         Brain.Screen.printAt(10, 193, true, "                              ");
     }
-
 }

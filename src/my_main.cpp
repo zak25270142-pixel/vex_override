@@ -41,8 +41,8 @@ static vex::event ai_vision_event(ai_vision_task);
 // 心跳掉线 failsafe（回调注入 comm，检测与处置解耦）：仅在底盘空闲态收车
 static void comm_link_lost_handler()
 {
-    if (!robot_action.is_busy()) // is_busy 期间车不在上位机手里，不打断
-        robot_action.stop_move();
+    if (!robot_action.is_busy())        // is_busy 期间车不在上位机手里，不打断
+        robot_action.stop_move(100000); // 缓停收车，不急刹
 }
 
 void my_Init()

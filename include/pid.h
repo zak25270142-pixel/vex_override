@@ -19,7 +19,7 @@ public:
     float ki; // 单位：输出 / (误差·秒)
     float kd; // 单位：输出·秒 / 误差
 
-    float integral;//误差累计，消除稳态误差
+    float integral; // 误差累计，消除稳态误差
     float previous_error;
     float max_output;
 

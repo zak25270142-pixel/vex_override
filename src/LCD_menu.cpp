@@ -281,7 +281,7 @@ void refresh_menu()
             {
                 left_axis.state = Remote_Control::middle;
                 right_axis.state = Remote_Control::middle;
-                robot_action.stop_move();
+                robot_action.stop_move(); // 解除手柄任务指针交出底盘
                 button3.reset_button_name("remote:on", 14, 16);
                 button3.reset_button_color(vex::color(0x00cc44), vex::color(0x005511));
             }

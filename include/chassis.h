@@ -9,8 +9,8 @@ struct MyMotor
     // 电压缩放因子：让组内各电机同指令下输出的轮速一致。
     // 各台斜率 k(pct/V) 有个体差异，且经齿轮传动的电机轮速 = 轴速/r，
     float volt_factor;
-    float volt_max;    // 最大电压
-    float volt_min;    // 最小电压（个体死区补偿，对齐各电机开始转动的起点）
+    float volt_max;           // 最大电压
+    float volt_min;           // 最小电压（个体死区补偿，对齐各电机开始转动的起点）
     float volt_output = 0.0f; // 目标输出电压（活状态，速度环每拍更新）
     MyMotor(vex::motor *m, float factor, float vmax, float vmin)
         : motor(m), volt_factor(factor), volt_max(vmax), volt_min(vmin)

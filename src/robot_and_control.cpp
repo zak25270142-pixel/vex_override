@@ -69,8 +69,8 @@ RobotAction robot_action(chassis, &left_axis.now_y, &left_axis.now_x);
 
 static void cmd_stop(const uint8_t *p)
 {
-    (void)p; // 无参
-    robot_action.stop_move();
+    (void)p;                       // 无参
+    robot_action.stop_move(50000); // 缓停：0V 减速→近零/到时硬刹
 }
 
 static void cmd_turn(const uint8_t *p)

@@ -36,11 +36,15 @@ private:
 
     void update_manual(uint32_t now); // 手动控制每轮执行
 
+    // 缓停任务
+    void stop_tick(uint32_t now);
+
     // 摇杆数值指针，构造时注入
     int32_t *move_axis;
     int32_t *turn_axis;
 
-    int32_t manual_stop_start = 0;
+    uint32_t stop_start_us = 0; // 本次停止起点，0 表示未计时/未开始
+    uint32_t stop_time_us = 0;  // 本次停止时限（us）
 
     // 动作自然结束的统一收尾：停车、清指针、触发 move_end_callback。
     void action_finished();
@@ -81,16 +85,20 @@ public:
     // 任务结束回调：完成或发起时发现目标已在容差内时调用；stop_move() 打断不触发。
     void (*move_end_callback)() = nullptr;
 
-    // 外部主动打断：立即停车并回到空闲，不触发 move_end_callback
-    void stop_move();
+    // 停止通道：time=0 立即硬刹（急停）；time>0 缓停
+    // 0V 交给速度环 PID 减速
+    // 不触发 move_end_callback 缓停期间 is_busy() 为真
+    void stop_move(uint32_t time = 0);
 
     // ---- 手动控制----
-
-    float turn_radius_45 = 1.2f;    // 45° 倾角时的转弯半径(m)
-    int manual_deadzone = 16; // 摇杆死区，平方域判据
+    float turn_radius_45 = 1.2f; // 45° 倾角时的转弯半径(m)
+    int manual_deadzone = 16;    // 摇杆死区，平方域判据
 
     // 松杆到硬刹之间的延时，单位 us（当前 50ms）。
     uint32_t manual_stop_delay = 50000;
+
+    // ---- 停止通道参数 ----
+    float stop_speed_th = 15.0f; // 硬刹轮速门槛，单位 pct：两组都低于它才刹（近零才刹，不点头）
 
     // 进入手动模式，退出用 stop_move()
     void manual();

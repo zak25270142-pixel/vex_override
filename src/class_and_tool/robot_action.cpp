@@ -179,7 +179,7 @@ void RobotAction::update_manual(uint32_t now)
 
     if (mv2tn2 > manual_deadzone)
     {
-        manual_stop_start = 0; // 清零后代表未停止，下次松杆重新计时
+        stop_start_us = 0; // 推杆即中止停止通道，下次松杆重新计时
 
         // 方向→半径（k=轮距/(2C)）：半径只随方向，与杆量无关
         float k = chassis.track_width / (2.0f * turn_radius_45);
@@ -195,18 +195,10 @@ void RobotAction::update_manual(uint32_t now)
     if (chassis.left_motors.spin_state == MyMotorGroup::SpinState::Stopped &&
         chassis.right_motors.spin_state == MyMotorGroup::SpinState::Stopped)
         return;
-    if (manual_stop_start == 0)
-    {
-        if (now == 0)
-            now++;
-        manual_stop_start = now;
-    }
-    else if (now - manual_stop_start >= manual_stop_delay)
-    {
-        chassis.stop(); // 指令已收到 0，实际速度也跟下来了，此时刹车不会点头
-        return;
-    }
-    chassis.output(0, 0);
+    // 松杆：走停止通道（0V 减速→转速低于阈值或到 manual_stop_delay 硬刹），刹完留在 manual 待命
+    if (stop_start_us == 0)
+        stop_time_us = manual_stop_delay; // 发起：只设时限，起点由 stop_tick 首拍记
+    stop_tick(now);
 }
 
 void RobotAction::refresh()
@@ -263,25 +255,55 @@ void RobotAction::goto_local(float x, float y, float heading)
     chassis_task_ptr = &RobotAction::start_goto;
 }
 
+// ---- 停止通道（manual 松杆内联调用；外部缓停把任务指针直接绑到本函数）----
+void RobotAction::stop_tick(uint32_t now)
+{
+    if (stop_start_us == 0) // 以stop_start_us = 0 作为没开始停车的标志
+    {
+        if (now == 0)
+            now++;
+        stop_start_us = now;
+    }
+    // 双判据先到先刹：两组实际转速都低于阈值（近零才刹，不点头），或时限到（兜底）
+    if ((fabsf(chassis.left_motors.pre_v) <= stop_speed_th &&
+         fabsf(chassis.right_motors.pre_v) <= stop_speed_th) ||
+        now - stop_start_us >= stop_time_us)
+    {
+        chassis.stop();
+        stop_start_us = 0;
+        if (chassis_task_ptr == &RobotAction::stop_tick)
+            chassis_task_ptr = nullptr;
+    }
+    chassis.output(0, 0); // 0V：target=0 时前馈与摩擦垫都归零，P 项即主动制动力；刹完那拍是 no-op（drive 0pct 守卫）
+}
+
 void RobotAction::action_finished()
 {
-    // 自然结束统一收尾：停车、清指针，最后通知回调（此时本动作已收尾，回调可直接发起下一个）。
-    chassis.stop();
-    chassis_task_ptr = nullptr;
+    // 自然结束统一收尾：急停放倒（完成判据已要求近零速），清指针，最后通知回调
+    stop_move(0);
     if (move_end_callback != nullptr)
         move_end_callback();
 }
 
-void RobotAction::stop_move()
+void RobotAction::stop_move(uint32_t time)
 {
-    // 外部主动打断：只停车、清指针，不触发回调。
-    chassis.stop();
-    chassis_task_ptr = nullptr;
+    if (time == 0)
+    {
+        // 急停：立即硬刹，不等减速
+        chassis.stop();
+        chassis_task_ptr = nullptr;
+        stop_start_us = 0;
+        return;
+    }
+    if (chassis_task_ptr == &RobotAction::stop_tick)
+        return; // 已在缓停，不重置计时
+    stop_time_us = time;
+    stop_start_us = 0;
+    chassis_task_ptr = &RobotAction::stop_tick; // 直接绑本函数，无需 wrapper
 }
 
 void RobotAction::manual()
 {
-    // 建议外部手动设置only_value状态,避免误触
     chassis_task_ptr = &RobotAction::update_manual;
-    manual_stop_start = 0;
+    stop_start_us = 0;
 }

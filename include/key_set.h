@@ -49,5 +49,4 @@ void menu_tc_key_reset();
 void pre_menu_key();
 void ai_vision_menu_key();
 
-
 #endif
