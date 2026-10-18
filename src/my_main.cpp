@@ -10,15 +10,13 @@ vex::brain Brain;
 
 CycleTimer main_timer(10); // 暂定10ms  生成主循环周期 类
 
-// 通信拆成两个任务：
-//  rx任务阻塞在/dev/serial1的read()上等USB来字节，收到命令立刻回（如目录请求）；
-//  tx任务每10ms一拍，按订阅档位推送监控值，与主循环共用10ms线程。
+// 通信拆成两个任务：rx 阻塞在 /dev/serial1 的 read() 上等字节；tx 每 10ms 一拍（与主循环同线程）。
 static vex::event comm_rx_event([]
                                 { comm.rx_task(); }); // 内部死循环，不会返回
 
 static void screen_refresh_task()
 {
-    CycleTimer screen_timer(10);
+    CycleTimer screen_timer(20);
     while (true)
     {
         screen_timer.cycle();
@@ -40,11 +38,10 @@ static void ai_vision_task()
 }
 static vex::event ai_vision_event(ai_vision_task);
 
-// 心跳掉线 failsafe（作为回调注入 comm，检测与处置解耦）：
-// 上位机断线时只在底盘空闲态替它收车；
+// 心跳掉线 failsafe（回调注入 comm，检测与处置解耦）：仅在底盘空闲态收车
 static void comm_link_lost_handler()
 {
-    if (!robot_action.is_busy()) // is_busy（自动动作/手柄手动）期间上位机本就没有控制权，一律不打断。
+    if (!robot_action.is_busy()) // is_busy 期间车不在上位机手里，不打断
         robot_action.stop_move();
 }
 

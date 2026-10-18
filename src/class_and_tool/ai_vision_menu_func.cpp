@@ -1,6 +1,6 @@
 #include "menu_func.h"
 
-// 布局属于视觉菜单自身，外部只提供数据，不需要知道绘制坐标。
+// 页面布局常量
 static const Size16t CONTENT_SIZE = {{3, 5}, 420, 216};
 static const Size16t BOX_VIEW_SIZE = {{255, 55}, 160, 120};
 static const uint16_t REFRESH_MS = 100;
@@ -46,7 +46,7 @@ void AI_VISION_MENU::draw_box_view()
 
 }
 
-// 同一个对象的文字和检测框在这里一起绘制，避免两套显示数据不同步。
+// 同一个对象的文字与检测框同帧绘制
 void AI_VISION_MENU::draw_object(uint8_t index)
 {
     const AI_VISION_MENU_OBJECT &object = objects[index];
@@ -68,7 +68,7 @@ void AI_VISION_MENU::draw_object(uint8_t index)
     if (!visible)
         return;
 
-    // 绘制时再根据 RGB 构造颜色，避免跨文件全局初始化顺序导致黑色。
+    // 绘制时再根据 RGB 构造颜色
     Brain.Screen.setPenColor(vex::color(object.pen_rgb));
     Brain.Screen.setFillColor(vex::transparent);
     Brain.Screen.drawRectangle(BOX_VIEW_SIZE.start_p.x + *object.center_x / 2 - *object.width / 4,

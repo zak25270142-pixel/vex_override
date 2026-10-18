@@ -14,22 +14,6 @@ void list_copy2(char *list1, const char *list2, uint16_t a, uint16_t b, uint16_t
         list1[i + a] = list2[i + b];
     }
 }
-uint8_t list_equal(char *list1, char *list2, uint16_t m, uint16_t n, uint16_t l)
-{ // list1 开始位置 list2 开始位置 判断的长度
-    for (uint16_t i = 0; i < l; i++)
-    {
-        if (list1[m + i] != list2[n + i])
-            return 0;
-    }
-    return 1;
-}
-uint16_t len_str(char *str)
-{
-    uint16_t i;
-    for (i = 0; str[i] != '\0'; i++)
-        ;
-    return i;
-}
 void uint_to_str(uint32_t num, char *str)
 {
     int8_t i = 0;
@@ -96,7 +80,7 @@ void value_to_str(void *ptr, char *str_buffer, uint8_t type)
         snprintf(str_buffer, 25, "%.4f", *(float *)ptr);
         break;
     case type_double:
-        snprintf(str_buffer, 25, "%.8f", *(float *)ptr);
+        snprintf(str_buffer, 25, "%.8f", *(double *)ptr);
         break;
     default:
         list_copy(str_buffer, "error", 6);

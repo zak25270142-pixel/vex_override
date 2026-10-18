@@ -4,14 +4,8 @@
 #include "vex.h"
 
 // 通用位置式 PID 控制器。
-// 需保证先reset()，再update()。包括中途改变目标也需reset()
-// 需保证每次update()至少间隔1ms(最好5ms+)，不能连续调用。本身也没有连续调用的必要
-//
-// 参数量纲（外部传入）：
-//   kp : 输出 / 误差
-//   ki : 输出 / (误差·秒)
-//   kd : 输出·秒 / 误差
-// 传入的时间戳为 us
+// 契约：先 reset() 再 update()（含中途改目标）；不可连续调用，每次至少间隔 1ms（调用方负责）。
+// 参数量纲与抗饱和/跨零清积分语义见 docs/代码补充注释/03。
 class PositionPID
 {
 private:
@@ -21,7 +15,7 @@ private:
     int8_t pre_sign = 0;
 
 public:
-    float kp;
+    float kp; // 单位：输出 / 误差
     float ki; // 单位：输出 / (误差·秒)
     float kd; // 单位：输出·秒 / 误差
 
@@ -39,15 +33,12 @@ public:
     // 开始设置一个目标并返回第一轮输出。
     float reset(float error, uint32_t current_time_us = vex::timer::systemHighResolution());
 
-    // 根据本轮误差计算输出。传入时间戳为 us，内部换算为秒后使用：
-    // i += error * gap_time_s；d = error_change / gap_time_s
-    // 返回值范围由公开成员 max_output 决定。
+    // 根据本轮误差计算输出（时间戳 us，内部换算秒）；返回值由 max_output 限幅。
     float update(float error, uint32_t current_time_us = vex::timer::systemHighResolution());
 };
 
 // 判断一个条件是否连续保持了指定时间。
-// 没有reset清除旧状态的必要(也就是复位为false)
-// 如果第一次update的值就是true，那么就说明系统一直是稳定的，没必要再等待stable_time。
+// 无 reset：stable_start_time 跨动作保留
 class StableJudge
 {
 private:

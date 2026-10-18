@@ -30,32 +30,30 @@ const struct MENU_ITEM menu_item[] =
         {"R_dy_dz", type_float, &right_motors.dynamic_deadzone, "右动摩擦", "V"},
 
         // ========== 电压映射（速度环归一输出 → 四路实际电压）==========
-        // V = 目标方向·(摩擦+volt_min) + out·(volt_max-摩擦-volt_min)·volt_factor
-        // 摩擦垫只认目标方向，out 是双极性连续修正，过零不再翻转摩擦电压
-        {"L_vmin0", type_float, &left_motors.motors[0].volt_min, "左0最小电压", "V"},
-        {"L_vmin1", type_float, &left_motors.motors[1].volt_min, "左1最小电压", "V"},
-        {"L_vmin2", type_float, &left_motors.motors[2].volt_min, "左2最小电压", "V"},
-        {"L_vmin3", type_float, &left_motors.motors[3].volt_min, "左3最小电压", "V"},
-        {"R_vmin0", type_float, &right_motors.motors[0].volt_min, "右0最小电压", "V"},
-        {"R_vmin1", type_float, &right_motors.motors[1].volt_min, "右1最小电压", "V"},
-        {"R_vmin2", type_float, &right_motors.motors[2].volt_min, "右2最小电压", "V"},
-        {"R_vmin3", type_float, &right_motors.motors[3].volt_min, "右3最小电压", "V"},
-        {"L_vmax0", type_float, &left_motors.motors[0].volt_max, "左0最大电压", "V"},
-        {"L_vmax1", type_float, &left_motors.motors[1].volt_max, "左1最大电压", "V"},
-        {"L_vmax2", type_float, &left_motors.motors[2].volt_max, "左2最大电压", "V"},
-        {"L_vmax3", type_float, &left_motors.motors[3].volt_max, "左3最大电压", "V"},
-        {"R_vmax0", type_float, &right_motors.motors[0].volt_max, "右0最大电压", "V"},
-        {"R_vmax1", type_float, &right_motors.motors[1].volt_max, "右1最大电压", "V"},
-        {"R_vmax2", type_float, &right_motors.motors[2].volt_max, "右2最大电压", "V"},
-        {"R_vmax3", type_float, &right_motors.motors[3].volt_max, "右3最大电压", "V"},
-        {"L_vf0", type_float, &left_motors.motors[0].volt_factor, "左0电压系数", ""},
-        {"L_vf1", type_float, &left_motors.motors[1].volt_factor, "左1电压系数", ""},
-        {"L_vf2", type_float, &left_motors.motors[2].volt_factor, "左2电压系数", ""},
-        {"L_vf3", type_float, &left_motors.motors[3].volt_factor, "左3电压系数", ""},
-        {"R_vf0", type_float, &right_motors.motors[0].volt_factor, "右0电压系数", ""},
-        {"R_vf1", type_float, &right_motors.motors[1].volt_factor, "右1电压系数", ""},
-        {"R_vf2", type_float, &right_motors.motors[2].volt_factor, "右2电压系数", ""},
-        {"R_vf3", type_float, &right_motors.motors[3].volt_factor, "右3电压系数", ""},
+        {"L_vmin0", type_float, &left_motor_list[0].volt_min, "左0最小电压", "V"},
+        {"L_vmin1", type_float, &left_motor_list[1].volt_min, "左1最小电压", "V"},
+        {"L_vmin2", type_float, &left_motor_list[2].volt_min, "左2最小电压", "V"},
+        {"L_vmin3", type_float, &left_motor_list[3].volt_min, "左3最小电压", "V"},
+        {"R_vmin0", type_float, &right_motor_list[0].volt_min, "右0最小电压", "V"},
+        {"R_vmin1", type_float, &right_motor_list[1].volt_min, "右1最小电压", "V"},
+        {"R_vmin2", type_float, &right_motor_list[2].volt_min, "右2最小电压", "V"},
+        {"R_vmin3", type_float, &right_motor_list[3].volt_min, "右3最小电压", "V"},
+        {"L_vmax0", type_float, &left_motor_list[0].volt_max, "左0最大电压", "V"},
+        {"L_vmax1", type_float, &left_motor_list[1].volt_max, "左1最大电压", "V"},
+        {"L_vmax2", type_float, &left_motor_list[2].volt_max, "左2最大电压", "V"},
+        {"L_vmax3", type_float, &left_motor_list[3].volt_max, "左3最大电压", "V"},
+        {"R_vmax0", type_float, &right_motor_list[0].volt_max, "右0最大电压", "V"},
+        {"R_vmax1", type_float, &right_motor_list[1].volt_max, "右1最大电压", "V"},
+        {"R_vmax2", type_float, &right_motor_list[2].volt_max, "右2最大电压", "V"},
+        {"R_vmax3", type_float, &right_motor_list[3].volt_max, "右3最大电压", "V"},
+        {"L_vf0", type_float, &left_motor_list[0].volt_factor, "左0电压系数", ""},
+        {"L_vf1", type_float, &left_motor_list[1].volt_factor, "左1电压系数", ""},
+        {"L_vf2", type_float, &left_motor_list[2].volt_factor, "左2电压系数", ""},
+        {"L_vf3", type_float, &left_motor_list[3].volt_factor, "左3电压系数", ""},
+        {"R_vf0", type_float, &right_motor_list[0].volt_factor, "右0电压系数", ""},
+        {"R_vf1", type_float, &right_motor_list[1].volt_factor, "右1电压系数", ""},
+        {"R_vf2", type_float, &right_motor_list[2].volt_factor, "右2电压系数", ""},
+        {"R_vf3", type_float, &right_motor_list[3].volt_factor, "右3电压系数", ""},
         {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
         {"L_slewB", type_float, &left_motors.slew_boost, "左升压斜率", "V/s"},
@@ -67,9 +65,9 @@ const struct MENU_ITEM menu_item[] =
         {"L_recA", type_float, &left_motors.recover_accel, "左反常加速度", "pct/s"},
         {"R_recA", type_float, &right_motors.recover_accel, "右反常加速度", "pct/s"},
 
-        // 手柄松杆减速缓冲：太小会点头前倾，太大松杆后滑行太久
+        // 手柄松杆减速缓冲
         {"man_decay", type_uint32_t, &robot_action.manual_stop_delay, "松杆停车延迟", "us"},
-        // 45° 倾角时的转弯半径(m)：越小转向越贼，越大越钝。方向定半径，与杆量无关
+        // 45° 倾角时的转弯半径(m)：方向定半径，与杆量无关
         {"turn_r45", type_float, &robot_action.turn_radius_45, "45度转弯半径", "m"},
 
         // // ========== 位置环 ==========
@@ -101,7 +99,6 @@ const struct MENU_ITEM menu_item[] =
 };
 
 // 监控表要在运行时被通信模块改订阅档位（改tag字段），不能加const。
-// tag 为位域：SUB/FAST/GETTER/KIND；x/y/yaw 用 KIND 供场地图识别。
 static struct MENU_ITEM monitor_menu_item[] =
     {
         // 场地图语义：订阅+高速+KIND
@@ -109,54 +106,50 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"chassis_y", type_float, &chassis.y, "全局Y", "m", monitor_tag_pos_y},
         {"chassis_heading", type_float, &chassis.heading, "航向", "deg", monitor_tag_yaw},
 
-        // 本段相对量（手推/动作时看定位是否准）
+        // 本段相对量
         {"dist_seg", type_float, &chassis.distance_from_reset, "段内前向", "m", monitor_tag_fast},
         {"side_seg", type_float, &chassis.side_distance_from_reset, "段内侧向", "m", monitor_tag_fast},
         {"head_seg", type_float, &chassis.heading_from_reset, "段内转角", "deg", monitor_tag_fast},
 
-        // 瞬时速度（判停、StableJudge 对照）
+        // 瞬时速度
         {"v_lin", type_float, &chassis.linear_speed, "线速度", "m/s", monitor_tag_fast},
         {"w_ang", type_float, &chassis.angular_speed, "角速度", "deg/s", monitor_tag_fast},
 
-        // 定位轮原始累计（第4步正负与尺度）
+        // 定位轮原始累计
         {"trk_fwd", type_float, &chassis.forward_tracking_distance, "前向轮里程", "m", monitor_tag_slow},
         {"trk_side", type_float, &chassis.side_tracking_distance, "侧向轮里程", "m", monitor_tag_slow},
 
-        // 指令电压：有稳定地址，内存项即可（无需 getter）
-        {"L0_Vcmd", type_float, &left_motors.motors[0].volt_output, "左0指令电压", "V", monitor_tag_fast},
-        {"R0_Vcmd", type_float, &right_motors.motors[0].volt_output, "右0指令电压", "V", monitor_tag_fast},
-        {"L1_Vcmd", type_float, &left_motors.motors[1].volt_output, "左1指令电压", "V", monitor_tag_slow},
-        {"R1_Vcmd", type_float, &right_motors.motors[1].volt_output, "右1指令电压", "V", monitor_tag_slow},
-        {"L2_Vcmd", type_float, &left_motors.motors[2].volt_output, "左2指令电压", "V", monitor_tag_slow},
-        {"R2_Vcmd", type_float, &right_motors.motors[2].volt_output, "右2指令电压", "V", monitor_tag_slow},
-        {"L3_Vcmd", type_float, &left_motors.motors[3].volt_output, "左3指令电压", "V", monitor_tag_slow},
-        {"R3_Vcmd", type_float, &right_motors.motors[3].volt_output, "右3指令电压", "V", monitor_tag_slow},
+        // 指令电压
+        {"L0_Vcmd", type_float, &left_motor_list[0].volt_output, "左0指令电压", "V", monitor_tag_fast},
+        {"R0_Vcmd", type_float, &right_motor_list[0].volt_output, "右0指令电压", "V", monitor_tag_fast},
+        {"L1_Vcmd", type_float, &left_motor_list[1].volt_output, "左1指令电压", "V", monitor_tag_slow},
+        {"R1_Vcmd", type_float, &right_motor_list[1].volt_output, "右1指令电压", "V", monitor_tag_slow},
+        {"L2_Vcmd", type_float, &left_motor_list[2].volt_output, "左2指令电压", "V", monitor_tag_slow},
+        {"R2_Vcmd", type_float, &right_motor_list[2].volt_output, "右2指令电压", "V", monitor_tag_slow},
+        {"L3_Vcmd", type_float, &left_motor_list[3].volt_output, "左3指令电压", "V", monitor_tag_slow},
+        {"R3_Vcmd", type_float, &right_motor_list[3].volt_output, "右3指令电压", "V", monitor_tag_slow},
 
-        // 指令转速：速度环目标，内存项直接读（与 L0/R0_rpm 对照即跟踪误差）
+        // 指令转速（速度环目标）
         {"L_tgt", type_float, &left_motors.target, "左指令转速", "pct", monitor_tag_fast},
         {"R_tgt", type_float, &right_motors.target, "右指令转速", "pct", monitor_tag_fast},
         {"L_integral", type_float, &left_motors.integral, "左PID积分", "", monitor_tag_fast},
         {"R_integral", type_float, &right_motors.integral, "右PID积分", "", monitor_tag_fast},
-        // 本拍前馈输出 = kf插值表(|target|)·target：标定 kf 表时直接看它，比看 Vcmd 少一层映射
+        // 本拍前馈输出
         {"L_ff", type_float, &left_motors.feedforward, "左前馈", "", monitor_tag_fast},
         {"R_ff", type_float, &right_motors.feedforward, "右前馈", "", monitor_tag_fast},
         {"L_error", type_float, &left_motors.previous_error, "左PID误差", "", monitor_tag_fast},
         {"R_error", type_float, &right_motors.previous_error, "右PID误差", "", monitor_tag_fast},
-        // 速度环状态机（见 chassis.h 的 SpinState）：
-        // 0=Stopped停车 1=Transit起步/换向 2=Track跟踪 3=Stable稳定 4=Recover外力 5=Stall堵转
-        // 判"有没有真的切成停车态"就看这两项是不是 0。
+        // 速度环状态机：0=Stopped 1=Transit 2=Track 3=Stable 4=Recover 5=Stall
         {"L_state", type_uint8_t, &left_motors.spin_state, "左环状态", "", monitor_tag_fast},
         {"R_state", type_uint8_t, &right_motors.spin_state, "右环状态", "", monitor_tag_fast},
 
-        // 转速/电流/编码器：无捕获 lambda 直接转 MenuFloatGetter，构造自动置 GETTER；
-        // SDK 读数是 double，cast 成 float 匹配签名。加/删一项只动这一行
-        // 转速只取 motors[0]（与轮轴直连，经齿轮传动的读数不代表轮速），pct 与 target 同口径
+        // 转速/加速度（speed 环内部量，慢1拍）
         {"L_pct", type_float, &left_motors.pre_v, "左转速(慢1拍)", "pct", monitor_tag_fast},
         {"R_pct", type_float, &right_motors.pre_v, "右转速(慢1拍)", "pct", monitor_tag_fast},
         {"L_a", type_float, &left_motors.pre_a, "左加速度(慢1拍)", "pct", monitor_tag_fast},
         {"R_a", type_float, &right_motors.pre_a, "右加速度(慢1拍)", "pct", monitor_tag_fast},
 
-        // 实际电压：SDK 回读，与指令电压 Vcmd 对照（差距大说明被限幅/堵转）
+        // 实际电压：SDK 回读
         {"L0_Vact", []
          { return static_cast<float>(left_motors.motors[0].motor->voltage(vex::voltageUnits::volt)); }, "左0实际电压", "V", monitor_tag_fast},
         {"R0_Vact", []
@@ -208,7 +201,7 @@ static struct MENU_ITEM monitor_menu_item[] =
         {"R3_pct", []
          { return static_cast<float>(right_motors.motors[3].motor->velocity(vex::velocityUnits::pct)); }, "右3转速", "pct", monitor_tag_slow},
 
-        // 手柄（手动/Arcade 对照）。now_x/now_y 是稳定地址，value环形槽会轮转不能直接取地址。
+        // 手柄摇杆原始值
         {"axis_Lx", type_int32_t, &left_axis.now_x, "左杆X", nullptr, monitor_tag_slow},
         {"axis_Ly", type_int32_t, &left_axis.now_y, "左杆Y", nullptr, monitor_tag_slow},
         {"axis_Rx", type_int32_t, &right_axis.now_x, "右杆X", nullptr, monitor_tag_slow},
@@ -222,9 +215,7 @@ MENU menu(menu_item,
           monitor_menu_item,
           sizeof(monitor_menu_item) / sizeof(monitor_menu_item[0]));
 
-// USB上位机通信，三张表（调参/监控/动作命令）都在构造时整张传入。
-// robot_cmds是另一编译单元里的纯const字面量表（常量初始化先于动态初始化完成），
-// 此处引用不存在全局对象构造顺序问题。
+// USB上位机通信：调参/监控/动作命令三张表构造时整张传入
 USB_Comm comm(menu_item,
               sizeof(menu_item) / sizeof(menu_item[0]),
               monitor_menu_item,
@@ -232,7 +223,7 @@ USB_Comm comm(menu_item,
               robot_cmds,
               robot_cmd_count);
 
-// 颜色名称、显示颜色和检测结果在应用层逐项对应，菜单类不猜测颜色含义。
+// 颜色名称、显示颜色与检测结果逐项对应
 static const AI_VISION_MENU_OBJECT ai_vision_objects[] = {
     {"RED", 0xFF0000, &ai_colors[0].visible, &ai_colors[0].center_x,
      &ai_colors[0].center_y, &ai_colors[0].width, &ai_colors[0].height},
@@ -283,10 +274,7 @@ void refresh_menu()
         }
         else if (key_joy_menu.read())
         {
-            // 手柄控屏开关：默认关。
-            //   关：两根摇杆都是 only_value，只当数据源、绝不产生菜单按键；
-            //   开：摇杆转为方向键语义可操作菜单，同时交出底盘（手动模式停车并置空闲）。
-            // 两者互斥是刻意的——改参数和开车不能同时发生，否则边开边把参数捅坏。
+            // 手柄控屏开关：开=摇杆操作菜单并交出底盘；关=摇杆只当数据源开车（互锁见 docs/代码补充注释/05）
             static bool joystick_menu_on = false;
             joystick_menu_on = !joystick_menu_on;
             if (joystick_menu_on)
@@ -332,8 +320,7 @@ void refresh_menu()
         else if (menu.is_monitor_menu)
             menu.refresh_value();
 
-        // 上位机改过调参的脏标志：菜单轮询自取自清并刷一帧；
-        // 监控界面本来每轮都在刷，只在调参界面需要补刷。没有菜单时标志挂着无害。
+        // 上位机改过调参的脏标志：自取自清，调参界面补刷一帧
         if (comm.tunable_dirty)
         {
             comm.tunable_dirty = false;

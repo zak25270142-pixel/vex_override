@@ -32,35 +32,28 @@ float PositionPID::update(float error, uint32_t current_time_us)
     uint32_t gap_time_us = current_time_us - last_time_us;
     float gap_time_s = static_cast<float>(gap_time_us) / 1000000.0f;
 
-    // pre_error为0时pre_sign保持不变，引入该项主要解出err正好是0时的后续处理
+    // pre_error为0时pre_sign保持不变
     if (previous_error != 0.0f)
         pre_sign = previous_error > 0.0f ? 1 : -1;
-    // 误差从正侧（>0）跨到负侧（<0），或反过来，说明系统越过了目标值。
-    // 清除旧方向积分，减少越过目标后的持续推力。
+    // 误差跨零：系统越过目标，清旧方向积分
     if ((error > 0.0f && pre_sign == -1) || (error < 0.0f && pre_sign == 1))
         integral = 0.0f;
 
     // 统一使用秒：I 项是“误差×秒”，D 项是“误差/秒”。
     float candidate_i = integral + error * gap_time_s;
     float p_add_d = kp * error + kd * (error - previous_error) / gap_time_s;
-    // 用候选积分计算一次未经限幅的输出，判断电机是否已经达到输出极限。
+    // 用候选积分算一次未限幅输出，判断是否已达输出极限
     float candidate_output = p_add_d + ki * candidate_i;
     /*
-     * 条件积分抗饱和：
-     * 1. 输出没有超过上限时，正常接受本轮积分。
-     * 2. 输出超过正上限，但误差为负时，积分会帮助输出离开正上限，允许积分。
-     * 3. 输出超过负上限，但误差为正时，积分会帮助输出离开负上限，允许积分。
-     * 如果输出已经达到极限，并且误差还想让输出继续朝极限外增大，就暂停积分。
+     * 条件积分抗饱和：输出顶限且误差还朝限外推时，本轮不积
      */
     if (fabsf(candidate_output) <= max_output ||
         (candidate_output > max_output && error < 0.0f) ||
         (candidate_output < -max_output && error > 0.0f))
         integral = candidate_i;
 
-    // 使用最终被接受的积分重新计算本轮位置式 PID 输出。
+    // 用最终被接受的积分重算输出，再限幅
     float output = p_add_d + ki * integral;
-
-    // 输出限幅
     if (output > max_output)
         output = max_output;
     else if (output < -max_output)

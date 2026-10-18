@@ -22,6 +22,11 @@ struct Size16t
     int16_t width;       // 标记宽
     int16_t height;      // 高
 };
+struct Vec2f
+{
+    float x;
+    float y;
+};
 typedef enum
 {
     type_uint8_t = 0,
@@ -46,7 +51,7 @@ typedef enum
 //   bit6 (0x40) MENU_TAG_FAST    速率：1=高速(每10ms)，0=低速(8相轮转约80ms)
 //   bit5 (0x20) MENU_TAG_GETTER  取数方式：1=data_ptr 为 float(*)() 函数指针；
 //                                 0=data_ptr 为普通变量地址（直接解引用）
-//   bit4~3      预留，写 0；订阅合并时下位机保留，上位机不要当速率位用
+//   bit4~3      预留，写 0
 //   bit2~0      语义种类 MENU_TAG_KIND_*：场地图等特殊量
 //                 0 none，1 pos_x，2 pos_y，3 yaw，4~7 预留
 static constexpr uint8_t MENU_TAG_SUB = 0x80u;
@@ -71,9 +76,9 @@ static constexpr uint8_t monitor_tag_yaw = (uint8_t)(MENU_TAG_SUB | MENU_TAG_FAS
 typedef float (*MenuFloatGetter)();
 
 // 菜单与通信共用的条目描述：名字、数据类型、数据指针、中文名、单位、监控标签
-// data_ptr 双重含义（由 tag 的 MENU_TAG_GETTER 区分，不另增指针成员）：
+// data_ptr 双重含义（由 tag 的 MENU_TAG_GETTER 区分）：
 //   - 未置 GETTER：指向可读写变量（调参/普通监控）
-//   - 已置 GETTER：值为 MenuFloatGetter，只读；禁止 write/旋钮改值
+//   - 已置 GETTER：值为 MenuFloatGetter，只读
 struct MENU_ITEM
 {
     const char *item_name;
@@ -89,7 +94,6 @@ struct MENU_ITEM
     {
     }
     // getter 只读项：固定 type_float；get 无参，返回 float；tag 自动加上 MENU_TAG_GETTER
-    // （构造函数不接收 VALUE_TYPE，因当前协议 GETTER 项只支持 float，避免不对称）
     MENU_ITEM(const char *name, MenuFloatGetter get, const char *c,
               const char *u, uint8_t t)
         : item_name(name), data_type(type_float), data_ptr(reinterpret_cast<void *>(get)), Chinese_name(c), unit(u), tag(static_cast<uint8_t>(t | MENU_TAG_GETTER))

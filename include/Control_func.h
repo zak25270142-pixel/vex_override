@@ -102,8 +102,7 @@ public:
     Control_key *left_state = nullptr;
     Control_key *right_state = nullptr;
     Remote_Control() {}
-    // 最新摇杆值，refresh每拍写入。地址稳定，需要注入指针的地方
-    // （如RobotAction手动控制、监控菜单）直接绑这两个变量。
+    // 最新摇杆值，refresh每拍写入
     int32_t now_x = 0;
     int32_t now_y = 0;
     STATE state = middle;        // only_value时，不触发按键，仅存储value用于底盘控制

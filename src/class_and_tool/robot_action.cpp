@@ -36,7 +36,7 @@ void RobotAction::finish_init()
 
 void RobotAction::start_turn(uint32_t now)
 {
-    // refresh 已 update，此处仅开启新段，本段转角从 0 起，首轮误差即目标本身。
+    // 开启新段：本段转角从 0 起，首轮误差即目标本身
     chassis.begin_segment();
     float output = turn_pid.reset(turn_target, now);
     chassis.output(output, -output);
@@ -61,7 +61,7 @@ void RobotAction::update_turn(uint32_t now)
 
 void RobotAction::start_move(uint32_t now)
 {
-    // refresh 已 update，此处仅开启新段，本段里程从 0 起，首轮误差即目标本身。
+    // 开启新段：本段里程从 0 起，首轮误差即目标本身
     chassis.begin_segment();
     float output = distance_pid.reset(move_target, now);
     heading_pid.reset(0.0f, now);
@@ -100,7 +100,7 @@ void RobotAction::start_goto(uint32_t now)
     float distance_error = sqrtf(goto_target.x * goto_target.x +
                                  goto_target.y * goto_target.y);
 
-    // refresh 已 update，此处仅开启新段，本段里程与转角均从 0 起。
+    // 开启新段：本段里程与转角均从 0 起
     chassis.begin_segment();
 
     // 本段航向为 0：车体坐标下的前后误差就是 x，瞄准角即 atan2(y, x)。
@@ -128,7 +128,6 @@ void RobotAction::start_goto(uint32_t now)
 void RobotAction::update_goto(uint32_t now)
 {
     // 每轮重新瞄准固定目标点，距离 PID 与转向 PID 同时输出，边走边转。
-    // 动作层只消费 Chassis 已经换算好的本段起点坐标，不自行积分测量量。
     float x_error = goto_target.x - chassis.distance_from_reset;
     float y_error = goto_target.y - chassis.side_distance_from_reset;
     float distance_error = sqrtf(x_error * x_error + y_error * y_error);
@@ -171,11 +170,9 @@ void RobotAction::update_goto(uint32_t now)
 }
 
 // ---- 手动控制（驾驶员开环）----
-
 void RobotAction::update_manual(uint32_t now)
 {
-    // 摇杆值只在本函数开头读一次：changed 回调在另一线程更新 now_x/now_y，
-    // 分开解引用可能混用到两拍的值
+    // 摇杆值开头一次读入，避免混用两拍的值
     int32_t mv = *move_axis;
     int32_t tn = *turn_axis;
     int32_t mv2tn2 = mv * mv + tn * tn;
@@ -184,19 +181,20 @@ void RobotAction::update_manual(uint32_t now)
     {
         manual_stop_start = 0; // 清零后代表未停止，下次松杆重新计时
 
-        // 方向→半径 ρ=C·mv/tn（κ=tanθ/C 展开即原始轴的线性混合）：半径只随方向
-        float k = chassis.track_width / (2.0f * turn_radius_45); // K=轮距/(2C)
+        // 方向→半径（k=轮距/(2C)）：半径只随方向，与杆量无关
+        float k = chassis.track_width / (2.0f * turn_radius_45);
         float left_cmd = mv + k * tn;
         float right_cmd = mv - k * tn;
 
-        // 杆量→外侧轮速度：杆量² 从死区到 127² 线性映射（小值压低，低速更可控）。
-        // 平方曲线只许在这里——进混合段会把 κ 变成 tan²θ，半径就被杆量污染了
+        // 杆量→外侧轮速度：杆量² 从死区到 127² 线性映射（小值压低，低速更可控）
         float speed = (mv2tn2 - manual_deadzone) / (16129.0f - manual_deadzone) * 100.0f;
         float scale = speed / fmaxf(fabsf(left_cmd), fabsf(right_cmd));
         chassis.output(left_cmd * scale, right_cmd * scale);
         return;
     }
-
+    if (chassis.left_motors.spin_state == MyMotorGroup::SpinState::Stopped &&
+        chassis.right_motors.spin_state == MyMotorGroup::SpinState::Stopped)
+        return;
     if (manual_stop_start == 0)
     {
         if (now == 0)
@@ -205,9 +203,7 @@ void RobotAction::update_manual(uint32_t now)
     }
     else if (now - manual_stop_start >= manual_stop_delay)
     {
-        if (chassis.left_motors.spin_state == MyMotorGroup::SpinState::Stopped &&
-            chassis.right_motors.spin_state == MyMotorGroup::SpinState::Stopped)
-            chassis.stop(); // 指令已收到 0，实际速度也跟下来了，此时刹车不会点头
+        chassis.stop(); // 指令已收到 0，实际速度也跟下来了，此时刹车不会点头
         return;
     }
     chassis.output(0, 0);
@@ -217,7 +213,7 @@ void RobotAction::refresh()
 {
     // 周期统一时间戳（us）
     uint32_t now = get_time_us();
-    // 每轮首先更新里程、速度和航向。
+    // 先更新里程、速度和航向，再推进当前任务，最后跑速度环
     chassis.update(now);
     // 指针为空即空闲。
     if (chassis_task_ptr != nullptr)

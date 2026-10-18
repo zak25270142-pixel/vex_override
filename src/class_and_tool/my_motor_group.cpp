@@ -1,31 +1,32 @@
 #include "chassis.h"
 
-MyMotorGroup::MyMotorGroup(const MyMotor *motor_list, uint8_t count,
-                           const KfTable &kf, float p, float i, float d)
+MyMotorGroup::MyMotorGroup(MyMotor *motor_list, uint8_t count,
+                           const Vec2f *kf_node, uint8_t kf_num,
+                           float p, float i, float d)
 {
-    kf_table = kf;
+    this->motors = motor_list;
+    this->kf_node = kf_node;
+    this->kf_num = kf_num;
     kp = p;
     ki = i;
     kd = d;
     motor_count = count;
-    for (uint8_t j = 0; j < count; j++)
-        motors[j] = motor_list[j];
 }
 
-// 前馈斜率插值：|target| 落在哪两节点之间就按距离加权。
-float KfTable::at(float abs_target) const
+// 前馈插值：|target| 落在哪两节点之间就按距离加权，返回该处曲线上的稳态前馈输出（归一）。
+float MyMotorGroup::kf_at(float abs_target) const
 {
-    if (abs_target <= node[0])
-        return k[0];
-    for (uint8_t i = 1; i < num; i++)
+    if (abs_target <= kf_node[0].x)
+        return kf_node[0].y;
+    for (uint8_t i = 1; i < kf_num; i++)
     {
-        if (abs_target <= node[i])
+        if (abs_target <= kf_node[i].x)
         {
-            const float t = (abs_target - node[i - 1]) / (node[i] - node[i - 1]);
-            return k[i - 1] + (k[i] - k[i - 1]) * t;
+            const float t = (abs_target - kf_node[i - 1].x) / (kf_node[i].x - kf_node[i - 1].x);
+            return kf_node[i - 1].y + (kf_node[i].y - kf_node[i - 1].y) * t;
         }
     }
-    return k[num - 1];
+    return kf_node[kf_num - 1].y;
 }
 
 void MyMotorGroup::setStopping(vex::brakeType brake)
@@ -46,11 +47,6 @@ void MyMotorGroup::setStopping(vex::brakeType brake)
 //     return motors[0].motor->position(vex::rotationUnits::rev);
 // }
 
-double MyMotorGroup::velocity()
-{
-    return motors[0].motor->velocity(vex::velocityUnits::rpm);
-}
-
 void MyMotorGroup::stop()
 {
     spin_state = Stopped;
@@ -69,15 +65,13 @@ void MyMotorGroup::stop()
     }
 }
 
-// target=0 没有特权：和 ±1 走同一套状态机与 PID，由速度环自己把速度收敛到 0。
-// 是否真正停车（硬刹 + 清积分）由外界 stop() 决定，本函数不自己判断。
 void MyMotorGroup::my_spin()
 {
     if (spin_state == Stopped)
         return;
     uint32_t now_us = get_time_us();
     uint32_t dt_us = now_us - last_time_us;
-    if (dt_us < 1000) // drive 与my_spin 撞后 dt容易很小，给个1ms最小值
+    if (dt_us < 1000) // drive 与 my_spin 同拍/亚毫秒重叠时防首帧除零
         dt_us = 1000;
     else if (dt_us > 20000)
         dt_us = 20000;
@@ -85,7 +79,7 @@ void MyMotorGroup::my_spin()
 
     last_time_us = now_us;
 
-    // 直接读速度，不重复做滤波
+    // 直接读 motors[0] 速度，不做滤波
     const float speed = static_cast<float>(motors[0].motor->velocity(vex::velocityUnits::pct));
 
     // ---------- 状态判定 1：目标 / 稳定（不依赖本拍输出，先判给 I 项用）----------
@@ -101,14 +95,10 @@ void MyMotorGroup::my_spin()
     else if (spin_state == Stable && fabs_error > err_out_dead)
         spin_state = Track;
 
-    // ---------- 连续摩擦补偿 ----------
     const float friction = dynamic_deadzone + (static_deadzone - dynamic_deadzone) * expf(-fabs_target / 3.0f);
-
-    // ---------- PID ----------
-    // 前馈查表：用 fabs_target 取斜率、乘带符号 target —— 正反向同一条曲线，过零时 ff=0 不跳变。
     const float p_output = kp * error;
     const float d_output = kd * derivative;
-    feedforward = kf_table.at(fabs_target) * target;
+    feedforward = target_sign * kf_at(fabs_target);
 
     // ---------- I 项：Transit 不工作；Stable 只缩小新增积分，避免已有 I 输出跳变 ---------
     if (spin_state != Transit)
@@ -119,9 +109,7 @@ void MyMotorGroup::my_spin()
         // 方向性抗饱和：候选输出在误差想推的方向被归一硬限顶住，本拍就不积；
         const float candidate_output = feedforward + p_output + ki * (integral + delta) + d_output;
         if ((candidate_output <= 1.0f || error <= 0.0f) && (candidate_output >= -1.0f || error >= 0.0f))
-        {
             integral += delta;
-        }
     }
     float output = feedforward + p_output + ki * integral + d_output;
 
@@ -131,26 +119,13 @@ void MyMotorGroup::my_spin()
         output = -1;
 
     // ---------- 状态判定 2：非预期运动 / 堵转（要用到本拍输出，故排在 PID 之后）----------
-    // 三个中间量：
-    //   giving_max  归一输出已经顶到上限（我们要给的全给了）
-    //   wheel_low   轮胎基本没在转
-    //   pulled_away 车在"目标想让它去的方向"的反方向上运动 —— 我要它往这走，它偏往那走。
-    //     判"我想让它往哪走"必须用 target 的符号，不能用 output 的：
-    //       制动时 output 是负的，那是在刹车，不是"想让它往后退"；
-    //       target=0 时 output 只剩 P/I 在 0 附近抖动、符号随机，用它判意图必然误触发。
-    //     于是 target=0 时本项恒为 false——松杆就是要它停，车速在降是期望行为，不是非预期运动。
-    const bool giving_max = fabsf(output) >= stall_output;
-    const bool wheel_low = fabsf(speed) <= stall_speed;
-    const bool pulled_away = (target > 0.0f && now_a < 0.0f) || (target < 0.0f && now_a > 0.0f);
+    const bool giving_max = fabsf(output) >= stall_output;                                       // 归一输出是否已经顶到上限
+    const bool wheel_low = fabsf(speed) <= stall_speed;                                          // 轮胎是否基本没在转
+    const bool pulled_away = (target > 0.0f && now_a < 0.0f) || (target < 0.0f && now_a > 0.0f); // 目标是否和加速度反向
 
     if (spin_state == Stall)
     {
-        // 退出条件刻意不是进入条件的取反：
-        //   轮速起来了 —— 外力没了或被我们克服了；
-        //   操作手松杆（目标落进死区）—— 他要的是"停"，不是"顶着"，此时该按正常松杆快撤压。
-        // 而"把杆收小但没收到底"（80→5）**不退出**：target 变小不代表负载消失，
-        // 退出会把顶着的电压一把撤掉，车就被它顶着的东西弹回来。
-        // 那种情况留在 Stall 里，靠松劲限速慢慢放，就是操作手要的"缓慢撤退"。
+        // Stall 退出：轮速起来了，或操作手松杆（目标落进死区）；杆收小但没收到底不退出
         if (!wheel_low || fabs_target == 0.0f)
         {
             stall_since_us = 0;
@@ -160,7 +135,7 @@ void MyMotorGroup::my_spin()
     }
     else
     {
-        // Stall 计时：必须持续够久。起步那几十毫秒 output 也是满的、轮速也是 0，只能靠时长滤掉。
+        // Stall 计时：给满+轮速低须持续够久（滤掉起步瞬间）；Transit 期间不计时
         if (giving_max && wheel_low && spin_state != Transit)
         {
             if (stall_since_us == 0)
@@ -173,9 +148,7 @@ void MyMotorGroup::my_spin()
             spin_state = Stall;
         else if (spin_state == Recover)
         {
-            // Recover 退出：误差回到 I 工作区且输出不再顶格，走 Transit 重新观察。
-            // 积分此刻已不可信（它是被外力拖出来的），但只冻结不清零 —— 清零会把车正在
-            // 顶着的力矩一起抽掉，正是要防的"被顶飞"。
+            // Recover 退出：误差回到 I 工作区且输出不再顶格，走 Transit 重新观察（积分不清零）
             if (fabs_error <= error_for_i && !giving_max)
             {
                 transit_start_us = now_us;
@@ -185,44 +158,43 @@ void MyMotorGroup::my_spin()
         else if (spin_state != Transit && pulled_away &&
                  (fabsf(now_a) > recover_accel || (giving_max && fabsf(now_a) > speed_stable)))
         {
-            // Recover 进入：多因素取或 —— 成因不止一种，没有单因素能断言。
-            //   (a) 车速被猛地带偏（撞击 / 被抓 / 被推 / 突然打滑）
-            //   (b) 已经给满是却在往后退（(a) 的兜底：渐进负载把 I 顶到饱和之后的版本）
-            // 前置"不在 Transit"：Transit 里 error 大是操作手造成的，不是外力证据。
+            // Recover 进入：目标与加速度反向且幅度超门槛；前置不在 Transit（那里的 error 是操作手造成的）
             spin_state = Recover;
         }
     }
 
     // ---------- 归一输出映射到各路电压 + 电压斜率限制 ----------
-    // 斜率不对称：升压要慢（加压过快会打滑、拉大电流），撤压要快
-    // （收油没有打滑风险，电机那端是被动负载，撤压慢等于迟收油、继续推着车走）。
-    // Recover：已确认是非预期运动，两方向都不限，让 P、I 立刻给出所需补偿。
-    // Stall：唯一例外。被顶住时"松劲"最危险——操作手拨杆会让 kf、kp 一起缩，
-    //   而 I 在饱和方向积不进去，合成输出一塌车就被它顶着的东西弹回来。
-    //   所以目标电压绝对值比当前小（= 在松劲）时按升压斜率慢慢松；
-    //   加压和反向（操作手拨满想脱困）不受限，意图必须实现。
-    // 各限幅都是正的绝对电压步长；不能乘带符号 output，否则反向命令的限幅方向会反转。
-    const float dv_up = slew_boost * dt_s;
-    const float dv_down = slew_release * dt_s;
+    // 换向以 0 为界分段限速、额度按时间分，思路见 docs/代码补充注释/01
+    const bool slow_on_rise = spin_state != Stall;                    // 常态加压慢、撤压快；Stall 反过来：松劲慢、顶住快
+    const float rate_fall = slow_on_rise ? slew_release : slew_boost; // 幅值减小方向的速率，单位 V/s
+    const float rate_rise = slow_on_rise ? slew_boost : slew_release; // 幅值增大方向的速率，单位 V/s
     for (uint8_t i = 0; i < motor_count; i++)
     {
-        const float base_voltage = friction + motors[i].volt_min;
-        const float controllable_voltage = motors[i].volt_max - base_voltage;
-        float volt = target_sign * base_voltage + output * controllable_voltage * motors[i].volt_factor;
-        const float dv = volt - motors[i].volt_output;
-        if (spin_state == Recover)
-            ; // 不限
-        else if (spin_state == Stall)
+        const float base_voltage = friction + motors[i].volt_min;                                        // 基础电压
+        const float controllable_voltage = motors[i].volt_max - base_voltage;                            // 可调电压
+        float volt = target_sign * base_voltage + output * controllable_voltage * motors[i].volt_factor; // 目标电压
+        const float volt_output = motors[i].volt_output;
+        if (spin_state != Recover) // Recover 两方向都不限斜率，抢时间补力矩
         {
-            // 用电压绝对值比而不是数值大小比：反向加压时电压数值也在降，但那不是松劲
-            const float limit = (fabsf(volt) < fabsf(motors[i].volt_output) ? slew_boost : slew_release) * dt_s;
-            if (fabsf(dv) > limit)
-                volt = motors[i].volt_output + (dv > 0.0f ? limit : -limit);
+            if (volt * volt_output < 0.0f) // 过零换向：撤到 0 之前升压速率不生效
+            {
+                const float t_fall = fabsf(volt_output) / rate_fall; // 撤到 0 要花的时间，单位 s
+                if (t_fall >= dt_s)
+                    volt = volt_output - (volt_output > 0.0f ? rate_fall : -rate_fall) * dt_s; // 本拍撤不完
+                else
+                {
+                    const float rise = rate_rise * (dt_s - t_fall); // 剩下的时间够升多少，单位 V
+                    volt = volt > 0.0f ? fminf(volt, rise) : fmaxf(volt, -rise);
+                }
+            }
+            else
+            {
+                const float limit = (fabsf(volt) > fabsf(volt_output) ? rate_rise : rate_fall) * dt_s;
+                const float dv = volt - volt_output; // 目标电压变化
+                if (fabsf(dv) > limit)
+                    volt = volt_output + (dv > 0.0f ? limit : -limit);
+            }
         }
-        else if (dv > dv_up)
-            volt = motors[i].volt_output + dv_up;
-        else if (dv < -dv_down)
-            volt = motors[i].volt_output - dv_down;
         motors[i].volt_output = volt;
         motors[i].motor->spin(vex::directionType::fwd, volt, vex::voltageUnits::volt);
     }
@@ -241,41 +213,29 @@ void MyMotorGroup::drive(float target)
         fabs_target = 0.0f;
     }
     const uint32_t now_us = get_time_us();
-
-    // ---- 目标事件 ----
-    // 大跳：目标动了，而且**新目标离实际速度还差得远**。
-    //   只看 |Δtarget| 不够——target 100→5 而车实际只在 1 pct 时，新目标离速度只有 4 pct，
-    //   既不该重置积分，撤压方向也不该被保护（撤压本来就允许快）。
-    //   操作手 5pct→1pct→−1pct 的缓进缓退两条都不成立，不会被当成事件。
-    // 换向：方向反了但幅度很小那也是操作手的明确意图，进 Transit 给斜率保护。
-    // 注：不再为 Recover/Stall 开例外——这两个条件已经把"堵转中把杆收小"
-    // （100→−5 而车在 1 pct）自动挡掉了，不需要额外的免疫规则。
     const int8_t new_target_sign = target > 0.0f ? 1 : (target < 0.0f ? -1 : 0);
-    const bool target_jumped = fabsf(target - this->target) > target_jump_abs &&
-                               fabsf(target - pre_v) > target_jump_abs;
-    const bool reversed = new_target_sign != 0 && target_sign != 0 && new_target_sign != target_sign;
-
-    if (spin_state == Stopped)
+    if (spin_state == Stopped && target != 0.0f)
     {
         last_time_us = now_us;
-        transit_start_us = now_us;
-        spin_state = Transit;
+        if (fabs_target < err_out_dead)
+            spin_state = Track;
+        else
+        {
+            spin_state = Transit;
+            transit_start_us = now_us;
+        }
     }
-    else if (target_jumped || reversed)
+    else if (fabsf(target - this->target) > target_jump_abs && fabsf(target - pre_v) > target_jump_abs)
+    { // 目标跳动：积分清零，走 Transit 重新观察。
+        integral = 0.0f;
+        spin_state = Transit;
+        transit_start_us = now_us;
+    }
+    else if (new_target_sign != 0 && target_sign != 0 && new_target_sign != target_sign)
     {
-        // 只有"大跳"才清积分。换向但幅度很小（堵转中的缓进缓退）不清——
-        // 那笔积分正是车此刻顶着负载的力矩，清掉车就塌下去了。
-        if (target_jumped)
-            integral = 0.0f;
-        transit_start_us = now_us;
         spin_state = Transit;
+        transit_start_us = now_us;
     }
-
-    // target_sign 直接跟随 target 的符号：target=0 时为 0，摩擦垫随之消失。
-    // 车要停就不该再按上一拍的方向垫电压——那等于常驻一股推着车走的力矩。
-    // 抖动导致的 ±2V 翻极性交给斜率不对称吸收：升压 25V/s 慢、撤压 240V/s 快，
-    // 抖动的净电压趋近于 0，真过零起步还有升压斜率挡着不会打滑。
     target_sign = new_target_sign;
-
     this->target = target;
 }

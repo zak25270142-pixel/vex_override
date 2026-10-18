@@ -173,7 +173,7 @@ void menu_key_reset()
     key_up.mode = Control_key::spress;
     key_down.mode = Control_key::spress;
     key_shift.mode = Control_key::lpress;
-    key_shift.first_press_gap = 65535; // 等于短按但是下降沿触发
+    key_shift.first_press_gap = 65535; // 等于上升沿触发无长按短按之分
     key_enter.mode = Control_key::lpress;
     key_enter.first_press_gap = 65535;
     key_back.mode = Control_key::lpress;

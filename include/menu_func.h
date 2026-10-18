@@ -63,7 +63,7 @@ public:
     void back();
 };
 
-// 一个视觉菜单对象同时包含文字样式和检测框数据，两者由同一次循环绘制。
+// 一个视觉菜单对象：名称、颜色与检测结果指针（数据由外部持有）
 struct AI_VISION_MENU_OBJECT
 {
     const char *name;

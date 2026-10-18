@@ -114,7 +114,7 @@ void MENU::tc_value_add()
         *(float *)item->data_ptr += (exn >= 0) ? (float)ten_xx_num(exn) : 1.0 / ten_xx_num(-exn);
         break;
     case type_double:
-        *(float *)item->data_ptr += (exn >= 0) ? (float)ten_xx_num(exn) : 1.0 / ten_xx_num(-exn);
+        *(double *)item->data_ptr += (exn >= 0) ? (double)ten_xx_num(exn) : 1.0 / (double)ten_xx_num(-exn);
         break;
     case type_on_off:
     case type_bool:
@@ -159,7 +159,7 @@ void MENU::tc_value_reduce()
         *(float *)item->data_ptr -= (exn >= 0) ? (float)ten_xx_num(exn) : 1.0 / ten_xx_num(-exn);
         break;
     case type_double:
-        *(float *)item->data_ptr -= (exn >= 0) ? (float)ten_xx_num(exn) : 1.0 / ten_xx_num(-exn);
+        *(double *)item->data_ptr -= (exn >= 0) ? (double)ten_xx_num(exn) : 1.0 / (double)ten_xx_num(-exn);
         break;
     case type_on_off:
     case type_bool:
@@ -287,7 +287,6 @@ void MENU::up()
     {
         now_choose = (now_choose + menu_len - 1) % menu_len;
         refresh();
-        refresh_highlight_line_left();
     }
     else if (inner_menu && !is_monitor_menu)
     {
@@ -303,7 +302,6 @@ void MENU::down()
         now_choose++;
         now_choose %= menu_len;
         refresh();
-        refresh_highlight_line_left();
     }
     else if (inner_menu && !is_monitor_menu)
     {
@@ -339,22 +337,16 @@ void MENU::shift()
 
 void MENU::enter()
 {
-    if (!is_monitor_menu && menu_item[now_choose].is_getter())
-        return;
-
-    inner_menu = true;
+    // 监控菜单只读：enter 空操作（"监听菜单相关处理"预留）。
+    // 不能置 inner_menu——up/down 两个分支都进不去，监控列表直接冻结。
     if (is_monitor_menu)
-    {
-        // 监听菜单相关处理
-    }
-    else
-    {
-        if (tc_key_reset != nullptr)
-            tc_key_reset();
-        exn = 0;
-        refresh_exn();
-        refresh_highlight_line_right();
-    }
+        return;
+    inner_menu = true;
+    if (tc_key_reset != nullptr)
+        tc_key_reset();
+    exn = 0;
+    refresh_exn();
+    refresh_highlight_line_right();
 }
 
 void MENU::back()
