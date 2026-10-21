@@ -28,9 +28,9 @@ speed_loop_probe.py —— 速度环低速粘滑问题的实车诊断脚本（�
 
 用法：
     先起后端：uvicorn app.main:app --host 127.0.0.1 --port 8000
-    然后：python scripts/speed_loop_probe.py               # open+closed 全跑
-          python scripts/speed_loop_probe.py --phase open  # 只跑开环
-          python scripts/speed_loop_probe.py --tag old_mapping   # 给数据文件打标记(如固件版本)
+    然后：python scripts/05-速度环/speed_loop_probe.py               # open+closed 全跑
+          python scripts/05-速度环/speed_loop_probe.py --phase open  # 只跑开环
+          python scripts/05-速度环/speed_loop_probe.py --tag old_mapping   # 给数据文件打标记(如固件版本)
 数据写到 backend/pytest/probe_data/ 下：每试次的指标汇总 csv + 完整波形 csv。
 """
 
@@ -41,14 +41,43 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from app.script_api import BackendLink  # noqa: E402
+
+
+def plot_groups(path, sum_rows, targets):
+    """一栏：各增益组的稳态误差 vs 目标——哪组在中低速最贴 0 一目了然。"""
+    from plot_util import subplots, save, legend
+
+    fig, axes = subplots(1, width=7.5)
+    ax = axes[0][0]
+    groups = sorted({r[0] for r in sum_rows if r[0].startswith("closed_")})
+    for gname in groups:
+        xs, ys = [], []
+        for t in targets:
+            for r in sum_rows:
+                if (r[0] == gname and r[1] == "tgt=%g" % t and len(r) > 6
+                        and isinstance(r[6], str) and r[6].startswith("err=")):
+                    xs.append(t)
+                    ys.append(float(r[6][4:]))
+        if xs:
+            ax.plot(xs, ys, "o-", ms=3, lw=1, label=gname.replace("closed_", ""))
+    ax.axhline(0, color="gray", ls=":", lw=1)
+    ax.set_xlabel("目标 / pct")
+    ax.set_ylabel("稳态误差 / pct")
+    ax.set_title("各增益组稳态误差（越贴 0 越好）")
+    ax.grid(True, alpha=0.3)
+    legend(ax, fontsize=7, ncol=2)
+    save(fig, path)
 
 # 关心的监控项中文名（来自 LCD_menu.cpp 注册表）
 MON_OPEN = ["左0转速", "右0转速", "左0实际电压", "右0实际电压", "全局X", "全局Y", "航向"]
 MON_CLOSED = ["左指令转速", "右指令转速", "左0转速", "右0转速",
-              "左0指令电压", "右0指令电压", "左0实际电压", "全局X", "全局Y", "航向"]
+              "左0指令电压", "右0指令电压", "左0实际电压",
+              "左0电流", "左1电流", "左2电流", "右0电流", "右1电流", "右2电流",  # 看 factor 载荷分担
+              "全局X", "全局Y", "航向"]
 NAME_X, NAME_Y, NAME_YAW = "全局X", "全局Y", "航向"
 
 # 调参项中文名（调参目录下发的是 Chinese_name，不是代码里的 item_name）
@@ -56,13 +85,12 @@ NAME_X, NAME_Y, NAME_YAW = "全局X", "全局Y", "航向"
 # robot_and_control.cpp 里重新烧录，调参目录和本脚本都不改它；要动前馈请走开环电压
 # 实验、回来改表。另注意固件里表的占位值是各节点 0.01，与历史实验的 0.006 不同，
 # 复现旧数据前先把表填成对应值。
-GAIN_KEYS = ["左kp 输出/pct", "左ki 输出/(pct·s)", "左kd 输出·s/pct",
-             "右kp 输出/pct", "右ki 输出/(pct·s)", "右kd 输出·s/pct"]
-GAIN_NAME = {"L": {"kp": "左kp 输出/pct", "ki": "左ki 输出/(pct·s)", "kd": "左kd 输出·s/pct"},
-             "R": {"kp": "右kp 输出/pct", "ki": "右ki 输出/(pct·s)", "kd": "右kd 输出·s/pct"}}
+GAIN_NAME = {"L": {"kp": "左kp", "ki": "左ki", "kd": "左kd"},
+             "R": {"kp": "右kp", "ki": "右ki", "kd": "右kd"}}
+GAIN_KEYS = [GAIN_NAME[s][k] for s in ("L", "R") for k in ("kp", "ki", "kd")]
 
 # 闭环增益组：(组名, kp, ki每秒, kd每秒, 摩擦垫设置)
-# 摩擦垫设置=None 用当前调参值；否则为 (静摩擦V, 动摩擦V, volt_min V×8台)
+# 摩擦垫设置=None 用当前调参值；否则为 (静摩擦V, 动摩擦V, volt_min V×6台)
 # 注意 ki/kd 调参表里存的就是每秒量纲值，脚本原样下发，无需换算。
 # kf 不在此扫：固件里的插值表整个实验期间保持不变（见 robot_and_control.cpp）。
 GAIN_GROUPS = [
@@ -91,9 +119,14 @@ SPEED_TARGETS = [3.0, 5.0, 10.0, 20.0]   # pct；3/5pct 是低速重点，10/20p
 SUM_COLS = ["phase", "step", "L_mean", "R_mean", "L_std", "R_std",
             "note1", "note2", "note3", "note4"]
 
-# 开环电压扫描（V）：8电机同电压（整车直线，左右抵消转向力矩）
-VOLT_UP = [round(0.3 + 0.1 * i, 2) for i in range(14)]    # 0.3~1.6，每档重新起步
-VOLT_DOWN = [round(1.6 - 0.1 * i, 2) for i in range(15)]  # 1.6~0.2，滚动中连续扫
+# 开环电压扫描（V）：6电机同电压（整车直线，左右抵消转向力矩）
+def build_volts(vmax: float, step: float = 0.1):
+    """起步档 0.3~vmax 每档重新起步；降压档 vmax~0.2 滚动中连续扫。"""
+    n_up = int(round((vmax - 0.3) / step)) + 1
+    n_down = int(round((vmax - 0.2) / step)) + 1
+    up = [round(0.3 + step * i, 2) for i in range(n_up)]
+    down = [round(vmax - step * i, 2) for i in range(n_down)]
+    return up, down
 
 # ===== 安全限位（新版核心：累积位移归零，不靠单脉冲赌运气）=====
 FENCE_X_M = 1.0       # 相对会话原点的纵向围栏：越过立即收车中止（用户允许1.5m，留余量取1.0）
@@ -101,9 +134,8 @@ FENCE_Y_M = 0.30      # 横向围栏（走偏保护）
 FENCE_YAW_DEG = 30.0  # 航向围栏（防止扫成转圈绕线）
 PULSE_VOLT_S = 0.5    # 开环单档脉冲时长
 PULSE_SPIN_S = 0.8    # 闭环单目标脉冲时长
-RETURN_SPEED = 6.0    # 倒车复位速度 pct（慢，留制动余量）
-RETURN_TOL_M = 0.03   # 回到原点 3cm 内视为复位
-RETURN_EARLY_M = 0.06 # 距原点 6cm 就断电滑行，绝不带着速度过零反向窜
+RETURN_TOL_M = 0.03    # 回到原点 3cm 内视为复位
+RETURN_TIMEOUT_S = 8.0 # 倒车复位总时限 s（全局X闭环收敛，含近圈修正）
 HOME_GUARD_S = 0.35   # 脉冲后静止滑行观察时间
 STOP_SETTLE_S = 1.5   # 倒车前先刹停并等待真正零速的最长时间
 WD_PERIOD_S = 0.03    # 围栏主动 check 的周期
@@ -136,6 +168,7 @@ class Watchdog:
         self.armed = False
         self.tripped = None  # 触发原因字符串，None=正常
         self.ox = self.oy = self.oyaw = 0.0
+        self.fence_x = FENCE_X_M  # 纵向会话围栏 m（高速直行测试可经 CLI 调大）
         self.pb = None       # 单脉冲位移预算（m），None=不启用
         self.px = self.py = 0.0     # 脉冲起点 X/Y
         self.vlim = None     # 转速上限(pct)，任一侧持续超速即收车
@@ -214,8 +247,8 @@ class Watchdog:
         else:
             # 直线脉冲：会话级 x/y/yaw 围栏 + 单脉冲纵向预算
             dyaw = yawn - self.oyaw
-            if abs(dx) > FENCE_X_M:
-                self._emergency(f"纵向位移 {dx:+.3f}m 超过 ±{FENCE_X_M}m")
+            if abs(dx) > self.fence_x:
+                self._emergency(f"纵向位移 {dx:+.3f}m 超过 ±{self.fence_x}m")
             elif abs(dy) > FENCE_Y_M:
                 self._emergency(f"横向偏移 {dy:+.3f}m 超过 ±{FENCE_Y_M}m")
             elif self.yaw_fence_on and abs(dyaw) > FENCE_YAW_DEG:
@@ -289,26 +322,41 @@ class Probe:
         return False
 
     def return_home(self):
-        """安全倒车复位：先彻底刹停等零速 → 临时切纯前馈(消除PI粘滑极限环)慢倒
-        → 距原点6cm提前断电 → 刹停 → 恢复当前实验组增益。"""
+        """安全倒车复位：全局X闭环收敛——按残余距离下发反向速度，反复修正到原点
+        ±RETURN_TOL_M 内。远段连续倒（中途不停车，免静摩擦重启），进6cm圈断电滑行，
+        停稳仍超差就按全局X短冲再修；不赌固定滑行量，每轮都看全局X。"""
         self.wd.end_pulse()  # 复位是受控动作，关掉脉冲预算，只保留会话围栏+超速保护
         self.L.stop_move()   # 电机制动（不是0V惰行），尽快消掉前进余速
         self._wait_stop()
-        self.apply_settings(0.008, 0.0, 0.0, 0.0, None, remember=False)  # 回程用纯前馈
+        self.apply_settings(0.008, 0.0, 0.0, None, remember=False)  # 回程用纯前馈（pads=None 不碰摩擦垫）
         self.wd.begin_pulse(vlim=20.0, budget=None)
         try:
-            dx = self.L.latest(NAME_X) - self.wd.ox
-            if abs(dx) > RETURN_TOL_M:
-                target = -RETURN_SPEED if dx > 0 else RETURN_SPEED
-                self.L.spin_target(target, target)
-                t_end = time.perf_counter() + 4.0
-                while time.perf_counter() < t_end:
-                    self.wd.check()
-                    if abs(self.L.latest(NAME_X) - self.wd.ox) <= RETURN_EARLY_M:
+            t_end = time.perf_counter() + RETURN_TIMEOUT_S
+            while time.perf_counter() < t_end:
+                self.wd.check()
+                dx = self.L.latest(NAME_X) - self.wd.ox
+                adx = abs(dx)
+                if adx <= RETURN_TOL_M:
+                    break
+                direction = -1.0 if dx > 0 else 1.0
+                if adx > 0.06:
+                    # 远段：连续倒，最低12pct保静摩擦突破，速度随残余距离涨（上限18，vlim=20 内）
+                    speed = min(18.0, max(12.0, adx * 30.0))
+                    self.L.spin_target(direction * speed, direction * speed)
+                    self._sleep(WD_PERIOD_S)
+                else:
+                    # 近圈：断电滑行+静摩擦收尾，停稳后按全局X决定是否短冲修正
+                    self.L.spin_target(0.0, 0.0)
+                    self._sleep(0.35)
+                    dx = self.L.latest(NAME_X) - self.wd.ox
+                    if abs(dx) <= RETURN_TOL_M:
                         break
-                    time.sleep(WD_PERIOD_S)
-                self.L.spin_target(0.0, 0.0)  # 提前断电滑行剩余 3~6cm
-                self._sleep(0.4)
+                    # 短冲修正：14pct 越过静摩擦，时长按残余距离给（最多0.3s）
+                    direction = -1.0 if dx > 0 else 1.0
+                    self.L.spin_target(direction * 14.0, direction * 14.0)
+                    self._sleep(min(0.3, abs(dx) / 0.15))
+                    self.L.spin_target(0.0, 0.0)
+                    self._sleep(0.3)
         finally:
             self.wd.end_pulse()
             if self.cur_settings is not None:
@@ -333,8 +381,8 @@ class Probe:
         path = os.path.join(self.outdir, f"{self.tag}_{prefix}_{self._wave_seq:02d}_wave.csv")
         return self.L.save_csv(path, rows, ["t_rel_s", "item", "value"], quiet=True)
 
-    # ---------------- 实验1：开环电压特性（整车8电机同压，每脉冲后倒车回原点） ----------------
-    def phase_open(self):
+    # ---------------- 实验1：开环电压特性（整车6电机同压，每脉冲后倒车回原点） ----------------
+    def phase_open(self, volt_up, volt_down, pulse_s, seg_m):
         L = self.L
         L.clear_subs()
         L.sub(MON_OPEN)  # 登记要记录的项（顺带高速推送）
@@ -342,15 +390,15 @@ class Probe:
         self.halt()
         self.wd.arm()
 
-        print(f"\n===== 开环起步扫描：{PULSE_VOLT_S}s/档，动了就倒回原点 =====")
-        for v in VOLT_UP:
+        print(f"\n===== 开环起步扫描：{pulse_s}s/档 ×{len(volt_up)}档，动了就倒回原点 =====")
+        for v in volt_up:
             self.wd.check()
             x_pre = L.latest(NAME_X)
             L.start_log()      # 每档一段独立记录：缓冲不跨档累积，时间轴也从这里算起
-            self.wd.begin_pulse(vlim=80.0)  # 开环只防瞬间大蹿（松，允许静摩擦释放毛刺）
+            self.wd.begin_pulse(vlim=80.0, budget=seg_m)  # 位移预算随扫描电压上调（地面补标用）
             try:
                 L.drive_volt(v)
-                self._sleep(PULSE_VOLT_S)
+                self._sleep(pulse_s)
                 self.halt()
                 self._sleep(HOME_GUARD_S)
             except RuntimeError:
@@ -375,17 +423,17 @@ class Probe:
                 self.return_home()
             self._sleep(0.25)
 
-        print("\n===== 开环滚动降压：1.6V起步后连续降档，整体移出≤0.2m 后倒回 =====")
-        self.wd.begin_pulse(vlim=80.0, budget=0.20)
+        print(f"\n===== 开环滚动降压：{volt_down[0]:.1f}V起步后连续降档，整体移出≤{seg_m}m 后倒回 =====")
+        self.wd.begin_pulse(vlim=80.0, budget=seg_m)
         try:
-            L.drive_volt(1.6)
+            L.drive_volt(volt_down[0])
             self._sleep(0.7)
             x_scan0 = L.latest(NAME_X)
-            for v in VOLT_DOWN:
+            for v in volt_down:
                 self.wd.check()
                 L.start_log()      # 每档一段独立记录，波形按档切分
                 L.drive_volt(v)
-                self._sleep(0.3)
+                self._sleep(pulse_s)
                 L.end_log()
                 w = L.wave(MON_OPEN)
                 self.save_wave("open_down", w)
@@ -398,8 +446,8 @@ class Probe:
                                       f"{ls:.2f}", f"{rs:.2f}", state])
                 print(f"  {v:4.1f}V  L {lm:6.2f}±{ls:4.2f}(min {lmin:5.1f})  "
                       f"R {rm:6.2f}±{rs:4.2f}  {state}")
-                if abs(L.latest(NAME_X) - x_scan0) > 0.20:
-                    print("    [分段] 本段已移出0.2m，先倒回再继续降档")
+                if abs(L.latest(NAME_X) - x_scan0) > seg_m:
+                    print(f"    [分段] 本段已移出{seg_m}m，先倒回再继续降档")
                     break
         finally:
             self.wd.end_pulse()
@@ -426,13 +474,15 @@ class Probe:
         if remember:
             self.cur_settings = (kp, ki_s, kd_s, pads)
 
-    def phase_closed(self, no_prompt=False, group_filter=None, rotate=False):
+    def phase_closed(self, no_prompt=False, group_filter=None, rotate=False,
+                     targets=None, budget_max=0.65):
         L = self.L
         L.clear_subs()
         L.sub(MON_CLOSED)  # 登记要记录的项
         time.sleep(0.3)
         self.halt()
         groups = [g for g in GAIN_GROUPS if group_filter is None or g[0] in group_filter]
+        targets = targets or SPEED_TARGETS
         for gname, kp, ki, kd, pads in groups:
             self.wd.check()
             self.apply_settings(kp, ki, kd, pads)
@@ -448,7 +498,7 @@ class Probe:
                 print(f"\n===== 增益组 {gname}  kp={kp} ki={ki} kd={kd} pads={pads}{mode_txt} =====")
                 self.wd.arm(rotate=rotate)
                 time.sleep(0.3)
-            for pulse_i, tgt in enumerate(SPEED_TARGETS):
+            for pulse_i, tgt in enumerate(targets):
                 self.wd.check()
                 L.start_log()   # 每个脉冲一段独立记录：缓冲不累积，波形天然按脉冲切分
                 if rotate:
@@ -460,7 +510,7 @@ class Probe:
                     ltgt, rtgt = s * tgt, -s * tgt
                 else:
                     # 超速：目标1.8倍+6pct持续120ms即收车；预算按实测物理速度约2.6cm/s/pct给1.4倍余量
-                    budget = min(0.65, 0.12 + tgt * 0.025 * 1.4)
+                    budget = min(budget_max, 0.12 + tgt * 0.025 * 1.4)
                     self.wd.begin_pulse(vlim=tgt * 1.8 + 6.0, budget=budget)
                     ltgt, rtgt = tgt, tgt
                 try:
@@ -545,14 +595,31 @@ def main():
                     help="回收模式：以≤6pct慢速倒车把车倒回 x≈0，不做任何实验")
     ap.add_argument("--rotate", action="store_true",
                     help="原地旋转模式：左正反右，车不位移，专用于高速段测试(防拉线)")
+    ap.add_argument("--volt-max", type=float, default=1.6, help="开环扫描电压上限 V（默认 1.6）")
+    ap.add_argument("--pulse-s", type=float, default=PULSE_VOLT_S,
+                    help="开环每档脉冲时长 s（默认 %.1f；地面补标拿准稳态可加长）" % PULSE_VOLT_S)
+    ap.add_argument("--seg-m", type=float, default=PULSE_BUDGET_M,
+                    help="开环单脉冲/单段位移预算 m（默认 %.2f，扩压扫描要随之上调）" % PULSE_BUDGET_M)
+    ap.add_argument("--targets", default="3,5,10,20",
+                    help="闭环目标速度档 pct，逗号分隔（高速直行测试加 30,40 等）")
+    ap.add_argument("--fence-x", type=float, default=FENCE_X_M,
+                    help="纵向会话围栏 m（默认 %.1f，高速直行测试调大，人看线）" % FENCE_X_M)
+    ap.add_argument("--budget-max", type=float, default=0.65, help="闭环单脉冲位移预算上限 m（高速档要调大）")
+    ap.add_argument("--png", default="speed_loop.png",
+                    help="汇总图文件名，空字符串跳过；落 backend/pytest/probe_data/05-速度环/<tag>/")
     args = ap.parse_args()
 
-    outdir = str(Path(__file__).resolve().parent.parent / "pytest" / "probe_data")
+    volt_up, volt_down = build_volts(args.volt_max)
+    targets = [float(t) for t in args.targets.split(",") if t.strip()]
+
+    # 一次 probe 会吐几十个 <tag>_*_wave.csv，按 tag 单独建目录，免得淹没 probe_data
+    outdir = str(BackendLink.OUT_ROOT / "05-速度环" / args.tag)
     os.makedirs(outdir, exist_ok=True)
 
     link = BackendLink(args.base)  # 构造即就绪：等连上/等目录/清 abort/拉目录
 
     wd = Watchdog(link)
+    wd.fence_x = args.fence_x
     saved_gains = {}
     probe = None
     try:
@@ -593,13 +660,12 @@ def main():
         time.sleep(0.2)
 
         probe = Probe(link, outdir, args.tag, wd)
-        if args.phase in ("closed", "all"):
-            for k in GAIN_KEYS + PAD_NAMES:
-                if k in link.tun_dir:
-                    saved_gains[k] = link.tun_dir[k][1]
+        for k in GAIN_KEYS + PAD_NAMES:
+            if k in link.tun_dir:
+                saved_gains[k] = link.tun_dir[k][1]
 
-        print("\n安全机制：每个测试脉冲后【先刹停等零速再6pct慢倒】回原点；")
-        print("         相对起点 ±1.0m/±0.30m/±30° 硬围栏；单脉冲0.25m预算+超速保护；")
+        print("\n安全机制：每个测试脉冲后【先刹停等零速，再按全局X残余距离定速闭环倒回】；")
+        print(f"         相对起点 ±{args.fence_x:.1f}m/±0.30m/±30° 硬围栏；单脉冲位移预算+超速保护；")
         print("         围栏在脉冲循环里按 30ms 主动 check（不再单开看门狗线程）；")
         print("         上位机停车会置 abort 立即中止；脚本死掉则主控心跳看门狗 2.56s 内自行收车。")
         if not args.no_prompt:
@@ -607,11 +673,14 @@ def main():
             input("准备好后回车开始 > ")
 
         if args.phase in ("open", "all"):
-            probe.phase_open()
+            probe.phase_open(volt_up, volt_down, args.pulse_s, args.seg_m)
         if args.phase in ("closed", "all") and not (probe and probe.abort):
             gf = None if args.groups == "all" else set(args.groups.split(","))
-            probe.phase_closed(args.no_prompt, gf, rotate=args.rotate)
+            probe.phase_closed(args.no_prompt, gf, rotate=args.rotate,
+                               targets=targets, budget_max=args.budget_max)
         probe.write_summary()
+        if args.png and probe.sum_rows:
+            plot_groups(os.path.join(outdir, args.png), probe.sum_rows, targets)
 
         # 还原调参（闭环实验改过 kp/ki/kd 与摩擦垫；kf 表不动，无需还原）
         if saved_gains:
@@ -625,9 +694,9 @@ def main():
         print(f"\n[异常] {e}")
     finally:
         wd.armed = False  # 先撤防，收尾动作不再被围栏打断
-        link.close_safely()  # 目标归零 → 8电机0V → 刹车 → 停记录 → 退订 → 关连接
+        link.close_safely()  # 目标归零 → 6电机0V → 刹车 → 停记录 → 退订 → 关连接
         wd.close()
-        print("[safe] 已收车（目标归零/8电机0V/刹车/退订）")
+        print("[safe] 已收车（目标归零/6电机0V/刹车/退订）")
 
 
 if __name__ == "__main__":

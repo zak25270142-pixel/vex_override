@@ -38,10 +38,14 @@ static void ai_vision_task()
 }
 static vex::event ai_vision_event(ai_vision_task);
 
-// 心跳掉线 failsafe（回调注入 comm，检测与处置解耦）：仅在底盘空闲态收车
+// 心跳掉线 failsafe（回调注入 comm，检测与处置解耦）：
+// 开环/空闲态（!is_busy：跑电压、速度环直控）必须收车；PC 位置环任务在跑也收车；
+// 手柄控车不打断。失联后控制权不在上位机，它下发/直控的任务一律收回。
 static void comm_link_lost_handler()
 {
-    if (!robot_action.is_busy())        // is_busy 期间车不在上位机手里，不打断
+    if (robot_action.is_manual()) // 手柄控车，不打断
+        return;
+    if (!robot_action.is_busy() || pc_took_control)
         robot_action.stop_move(100000); // 缓停收车，不急刹
 }
 
@@ -76,6 +80,6 @@ void my_while()
 { // main.cpp while 区 10ms标准任务频率区
     main_timer.cycle();
     robot_action.refresh(); // 先更新状态
-    // 通信收/发都在独立的comm_rx_task、comm_tx_task里，不能在主循环再调用
+    // tx_tick 与主循环同线程同节拍（见文件头说明）；rx 在独立任务里阻塞等字节
     comm.tx_tick(); // 最后通信
 }

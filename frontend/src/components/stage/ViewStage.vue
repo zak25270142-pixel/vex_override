@@ -1,5 +1,5 @@
 <template>
-  <!-- 导航 + 视图屏。v-show 保持 ECharts 实例存活，由 ResizeObserver 自适应尺寸 -->
+  <!-- 导航 + 视图屏。v-show 保持 ECharts 实例存活，容器尺寸变化由 ChartView 的周期检查兜底 resize -->
   <section class="view-stage">
     <ViewNav />
     <div class="view-stage__screen">

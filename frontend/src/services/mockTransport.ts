@@ -149,9 +149,9 @@ const mockCommands: MockCmd[] = [
   ], ranges: [-10, 10, -10, 10, -360, 360] },
   // 字段异型的例子：编号是 uint8_t、电压是 float，min/max 各自按字段类型定宽
   { index: 0x84, tag: (2 << CMD_TAG_ARGC_SHIFT) | CMD_TAG_RANGE, name: '设置电机电压', fields: [
-    { type: ValueType.UInt8, name: '编号(0-7)' },
+    { type: ValueType.UInt8, name: '编号(0-2左1-3,3-5右1-3)' },
     { type: ValueType.Float, name: '电压(伏)' },
-  ], ranges: [0, 7, 0, 12] },
+  ], ranges: [0, 5, -12, 12] },
 ]
 
 /** 拼动作命令目录帧：[内容长度2B][命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×N] */
@@ -174,6 +174,10 @@ function cmdDirectoryFrame(c: MockCmd): Uint8Array {
   const payload = [body.length & 0xff, (body.length >> 8) & 0xff, ...body]
   return frame(CmdPost.CMDDirectory, payload)
 }
+
+/** 用户命令段边界（与固件 communication.h 的 CMD_BASE 一致）：0x80~0x9F */
+const CMD_USER_MIN = 0x80
+const CMD_USER_MAX = 0x9f
 
 /** 通用封帧（响应帧的命令字不是 CmdGet，所以不能直接用 protocol.buildFrame） */
 function frame(cmd: number, payload: number[]): Uint8Array {
@@ -272,7 +276,7 @@ export class MockTransport implements SerialTransport {
       mockCommands.forEach((c, i) => {
         setTimeout(() => this.cb.onData(cmdDirectoryFrame(c)), i * 10)
       })
-    } else if (cmd >= 0x80 && cmd <= 0x9f) {
+    } else if (cmd >= CMD_USER_MIN && cmd <= CMD_USER_MAX) {
       // 动作命令下发：演示源不执行真动作，静默吞掉（无ACK协议，真机同理不回帧）
     }
   }

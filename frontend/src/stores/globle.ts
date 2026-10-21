@@ -34,6 +34,7 @@ import {
   type DirItem,
   type CmdDirItem,
   type RxEvent,
+  BAUD_CDC,
 } from '@/services/protocol'
 import { CHANNELS, FAST_PERIOD, PLOT_WINDOW_S, TRACE_BUF_CAP } from '@/config/workspace'
 import type { WorkView } from '@/config/workspace'
@@ -49,8 +50,8 @@ export const connected = computed(() => connState.value === 'connected')
 export const statusText = ref(
   serialSupported.value ? '未连接' : '浏览器不支持 Web Serial，请使用 Chrome / Edge',
 )
-/** User 口是 USB CDC，波特率无实际意义，固定 115200 仅为满足 API */
-export const baud = 115200
+/** User 口是 USB CDC，波特率无实际意义，固定值仅为满足 Web Serial API */
+export const baud = BAUD_CDC
 /** 顶栏"自动连接"开关（持久化）：页面加载与断线后自动重连 */
 export const autoConnect = ref(loadPrefs().autoConnect)
 
@@ -152,7 +153,7 @@ async function sendFrame(frame: Uint8Array, label: string, quiet = false): Promi
   }
 }
 
-/* ===== 心跳：连上后每 1s 发 Ping，主控回 Pong；主控 2.56s 收不到会停推监控值 ===== */
+/* ===== 心跳：连上后每 80ms 发 Ping，主控回 Pong；主控 300ms 收不到会停推监控值并收车 ===== */
 let pingTimer: number | null = null
 
 function stopPing(): void {
@@ -164,12 +165,12 @@ function stopPing(): void {
 
 function startPing(): void {
   stopPing()
-  // 立刻先发一个：主控看门狗第一个巡视周期（2.56s）内必须见到 Ping，
-  // 干等到首个 1s 间隔虽然也够，但立即发能让"刚连上"的链路最快被认可
+  // 立刻先发一个：主控看门狗第一个巡视周期（300ms）内必须见到 Ping，
+  // 干等到首个 80ms 间隔虽然也够，但立即发能让"刚连上"的链路最快被认可
   void sendFrame(ping(), '心跳Ping', true)
   pingTimer = window.setInterval(() => {
     void sendFrame(ping(), '心跳Ping', true)
-  }, 1000)
+  }, 80)
 }
 
 /* ===== 两张参数目录（key=下位机数组下标 index） ===== */
@@ -403,7 +404,7 @@ function sortedIndices(map: Record<number, DirItem>): number[] {
     .sort((a, b) => a - b)
 }
 
-function sortedMonitor(map: Record<number, DirItem>): DirItem[] {
+export function sortedMonitor(map: Record<number, DirItem>): DirItem[] {
   // 已订阅优先（高速排前），同档按 index；未订阅按 index 跟在后面
   return sortedIndices(map)
     .map((i) => map[i]!)
@@ -769,7 +770,7 @@ serialClient.onStatus = (state, message) => {
     void fetchTunable()
     void fetchMonitor()
     void fetchCommands()
-    startPing() // 同时启动1s心跳；主控2.56s收不到Ping会自动停推监控值
+    startPing() // 同时启动80ms心跳；主控300ms收不到Ping会自动停推监控值并收车
   } else {
     stopPing() // 断开/连接中/出错都停心跳，避免向已关闭的端口写
     clearPendingTunable() // 待确认的写参也全部作废

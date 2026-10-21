@@ -236,6 +236,23 @@ static AI_VISION_MENU ai_vision_menu(
     menu.table_color,
     menu.bg_color);
 
+static bool remote_drive = true;
+// button3 标签与颜色同步到 joystick_drive_on：开=遥控器控车(绿)，关=摇杆控菜单并交出底盘(灰)
+static void refresh_remote_button()
+{
+    if (remote_drive)
+    {
+        button3.reset_button_name("remote:on", 14, 16);
+        button3.reset_button_color(vex::color(0x00cc44), vex::color(0x005511));
+    }
+    else
+    {
+        button3.reset_button_name("remote:off", 14, 16);
+        button3.reset_button_color(vex::color(0x777777), vex::color(0x222222));
+    }
+    button3.draw_button(Screen_Button::draw_released);
+}
+
 void refresh_menu()
 {
     switch (menu_state)
@@ -252,28 +269,23 @@ void refresh_menu()
             menu_state = ai_vision;
             ai_vision_menu.init();
         }
-        else if (key_joy_menu.read())
+        else if (key_remote.read())
         {
-            // 手柄控屏开关：开=摇杆操作菜单并交出底盘；关=摇杆只当数据源开车（互锁见 docs/代码补充注释/05）
-            static bool joystick_menu_on = false;
-            joystick_menu_on = !joystick_menu_on;
-            if (joystick_menu_on)
-            {
-                left_axis.state = Remote_Control::middle;
-                right_axis.state = Remote_Control::middle;
-                robot_action.stop_move(); // 解除手柄任务指针交出底盘
-                button3.reset_button_name("remote:on", 14, 16);
-                button3.reset_button_color(vex::color(0x00cc44), vex::color(0x005511));
-            }
-            else
+            // 遥控器控车开关：开=摇杆只当数据源开车；关=摇杆操作菜单并交出底盘（互锁见 docs/代码补充注释/05）
+            remote_drive = !remote_drive;
+            if (remote_drive)
             {
                 left_axis.state = Remote_Control::only_value;
                 right_axis.state = Remote_Control::only_value;
                 robot_action.manual();
-                button3.reset_button_name("remote:off", 14, 16);
-                button3.reset_button_color(vex::color(0x777777), vex::color(0x222222));
             }
-            button3.draw_button(Screen_Button::draw_released);
+            else
+            {
+                left_axis.state = Remote_Control::middle;
+                right_axis.state = Remote_Control::middle;
+                robot_action.stop_move(); // 解除手柄任务指针交出底盘
+            }
+            refresh_remote_button();
         }
         break;
 
@@ -323,5 +335,6 @@ void pre_menu_init()
     reset_origin();
     Brain.Screen.drawRectangle(0, 0, 480, 272, vex::black);
     pre_menu_key();
+    refresh_remote_button(); // 进/回待机屏时把标签同步到当前开关状态
     menu_state = pre;
 }

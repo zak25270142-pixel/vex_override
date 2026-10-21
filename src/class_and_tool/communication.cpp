@@ -201,8 +201,8 @@ void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd
         uint8_t vlen = value_size(item.data_type);
         uint8_t name_len = (uint8_t)strlen(item.Chinese_name);
 
-        if (name_len > 30)
-            name_len = 30; // 名称基本在30字节以下
+        if (name_len > DIR_NAME_MAX)
+            name_len = DIR_NAME_MAX; // 名称基本在30字节以下
 
         // 单位可能没填（nullptr或空串），统一发成长度0的单位段
         uint8_t unit_len = item.unit != nullptr ? (uint8_t)strlen(item.unit) : 0;
@@ -360,7 +360,7 @@ void USB_Comm::handle_command()
         break;
     }
     case Ping:
-        // 上位机心跳（每1s）：标记本周期见过心跳并立刻认可链路（掉线后再收到Ping
+        // 上位机心跳（每80ms）：标记本周期见过心跳并立刻认可链路（掉线后再收到Ping
         // 可即时恢复推送，不必等巡视点）；Pong不在这里发——rx任务不能写串口，
         // 只置pending标志，由下一拍tx_tick统一发，延迟最多10ms。
         ping_seen = true;
@@ -385,7 +385,7 @@ void USB_Comm::handle_command()
 void USB_Comm::monitor_tick()
 {
     // monitor_active：上位机要过监控目录；link_ok：心跳看门狗认可链路。
-    // 掉线（2.56s没见Ping）时只停监控值推送，订阅档位和表里数据都保留，Ping恢复即续传。
+    // 掉线（300ms没见Ping）时只停监控值推送，订阅档位和表里数据都保留，Ping恢复即续传。
     if (!monitor_active || !link_ok)
         return;
 
@@ -463,9 +463,9 @@ void USB_Comm::tx_tick()
 
     monitor_tick();
 
-    // 心跳巡视：每256拍（256×10ms=2.56s，上位机1s一个Ping，周期内必见2~3个）
-    // 在tick即将从255溢出回0前检查一次：本周期见过Ping就保持/恢复认可，没见过则断链停推。
-    if (tick == 255)
+    // 心跳巡视：每30拍（30×10ms=300ms，上位机80ms一个Ping，周期内必见3~4个，
+    // 丢一两个不误判）本周期见过Ping就保持/恢复认可，没见过则断链停推并通知收车。
+    if (tick % LINK_PATROL_TICKS == LINK_PATROL_TICKS - 1)
     {
         // 掉线只在"上周期认可、本周期没见Ping"的边沿通知一次：
         // 直接调注入的回调（本线程=主循环10ms，回调内只做快速收车，不阻塞）

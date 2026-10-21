@@ -2,6 +2,10 @@
 #include "key_set.h"       // 手柄摇杆对象在本层注入，工具类不直接引用全局
 #include "communication.h" // CMD_ITEM
 
+// PC 下发过位置环任务（turn/move/goto）即置位，不清零：掉线 failsafe 在 is_busy 时据此收车。
+// 开环命令（set_volt/set_spin）不建任务、is_busy 为假，由基础规则收车，无需置标记。
+bool pc_took_control = false;
+
 // 新车（feature/small_car）端口表：左右各 3 台
 static vex::motor left_chassis_1(vex::PORT1, vex::ratio6_1, true);
 static vex::motor left_chassis_2(vex::PORT2, vex::ratio6_1, false);
@@ -13,31 +17,31 @@ static vex::motor right_chassis_3(vex::PORT7, vex::ratio6_1, false);
 // kf 阻力前馈插值表
 static const Vec2f left_kf_table[] = {
     {0.0f, 0.0f},
-    {10.0f, 0.1f},
-    {25.0f, 0.25f},
-    {50.0f, 0.5f},
-    {75.0f, 0.75f},
-    {100.0f, 1.0f},
+    {10.0f, 0.0690f},
+    {25.0f, 0.2024f},
+    {50.0f, 0.4403f},
+    {75.0f, 0.6863f},
+    {100.0f, 0.9277f},
 };
 static const Vec2f right_kf_table[] = {
     {0.0f, 0.0f},
-    {10.0f, 0.1f},
-    {25.0f, 0.25f},
-    {50.0f, 0.5f},
-    {75.0f, 0.75f},
-    {100.0f, 1.0f},
+    {10.0f, 0.0594f},
+    {25.0f, 0.1988f},
+    {50.0f, 0.4338f},
+    {75.0f, 0.6650f},
+    {100.0f, 0.9094f},
 };
 
 // 逐台电机的个体属性：factor/max/min
 MyMotor left_motor_list[3] = {
-    {&left_chassis_1, 1.0f, 12.0f, 0.5f},
-    {&left_chassis_2, 1.0f, 12.0f, 0.5f},
-    {&left_chassis_3, 1.0f, 12.0f, 0.5f},
+    {&left_chassis_1, 1.0000f, 12.0f, 0.5f},
+    {&left_chassis_2, 1.0585f, 12.0f, 0.5f},
+    {&left_chassis_3, 0.8439f, 12.0f, 0.5f},
 };
 MyMotor right_motor_list[3] = {
-    {&right_chassis_1, 1.0f, 12.0f, 0.5f},
-    {&right_chassis_2, 1.0f, 12.0f, 0.5f},
-    {&right_chassis_3, 1.0f, 12.0f, 0.5f},
+    {&right_chassis_1, 1.0000f, 12.0f, 0.5f},
+    {&right_chassis_2, 0.7908f, 12.0f, 0.5f},
+    {&right_chassis_3, 0.9343f, 12.0f, 0.5f},
 };
 
 MyMotorGroup left_motors(
@@ -72,6 +76,7 @@ static void cmd_stop(const uint8_t *p)
 
 static void cmd_turn(const uint8_t *p)
 {
+    pc_took_control = true; // PC 位置环任务：掉线 failsafe 在 is_busy 时据此收车
     if (robot_action.is_busy())
         return;
     float angle;
@@ -81,6 +86,7 @@ static void cmd_turn(const uint8_t *p)
 
 static void cmd_move(const uint8_t *p)
 {
+    pc_took_control = true; // PC 位置环任务：掉线 failsafe 在 is_busy 时据此收车
     if (robot_action.is_busy())
         return;
     float distance;
@@ -90,6 +96,7 @@ static void cmd_move(const uint8_t *p)
 
 static void cmd_goto(const uint8_t *p)
 {
+    pc_took_control = true; // PC 位置环任务：掉线 failsafe 在 is_busy 时据此收车
     if (robot_action.is_busy())
         return;
     float arg[3]; // x前(米)、y右(米)、heading最终朝向(度)，紧凑小端排列
@@ -153,7 +160,7 @@ static const struct __attribute__((packed))
 {
     uint8_t id_min, id_max;
     float v_min, v_max;
-} range_set_volt = {0, 5, 0.0f, 12.0f};
+} range_set_volt = {0, 5, -12.0f, 12.0f};
 
 // 本车动作命令总表，非 static 供外部链接
 const CMD_ITEM robot_cmds[] = {

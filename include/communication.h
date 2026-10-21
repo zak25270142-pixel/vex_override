@@ -25,8 +25,8 @@
 //   连接后表内预置的 SUB/FAST/KIND 即默认订阅；Subscribe 改档时下位机只合并
 //   上位机下发的 SUB+FAST，保留本机 GETTER 与 KIND（见 handle_command）。
 //
-// 心跳：上位机每1s发Ping(A5 FF FF)，主控下一拍回Pong(同为A5 FF FF)；
-// 主控每256拍(2.56s)巡视一次，周期内没收到Ping就停推监控值，Ping恢复即续传。
+// 心跳：上位机每80ms发Ping(A5 FF FF)，主控下一拍回Pong(同为A5 FF FF)；
+// 主控每30拍(300ms)巡视一次，周期内没收到Ping就停推监控值并触发掉线收车，Ping恢复即续传。
 
 // 动作命令处理函数：在rx线程上下文同步执行，只做快速赋值/置标志
 // 是否拒绝忙时下发等行为细节由各函数自己决定（比如先查is_busy()）。
@@ -121,13 +121,12 @@ private:
     static constexpr uint8_t SLOW_PHASES = 8; // 低速项轮转相数：单项刷新周期=8×10ms=80ms
     static constexpr uint8_t DIR_BATCH = 8;   // 调参/监控目录分批：每个10ms拍最多连续发8项
     static constexpr uint8_t UNIT_MAX = 8;    // 目录帧单位名截断长度（字节），如 m/s、deg/s
+    static constexpr uint8_t DIR_NAME_MAX = 30; // 目录帧名称截断长度（字节）
     // ---- 动作命令表 ----
     static constexpr uint8_t CMD_BASE = 0x80;    // 用户命令段起点，0x80~0x9F共32个合法命令字
-    static constexpr uint8_t CMD_SLOT_MAX = 32;  // 合法命令字个数，仅用于收帧时的范围校验
     static constexpr uint8_t CMD_DIR_BATCH = 4;  // 命令目录每拍最多发4条
     static constexpr uint8_t CMD_NAME_MAX = 32;  // 命令名截断长度（字节）
     static constexpr uint8_t CMD_FIELD_MAX = 24; // 单个字段名截断长度（字节）
-    static constexpr uint8_t CMD_INPUT_MAX = 7;  // 单命令参数个数上限（tag bit6~4能表达0~7）
 
     RxState rx_state = WAIT_HEAD;    // 当前处在接收的哪个阶段
     uint8_t rx_cmd = 0;              // 本帧收到的命令字，执行命令时用它判断要做什么
@@ -152,13 +151,15 @@ private:
 
     bool monitor_active = false; // 是否正在周期推送
 
-    // 心跳看门狗（上位机每1s发Ping）：
-    //   ping_seen    本个2.56s巡视周期(256拍)内收到过Ping，收到即置true
+    // 心跳看门狗（上位机每80ms发Ping）：
+    //   ping_seen    本个300ms巡视周期(LINK_PATROL_TICKS拍)内收到过Ping，收到即置true
     //   link_ok      链路是否被认可；false时monitor_tick停推监控值（目录仍可正常发）
     //   pong_pending 收到Ping后置true，由tx_tick下一拍发Pong（写串口只能在tx任务）
     bool ping_seen = false;
     bool link_ok = true;
     bool pong_pending = false;
+
+    static constexpr uint8_t LINK_PATROL_TICKS = 30; // 掉线巡视周期：30拍(300ms)没见Ping即断链
 
     // 调参回显槽：rx线程改完值写入该项index，tx下一拍从data_ptr重读真实值发Tunable_Echo后清0xFF。
     // 单字节槽、人工调参节奏低，一槽足够；0xFF表示无待回显

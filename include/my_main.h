@@ -4,8 +4,6 @@
 #include "vex.h"
 #include "stdint.h"
 
-#define elif else if
-
 // 几何常量与角度换算
 constexpr float math_pi = 3.1415927f;
 constexpr float deg_to_rad = math_pi / 180.0f;
@@ -102,7 +100,6 @@ struct MENU_ITEM
     bool is_getter() const { return (tag & MENU_TAG_GETTER) != 0; }
     bool is_subscribed() const { return (tag & MENU_TAG_SUB) != 0; }
     bool is_fast() const { return (tag & MENU_TAG_FAST) != 0; }
-    uint8_t kind() const { return static_cast<uint8_t>(tag & MENU_TAG_KIND_MASK); }
 };
 
 void my_Init();

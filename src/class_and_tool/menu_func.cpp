@@ -26,7 +26,7 @@ MENU::MENU(const struct MENU_ITEM *items,
 // 打印数值+单位或个性化打印（仅内存指针路径；GETTER 项走 print_item）
 void MENU::print_value(int32_t y, void *ptr, VALUE_TYPE type, const char *unit, bool bOpaque)
 {
-    char str_buffer[28] = {32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, '\0'};
+    char str_buffer[STR_BUF_SIZE] = {32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, '\0'};
     switch (type)
     {
     case type_str:
@@ -61,7 +61,7 @@ void MENU::print_value(int32_t y, void *ptr, VALUE_TYPE type, const char *unit, 
             list_copy2(str_buffer, unit, len, 0, ulen);
             len += ulen;
         }
-        str_buffer[27] = '\0';
+        str_buffer[STR_BUF_SIZE - 1] = '\0';
         Brain.Screen.printAt(0, y, bOpaque, (const char *)str_buffer);
         break;
     }

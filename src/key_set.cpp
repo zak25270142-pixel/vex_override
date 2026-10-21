@@ -14,7 +14,7 @@ Control_key key_add;
 Control_key key_reduce;
 Control_key key_back;
 Control_key key_shift;
-Control_key key_joy_menu;
+Control_key key_remote;
 
 Screen_Button button1(nullptr); // 暂不关联逻辑键，且不可用
 Screen_Button button2(nullptr);
@@ -108,7 +108,7 @@ void pre_menu_key()
     key_reduce.mode = Control_key::disable;
     key_left.mode = Control_key::disable;
     key_right.mode = Control_key::disable;
-    key_joy_menu.mode = Control_key::normal_press; // 下降沿单次触发，按钮切换用
+    key_remote.mode = Control_key::normal_press; // 下降沿单次触发，按钮切换用
 
     button1.reset_size(20, 5, 400, 40);
     button1.reset_button_name("enter_menu", 14, 16);
@@ -125,11 +125,8 @@ void pre_menu_key()
     button2.draw_button(Screen_Button::draw_released);
 
     button3.reset_size(20, 105, 400, 40);
-    button3.reset_button_name("remote:stop", 14, 16);
-    button3.reset_button_color(vex::color(0x777777), vex::color(0x222222));
-    button3.set_key(&key_joy_menu);
+    button3.set_key(&key_remote);
     button3.can_use = true;
-    button3.draw_button(Screen_Button::draw_released);
 
     button4.can_use = false;
     button5.can_use = false;

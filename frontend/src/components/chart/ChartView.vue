@@ -191,7 +191,7 @@ function applyChannel(chart: ECharts, ch: number) {
 }
 
 /** 每个图固定 4 条 series（槽位颜色=通道配色），数据由 applyChannel 覆盖 */
-function seriesInit(fontSize: number) {
+function seriesInit() {
   return SLOTS.map((slot) => ({
     name: '',
     type: 'line' as const,
@@ -223,7 +223,7 @@ function fitCharts(): void {
             itemHeight: 8,
             textStyle: { color: chartTheme.legend, fontSize: 10.5 },
           },
-          series: seriesInit(10.5),
+          series: seriesInit(),
         }),
       )
       sepCharts[i] = chart
@@ -244,7 +244,7 @@ function fitCharts(): void {
           title: { text: '', left: 10, top: 6, textStyle: { color: chartTheme.title, fontSize: 13 } },
           legend: { top: 6, right: 12, textStyle: { color: chartTheme.legend, fontSize: 12 } },
           grid: { left: 60, right: 20, top: 48, bottom: 34 },
-          series: seriesInit(12),
+          series: seriesInit(),
         }),
       )
     } else if (bigChart.getWidth() !== el.clientWidth || bigChart.getHeight() !== el.clientHeight) {

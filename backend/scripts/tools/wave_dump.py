@@ -1,10 +1,10 @@
 # 把 probe 波形按时间轴对齐打印（每50ms一行），看蹿动/振荡时序
-# 用法：python scripts/wave_dump.py [某个 *_wave.csv]，缺省取 pytest/probe_data 下最新一份
+# 用法：python scripts/tools/wave_dump.py [某个 *_wave.csv]，缺省取 pytest/probe_data 下最新一份
 import csv, sys, glob
 from pathlib import Path
 
-_default = str(Path(__file__).resolve().parent.parent / "pytest" / "probe_data" / "*_wave.csv")
-path = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(_default))[-1]
+_default = str(Path(__file__).resolve().parent.parent.parent / "pytest" / "probe_data" / "**" / "*_wave.csv")
+path = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(_default, recursive=True))[-1]
 data = {}
 with open(path, encoding="utf-8-sig") as f:
     for row in csv.DictReader(f):

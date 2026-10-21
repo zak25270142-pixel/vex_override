@@ -82,6 +82,9 @@ public:
     // 是否有动作正在执行（接力指针非空）。
     bool is_busy() const { return chassis_task_ptr != nullptr; }
 
+    // 当前是否手动档（接力指针绑在 update_manual 上）；is_busy 分不清手动与 PC 动作。
+    bool is_manual() const { return chassis_task_ptr == &RobotAction::update_manual; }
+
     // 任务结束回调：完成或发起时发现目标已在容差内时调用；stop_move() 打断不触发。
     void (*move_end_callback)() = nullptr;
 

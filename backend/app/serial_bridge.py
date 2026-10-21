@@ -8,6 +8,12 @@
     操作系统层面无法区分。唯一区别是 User 口上跑着用户程序，收到 Ping 会回 Pong。
     所以只能逐个口发 Ping，谁回 A5 FF FF 谁就是 User 口。
 
+谁有资格被 Ping（不抢占别人的口）：
+    只有带 VEX 标识的口（VID 0x2888，或描述符含 vex/user）才会被打开——
+    打开串口即独占，乱开别的设备的口会打断烧录和其他进程。没识别出 VEX 口时
+    直接收工，不穷举本机全部串口。每个候选口最多等 120ms（主控 10ms 一拍即回
+    Pong），认不出就关掉换下一个；Hub 的重连循环每 5s 才整体试一轮。
+
 本文件只管"字节怎么进出串口"，不关心帧的业务含义——解析交给 protocol.FrameParser，
 调度交给 hub.Hub。写串口的入口虽在这里，但实际由 Hub 的优先级队列串行调用。
 """
@@ -16,10 +22,10 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from enum import Enum
 
-from .protocol import FRAME_HEAD, FrameParser, PongEvent, RxEvent, ping
+from .dataclass import PongEvent, PortInfo, RxEvent
+from .protocol import FRAME_HEAD, FrameParser, ping
 
 logger = logging.getLogger("vex.serial")
 
@@ -49,6 +55,10 @@ except ImportError:  # pragma: no cover
 
 # VEX Robotics 的 USB VID；描述符匹配不到时用它优先（真正判定仍靠 Ping 应答）
 VEX_VID = 0x2888
+
+# 主控 10ms 一拍即回，120ms 留有十倍余量；窗口内每 30ms 补发一次防首帧丢在枚举窗口
+PROBE_TIMEOUT_S = 0.12
+'''单个候选口等 Pong 的时长'''
 
 
 @dataclass
@@ -108,10 +118,11 @@ class SerialBridge:
         self._parser = FrameParser()
         '''Python 侧帧解析器；喂收上来的字节，吐目录/值/回显事件'''
 
-        # 写锁：虽然目前只有 Hub 的 tx 线程会调 send，但 send 是公共方法，
-        # 留锁防将来有人从别的线程直接写，两次 write 交错会撕帧。
+        # 写锁：Hub 的 tx 线程和内置心跳线程都会调 send，且 send 是公共方法，
+        # 锁负责把多次 write 串行化，交错会撕帧。
         self._tx_lock = threading.Lock()
         '''写锁：串行化 send()，防多线程写交错撕帧'''
+        
         self._rx_thread: threading.Thread | None = None
         '''收数线程（connect 成功时启动，disconnect/_lost 时收尾）'''
 
@@ -138,16 +149,6 @@ class SerialBridge:
         # 只判 _connected 会在拔线后仍返回 True（标志还没被 _lost 清掉）。
         return self._connected and self._ser is not None and self._ser.is_open
 
-    @property
-    def parser(self) -> FrameParser:
-        """Python 侧帧解析器（Hub 读它的 stats 做链路诊断）。"""
-        return self._parser
-
-    @property
-    def last_pong(self) -> float:
-        """上次收到 Pong 的 time.monotonic() 秒；0.0=还没收到过（心跳超时判定用）。"""
-        return self._last_pong
-
     # ---------- 端口枚举 ----------
 
     @staticmethod
@@ -172,30 +173,28 @@ class SerialBridge:
         return out
 
     def find_candidates(self) -> list[str]:
-        """给出待探测的串口名列表，VEX 可能的口排前面。
+        """给出待探测的串口名列表：只含 VEX 标识的口（VID / 描述符认得出）。
 
         返回: 设备名字符串列表；指定了 self.port_name 就只返回它（跳过自动探测）。
-              VEX_VID 匹配 / 描述含 "vex"、"user" 的排前面，其余口兜底排后面。
+        没有 VEX 口时返回空列表——非 VEX 设备的串口一律不打开（打开即独占，
+        会打断烧录和其他进程），这就是"没识别到就不抢占"。
         """
         if self.port_name:
             return [self.port_name]
-        preferred = []
-        others = []
+        out = []
         for p in self.list_ports():
-            dev = p.device
             desc = (p.description or "").lower()
             if p.vid == VEX_VID or "vex" in desc or "user" in desc:
-                preferred.append(dev)
-            else:
-                others.append(dev)
-        return preferred + others
+                out.append(p.device)
+        return out
 
     # ---------- 连接 / 探测 ----------
 
-    def connect(self, timeout: float = 2.0) -> bool:
+    def connect(self, timeout: float = PROBE_TIMEOUT_S) -> bool:
         """打开并认领 V5 User 口：逐候选口发 Ping，认得出才建收数线程。
 
-        timeout: 每个候选口的探测时长（秒），不够可加大
+        timeout: 每个候选口的探测时长（秒），默认 120ms；主控一拍（10ms）就回 Pong，
+                 等太久只是白占着口
         返回: True=已连上（收数线程已在跑）；False=没认出来（已上报 error 状态）
         副作用: 认领成功后启动 _rx_thread、清停止标志、上报 connected 状态
         """
@@ -207,7 +206,7 @@ class SerialBridge:
 
         candidates = self.find_candidates()
         if not candidates:
-            self.on_status(Status.error, "未发现串口设备")
+            self.on_status(Status.error, "未发现 VEX 串口设备（VID 0x2888）")
             return False
 
         self.on_status(Status.connecting, f"探测 {len(candidates)} 个候选口…")
@@ -245,17 +244,20 @@ class SerialBridge:
                 pass
             last_err = f"{dev} 无 Pong 应答"
 
-        self.on_status(Status.error, f"未能识别 V5 User 口: {last_err}")
+        self.on_status(
+            Status.error,
+            f"未能识别 V5 User 口（仅试了 VEX 标识的 {len(candidates)} 个口）: {last_err}",
+        )
         return False
 
     # 签名注解必须加引号：函数签名（参数/返回）的注解在 def 执行时就求值，
     # 而函数体内的注解不求值。pyserial 未装时 serial 为 None，
     # 不加引号这里会 AttributeError: 'NoneType' object has no attribute 'Serial'。
-    def _probe(self, ser: "serial.Serial", timeout: float = 0.3) -> bool:
+    def _probe(self, ser: "serial.Serial", timeout: float = PROBE_TIMEOUT_S) -> bool:
         """发 Ping，在 timeout 内找到完整 Pong(A5 FF FF) 才算这个口对。
 
         ser    : 已打开、待验证的串口对象
-        timeout: 等 Pong 的时长（秒）；后半程会补发一次 Ping 防首帧丢在枚举窗口
+        timeout: 等 Pong 的时长（秒），默认 120ms；每 30ms 补发一次 Ping 防首帧丢在枚举窗口
         返回: True=认领成功（这是 V5 User 口）；False=该口无应答
         """
         try:
@@ -269,6 +271,7 @@ class SerialBridge:
             ser.write(frame)
         except Exception:
             return False
+        next_ping = time.monotonic() + 0.03
         while time.monotonic() < deadline:
             try:
                 n = ser.in_waiting
@@ -285,13 +288,15 @@ class SerialBridge:
             except Exception:
                 return False
             time.sleep(0.01)
-            # 后半程补发一次 Ping，防止首帧丢在 USB 枚举窗口里
-            # （刚 open 时设备可能还没准备好接收，第一帧会石沉大海）
-            if time.monotonic() > deadline - timeout / 2:
+            # 每30ms补发一次Ping，防止首帧丢在USB枚举窗口里
+            # （刚open时设备可能还没准备好接收，第一帧会石沉大海）
+            now = time.monotonic()
+            if now >= next_ping:
                 try:
                     ser.write(frame)
                 except Exception:
                     pass
+                next_ping = now + 0.03
         return False
 
     def disconnect(self) -> None:
@@ -391,8 +396,10 @@ class SerialBridge:
 
     # ---------- 心跳 ----------
 
-    # 心跳 1s 一发，超过 5s 没收到 Pong 判定下位机程序已死（USB 还连着但链路没意义）
-    PONG_TIMEOUT_S = 5.0
+    # 心跳 80ms 一发，超过 1s 没收到 Pong 判定下位机程序已死（USB 还连着但链路没意义）。
+    # 1s 容忍约 12 个 Pong 丢失，防 rx 线程被慢 WS 客户端反压时的误判；
+    # 判定失败也只是走一遍重连，可恢复。
+    PONG_TIMEOUT_S = 1.0
 
     def stop_heartbeat(self) -> None:
         """停心跳线程并等它退出；从心跳线程自己调 _lost 进来时不 join（等自己无意义）。"""
@@ -402,10 +409,10 @@ class SerialBridge:
             t.join(timeout=1.5)
         self._hb_thread = None
 
-    def start_heartbeat(self, interval: float = 1.0) -> threading.Thread:
+    def start_heartbeat(self, interval: float = 0.08) -> threading.Thread:
         """单例心跳：重复调用先停旧线程再启，避免重连后叠出多个 Ping 源。
 
-        interval: 发 Ping 的间隔（秒），默认 1s
+        interval: 发 Ping 的间隔（秒），默认 80ms（主控 300ms 收不到即断链收车）
         返回: 刚启动的心跳线程
         线程内每拍发一次 Ping，并检查 last_pong——超过 PONG_TIMEOUT_S 未回则判定掉线。
         """
@@ -426,7 +433,7 @@ class SerialBridge:
                     break
                 last = self._last_pong
                 if last > 0 and time.monotonic() - last > self.PONG_TIMEOUT_S:
-                    logger.warning("超过 %.0fs 未收到 Pong，判定下位机掉线", self.PONG_TIMEOUT_S)
+                    logger.warning("超过 %.1fs 未收到 Pong，判定下位机掉线", self.PONG_TIMEOUT_S)
                     self._lost("心跳超时，下位机无响应")
                     break
 

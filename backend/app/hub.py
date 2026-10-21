@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -52,6 +52,11 @@ logger = logging.getLogger("vex.hub")
 PRI_STOP = 0 # 0停车帧。永远第一
 PRI_UI = 10 #上位机：网页按钮、目录请求、订阅。人工操作，比脚本优先
 PRI_SCRIPT = 20 #脚本下发的命令/调参
+
+# ---------- 重连节奏 ----------
+# 掉线后每 5s 试一轮：一轮里每个 VEX 候选口只开一次、最多等 100ms（见 SerialBridge），
+# 单个口每轮最多被占 100ms。再快只会频繁打扰下位机和其他用口的进程（如 VS Code 烧录）
+RECONNECT_INTERVAL_S = 5.0
 
 # ---------- 日志缓冲上限 ----------
 # 脚本忘了 end_log 会一直攒到内存吃满。超出后"丢新不丢旧"：
@@ -247,12 +252,16 @@ class LogFileMeta:
 
 @dataclass
 class PrintLogResult:
-    """/api/log/print 返回。"""
+    """/api/log/print 返回。columns/missing 只对 csv 有意义。"""
     ok: bool
     path: str
     format: str
     samples: int
     dropped: int
+    columns: list[str] = field(default_factory=list)
+    '''csv 宽表的列名（按 index 升序）'''
+    missing: dict[str, int] = field(default_factory=dict)
+    '''csv 每列的空单元格数（丢包数）；全空的桶不出行，只计这里'''
 
 
 @dataclass
@@ -492,11 +501,11 @@ class Hub:
     def _auto_connect(self) -> None:
         """start(auto_connect=True) 时开的一次性线程：探测连上串口并拉三张表。
 
-        串口探测要逐口发 Ping 等应答，可能阻塞数秒，所以放线程里，
+        串口探测要逐口开机关机 + 发 Ping 等应答，有阻塞，所以放线程里，
         FastAPI 的 startup 才能立刻返回、HTTP 接口马上可用。连上后开心跳 + 拉目录。
         """
         if self.bridge.connect():
-            self.bridge.start_heartbeat(1.0)
+            self.bridge.start_heartbeat(0.08)
             # 脚本没连上位机时也要有目录：连上自动拉三张表
             self._request_all_dirs()
 
@@ -517,14 +526,16 @@ class Hub:
         self._reconnect_thread.start()
 
     def _reconnect_loop(self) -> None:
-        """重连线程主循环：每 2s 试一次，直到连上或用户不再想连（_want_connected=False）。
+        """重连线程主循环：每 5s 试一次，直到连上或用户不再想连（_want_connected=False）。
 
+        一轮 connect() 里每个 VEX 候选口只开一次、最多等 120ms，所以单个口每 5s
+        最多被抢占 120ms；间隔取 3~10s 的中庸值，兼顾掉线自愈速度和少打扰。
         重连成功必须做三件事：清目录缓存 + 重拉三张表 + 补发订阅——
         下位机重启后目录内容可能变了，且它的订阅表是空的。做完即退出本线程。
         """
         while self._want_connected and not self.bridge.connected:
             if self.bridge.connect():
-                self.bridge.start_heartbeat(1.0)
+                self.bridge.start_heartbeat(0.08)
                 # 重连后目录可能已变：缓存和解析表都清掉重新拉
                 self.tunable_dir.clear()
                 self.monitor_dir.clear()
@@ -536,7 +547,7 @@ class Hub:
                 # 把聚合后的订阅意图补发给下位机（重连不丢订阅）
                 self._restore_subscriptions()
                 return
-            time.sleep(2.0)
+            time.sleep(RECONNECT_INTERVAL_S)
 
     def _restore_subscriptions(self) -> None:
         """重连后按聚合意图补发订阅。
@@ -624,26 +635,6 @@ class Hub:
         self.bridge.disconnect()
         if self._tx_thread:
             self._tx_thread.join(timeout=1.0)
-
-    def reconnect(self) -> bool:
-        """手动重连：断 → 连 → 清目录缓存 → 重拉三张表。
-
-        注意这里没有调 _restore_subscriptions：手动重连走的是 bridge.connect 成功路径，
-        订阅意图仍在 _sub_intent 里，下次有页面/脚本操作时会自然补发。
-        """
-        self.bridge.disconnect()
-        self._dir_buf.clear()
-        ok = self.bridge.connect()
-        if ok:
-            self.bridge.start_heartbeat(1.0)
-            self.tunable_dir.clear()
-            self.monitor_dir.clear()
-            self.cmd_dir.clear()
-            self._name_to_mon.clear()
-            self._name_to_tun.clear()
-            self._name_to_cmd.clear()
-            self._request_all_dirs()
-        return ok
 
     # ---------- 串口回调 ----------
 
@@ -1132,18 +1123,6 @@ class Hub:
                 continue
         return out
 
-    def read(self, *index_or_name):
-        """最便捷读法：单项直接拿数值（hub.read('x')）；
-        多项一次返回 {名字: 值}（hub.read('x','y','yaw')）。
-
-        多项一次取的意义：看门狗一轮通常要同时看 x/y/yaw，
-        一次请求拿全避免三次往返带来的时间偏差（三个值不是同一时刻的）。
-        多项的返回值是"名字 → 值"的动态映射，故仍用 dict。
-        """
-        if len(index_or_name) == 1:
-            return self.read_item(index_or_name[0]).value
-        return {it.name: it.value for it in self.read_items(list(index_or_name))}
-
     def sub(
         self,
         index_or_name,
@@ -1382,31 +1361,41 @@ class Hub:
             items.append(LogStatsItem(index=idx, name=name, **asdict(_aggregate(vals, thresholds, span_ms))))
         return LogStatsResult(items=items)
 
-    def print_log(self, path: str | None = None) -> PrintLogResult:
+    def print_log(self, path: str | None = None, index_or_name=None) -> PrintLogResult:
         """导出记录，格式由 path 的后缀决定（只写一种，不再一次落两份）：
 
-          path 后缀  导出内容
-          .json      全量 JSON（无后缀时的默认）
-          .csv       长表 CSV（t_ms,index,name,value），Excel/pandas 直读
-          .png/.jpg  按监控项作图，每项一条曲线（x=相对本段零点秒）
-          其它后缀   当 JSON 处理
+          path 后缀   导出内容
+          .json       全量 JSON（无后缀时的默认）
+          .csv        宽表 CSV：一列一项，行首 t_ms（见 _write_csv）
+          .png/.jpg   按监控项作图，每项一条曲线（x=相对本段零点秒）
+          .pdf/.svg   同上，矢量输出（pdf 内嵌字体，中文最稳；svg 依赖查看端字体）
+          其它后缀    当 JSON 处理
 
-        path 里带子目录（如 "pytest/l0/start.csv"）会自动创建；
-        不传 path 则默认落 pytest/log_<时间戳>.json。
+        index_or_name：只导出这几项（中文名或 index，可混）；None = 导出全部登记项。
+        记录缓冲在 end_log 之后仍在（下次 start_log 才清），所以可以换组合反复导出，
+        每次给不同 path 即可。
+
+        path 里带子目录（如 "probe_data/l0/start.csv"）会自动创建；
+        不传 path 则默认落 pytest/probe_data/log_<时间戳>.json。
         """
         if path:
             target = Path(path)
             if not target.suffix:  # 没标后缀 → 按默认 json
                 target = target.with_suffix(".json")
+            if not target.is_absolute():
+                # 相对路径一律归到 probe_data，不随后端进程的工作目录漂移
+                target = self.pytest_dir / "probe_data" / target
         else:
-            target = self.pytest_dir / f"log_{datetime.now():%Y%m%d_%H%M%S}.json"
+            target = self.pytest_dir / "probe_data" / f"log_{datetime.now():%Y%m%d_%H%M%S}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        rows = self.log_rows().rows
+        rows = self.log_rows(index_or_name).rows
         suffix = target.suffix.lower()
+        columns: list[str] = []
+        missing: dict[str, int] = {}
         if suffix == ".csv":
-            self._write_csv(target, rows)
-        elif suffix in (".png", ".jpg", ".jpeg"):
+            columns, missing = self._write_csv(target, rows)
+        elif suffix in (".png", ".jpg", ".jpeg", ".pdf", ".svg"):
             self._write_plot(target, rows)
         else:
             self._write_json(target, rows)
@@ -1417,6 +1406,8 @@ class Hub:
             format=suffix.lstrip("."),
             samples=len(rows),
             dropped=self.log_dropped,
+            columns=columns,
+            missing=missing,
         )
 
     def _write_json(self, target: Path, rows: list[LogRow]) -> None:
@@ -1431,12 +1422,51 @@ class Hub:
         with open(target, "w", encoding="utf-8") as f:
             json.dump(asdict(meta), f, ensure_ascii=False, indent=2, default=str)
 
-    def _write_csv(self, target: Path, rows: list[LogRow]) -> None:
-        """长表 CSV：每条推送一行；utf-8-sig 带 BOM，Excel 打开中文不乱码。"""
-        with open(target, "w", encoding="utf-8-sig") as f:
-            f.write("t_ms,index,name,value\n")
-            for row in rows:
-                f.write(f"{row.t},{row.index},{row.name},{row.value}\n")
+    # 宽表分桶宽度 ms：登记记录会把该项提升到高速推送（100Hz），按这个周期对齐
+    LOG_BUCKET_MS = 10
+
+    def _write_csv(self, target: Path, rows: list[LogRow]) -> tuple[list[str], dict[str, int]]:
+        """宽表 CSV：一列一项，行首 t_ms = 该行各非空样本时刻的均值。
+
+        为什么宽表而不是长表：导出给 AI/脚本按列算（比值、相关性、差分），长表每行
+        重复中文名、行数与 token 都膨胀 N 倍，还得先 pivot 才能算。
+
+        对齐：log 登记会把该项提升到高速推送，故按 LOG_BUCKET_MS 分桶，桶内每项取
+        最后一个样本。缺失留**空单元格**（pandas 一样读成 NaN，但省 token），
+        整桶全空不出行、只计入 missing——所以空单元格的位置就是丢包位置。
+
+        返回 (列名, {列名: 空单元格数})。utf-8-sig 带 BOM，Excel 打开中文不乱码。
+        """
+        buckets: dict[int, dict[str, Any]] = {}
+        t_of: dict[int, dict[str, float]] = {}
+        idx_of: dict[str, int] = {}
+        for row in rows:
+            b = int(row.t // self.LOG_BUCKET_MS)
+            buckets.setdefault(b, {})[row.name] = row.value   # 桶内取最后
+            t_of.setdefault(b, {})[row.name] = row.t
+            idx_of.setdefault(row.name, row.index)
+        cols = sorted(idx_of, key=lambda n: idx_of[n])        # 列序按 index，多次导出一致
+
+        missing = {c: 0 for c in cols}
+        with open(target, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("t_ms," + ",".join(cols) + "\n")
+            for b in sorted(buckets):
+                slot = buckets[b]
+                if not slot:
+                    continue
+                t_mean = sum(t_of[b][c] for c in slot) / len(slot)
+                cells = [f"{t_mean:.1f}"]
+                for c in cols:
+                    v = slot.get(c)
+                    if v is None:
+                        cells.append("")
+                        missing[c] += 1
+                    elif isinstance(v, float):
+                        cells.append(f"{v:.6g}")
+                    else:
+                        cells.append(str(v))
+                f.write(",".join(cells) + "\n")
+        return cols, missing
 
     def _write_plot(self, target: Path, rows: list[LogRow]) -> None:
         """按监控项作图并导出图片：每项一条曲线，横轴为相对本段零点的秒。

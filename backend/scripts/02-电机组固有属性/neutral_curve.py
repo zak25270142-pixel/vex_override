@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-接入 60:48 齿轮组后的零扭矩电压曲线测试。
+零电磁扭矩电压曲线测试 —— 每台电机的反电动势曲线 k_e·ω。
 
 通过 FastAPI 后端（HTTP）中转，不再直连串口：
     0x84 -> 单电机直接给电压
@@ -13,10 +13,9 @@
     cd backend
     uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-实验模型（以左侧 L2 为例）：
-    L0/L1 : 60T，固定同一个电压 D，负责把整组带到一个稳定轮速
-    L2    : 48T，被测，电压从 0V -> 12V 扫描
-    L3    : 48T，0V（惰行）
+实验模型（以左侧 L2 为例；同组三台 1:1 啮连、转速强制相同）：
+    L0/L1 : 固定同一个电压 D，负责把整组带到一个稳定轮速
+    L2    : 被测，电压从 0V -> 12V 扫描
 
 每个 D 对应一个自然稳定的轮端速度 W0：
     先 L2=0V，记录 baseline W0
@@ -24,29 +23,37 @@
 
     delta_w = W(test_voltage) - W0
 
-    delta_w < 0 : L2 对系统形成额外拖曳
-    delta_w ≈ 0 : L2 约处于零电磁扭矩边界
-    delta_w > 0 : L2 开始产生正向驱动力
+    delta_w < 0 : 被测台被整组拖着转，处于发电制动（拖曳）
+    delta_w ≈ 0 : 被测台约处于零电磁扭矩边界
+    delta_w > 0 : 被测台开始产生正向驱动力
 
 因此得到：
     wheel_speed -> V_neutral_actual
 
+测到的值是零电磁扭矩下的 k_e·ω，与同层等流搜索（cal_motor_intrinsic.py）测到的
+工作点电压 k_e·ω + R·I 只差一个 R·I 项——两者相减即可把反电动势差异（k_e）与
+内阻差异（R）分开，用来判断组内失配到底由哪个主导（motor_share_test 里"两档
+factor 不一致说明失配以 k_e 为主"这一条，本脚本能直接证实）。曲线形态还回答
+k_e 是否随速度恒定（线性性），比两档拟合更细。
+
 注意：
-    1. 0V 是现有固件中的“惰行”语义（你现有单电机测试已经这样使用）。
+    1. 0V 是现有固件中的"惰行"语义。
     2. 不使用 current() 的正负号判断发电，因为 current() 是幅值。
     3. 零扭矩点使用轮速相对 baseline 的过零点判断。
-    4. 每个测试电压前都重新测一次 L2=0V baseline，抵消电池电压、温度等慢漂移。
-    5. 默认记录左右两个 60T 电机的转速，并用两者平均值作为轮速点；原始值仍全部写入 CSV。
+    4. 每个测试电压前都重新测一次被测台 0V 的 baseline，抵消电池电压、温度等慢漂移。
+    5. 轮速取两台驱动电机的转速平均值；原始值仍全部写入 CSV。
+    6. 过零插值优先用被测台的实际电压（vact），抵消线损与母线差异。
+    7. 每台都能当被测（1:1 啮连，无齿轮比差异）；剩下的两台当驱动。
 
 示例（先启动后端，再运行本脚本）：
-    python scripts/neutral_curve.py --motors L2
-    python scripts/neutral_curve.py --motors L2,L3,R2,R3
+    python scripts/02-电机组固有属性/neutral_curve.py --motors L2
+    python scripts/02-电机组固有属性/neutral_curve.py --motors L0,L1,L2,R0,R1,R2
 
 只想测较低范围：
-    python scripts/neutral_curve.py --motors L2 --driver-volts 3,4,5,6,7,8
+    python scripts/02-电机组固有属性/neutral_curve.py --motors L2 --driver-volts 3,4,5,6,7,8
 
 减小/增加扫描步长：
-    python scripts/neutral_curve.py --coarse-step 0.25 --fine-step 0.05
+    python scripts/02-电机组固有属性/neutral_curve.py --coarse-step 0.25 --fine-step 0.05
 """
 
 from __future__ import annotations
@@ -57,7 +64,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # backend 根，供 import app
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))   # backend 根，供 import app
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 from app.script_api import BackendLink  # noqa: E402
 from motor_names import motor_names  # noqa: E402
 
@@ -73,36 +81,37 @@ def motor_id(motor_name: str) -> int:
     if side == "L":
         return n
     if side == "R":
-        return 4 + n
+        return 3 + n
     raise ValueError(f"非法电机名称：{motor_name}")
 
 
 def side_id_name(mid: int) -> str:
-    if 0 <= mid < 4:
+    if 0 <= mid < 3:
         return f"L{mid}"
-    if 4 <= mid < 8:
-        return f"R{mid - 4}"
+    if 3 <= mid < 6:
+        return f"R{mid - 3}"
     raise ValueError(f"非法电机编号：{mid}")
 
 
 def group_for_test(test_name: str) -> dict:
     """
-    返回同侧的：
-      driver0 / driver1 : 60T 直连电机
-      test               : 48T 被测电机
-      idle                : 另一台 48T，保持 0V 惰行
+    返回同侧三台的角色分配：
+      driver0 / driver1 : 该组另外两台，固定同一个电压 D，把整组带到稳定轮速
+      test              : 被测台，电压从 0V 扫描
+
+    1:1 啮连下同组三台转速强制相同，谁当驱动谁当被测都一样，没有齿轮比差异。
     """
     side = test_name[0].upper()
     n = int(test_name[1])
-    if n not in (2, 3):
-        raise ValueError("被测电机必须是 2 或 3，例如 L2/L3/R2/R3")
+    if n not in (0, 1, 2):
+        raise ValueError("被测电机编号必须是 0/1/2，例如 L0/L2/R1")
 
-    base = 0 if side == "L" else 4
+    base = 0 if side == "L" else 3
+    others = [base + i for i in range(3) if i != n]
     return {
-        "driver0": base + 0,
-        "driver1": base + 1,
+        "driver0": others[0],
+        "driver1": others[1],
         "test": base + n,
-        "idle": base + (3 if n == 2 else 2),
     }
 
 
@@ -112,7 +121,7 @@ def set_voltage(link: BackendLink, mid: int, volts: float) -> None:
 
 
 def all_zero(link: BackendLink) -> None:
-    for mid in range(8):
+    for mid in range(6):
         try:
             set_voltage(link, mid, 0.0)
         except Exception:
@@ -162,13 +171,12 @@ def measure_state(
 ) -> dict:
     """设置一个状态、保持 hold 秒后收段，取本段整段统计。
 
-    一段就是一次独立记录：start_log → 设 4 台电机电压 → 保持 → end_log。
+    一段就是一次独立记录：start_log → 设 3 台电机电压 → 保持 → end_log。
     rpm 用 |rpm| 的 mean；实际电压/电流用 mean。
     """
     link.start_log()
     set_voltage(link, group["driver0"], driver_voltage)
     set_voltage(link, group["driver1"], driver_voltage)
-    set_voltage(link, group["idle"], 0.0)
     set_voltage(link, group["test"], test_voltage)
     link.sleep(hold)
     link.end_log()
@@ -562,6 +570,26 @@ SUMMARY_FIELDS = [
 # ------------------------------------------------------------
 
 
+def plot_neutral(path, summary_rows):
+    """一栏：每台的反电动势曲线 k_e·ω——斜率即 k_e，几条线分开说明 k_e 有差异。"""
+    from plot_util import subplots, save, legend
+
+    fig, axes = subplots(1, width=7.0)
+    ax = axes[0][0]
+    for m in sorted({r["motor"] for r in summary_rows}):
+        pts = sorted((r["wheel_rpm"], r["neutral_voltage"]) for r in summary_rows
+                     if r["motor"] == m and r["wheel_rpm"] is not None
+                     and r["neutral_voltage"] is not None)
+        if pts:
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-", ms=3, lw=1, label=m)
+    ax.set_xlabel("轮速 / pct")
+    ax.set_ylabel("零扭矩电压 / V")
+    ax.set_title("零电磁扭矩电压曲线（斜率 = k_e）")
+    ax.grid(True, alpha=0.3)
+    legend(ax, fontsize=8, ncol=2)
+    save(fig, path)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="VEX 60:48 齿轮组零扭矩电压曲线测试（复用现有 0x84 协议）"
@@ -569,13 +597,13 @@ def main():
     ap.add_argument("--base", default="http://127.0.0.1:8000", help="后端地址，默认本机 8000")
     ap.add_argument(
         "--motors",
-        default="L2,L3,R2,R3",
-        help="要测试的 48T 电机，逗号分隔，例如 L2,L3",
+        default="L0,L1,L2,R0,R1,R2",
+        help="要测的电机，逗号分隔，例如 L2,R0（同组另外两台自动当驱动）",
     )
     ap.add_argument(
         "--driver-volts",
         default="3,4,5,6,7,8,9,10,11,12",
-        help="0/1 两台 60T 电机的固定驱动电压点",
+        help="两台驱动电机的固定驱动电压点",
     )
     ap.add_argument("--test-vmax", type=float, default=12.0)
     ap.add_argument("--coarse-step", type=float, default=0.25)
@@ -588,8 +616,12 @@ def main():
         help="delta_rpm 在此范围内认为已经接近零扭矩",
     )
     ap.add_argument("--cooldown", type=float, default=0.5)
-    ap.add_argument("--csv", default="pytest/neutral_curve_raw.csv", help="原始数据 CSV，空字符串跳过")
-    ap.add_argument("--summary", default="pytest/neutral_curve_summary.csv", help="曲线数据 CSV，空字符串跳过")
+    ap.add_argument("--csv", default="neutral_curve_raw.csv",
+                    help="原始数据 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
+    ap.add_argument("--summary", default="neutral_curve_summary.csv",
+                    help="曲线数据 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
+    ap.add_argument("--png", default="neutral_curve.png",
+                    help="结果图文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
     args = ap.parse_args()
 
     if args.hold <= 0:
@@ -607,8 +639,8 @@ def main():
     ]
 
     for name in motors:
-        if len(name) != 2 or name[0] not in ("L", "R") or name[1] not in ("2", "3"):
-            raise ValueError(f"非法被测电机 {name}，只能是 L2/L3/R2/R3")
+        if len(name) != 2 or name[0] not in ("L", "R") or name[1] not in ("0", "1", "2"):
+            raise ValueError(f"非法被测电机 {name}，只能是 L0/L1/L2/R0/R1/R2")
 
     for v in driver_voltages:
         if not (0.0 < v <= 12.0):
@@ -617,7 +649,7 @@ def main():
     raw_rows = []
     summary_rows = []
 
-    # with 退出时 __exit__ 自动收车收尾（目标归零 / 8电机0V / 刹车 / 停记录 / 退订 / 断连接）
+    # with 退出时 __exit__ 自动收车收尾（目标归零 / 6电机0V / 刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as link:
         directory = link.mon_dir
         try:
@@ -644,6 +676,14 @@ def main():
                 sys.exit(1)
 
             all_zero(link)
+            link.stop_move()  # 交出底盘：is_busy 期间 0x84 被固件静默丢弃，会全录到 0
+            link.sleep(0.4)
+            # 开环直设电压要求速度环空闲：环活着会每 10ms 覆盖 0x84，读到被扶住的假数据
+            st_l, st_r = link.latest("左环状态"), link.latest("右环状态")
+            if st_l != 0 or st_r != 0:
+                print(f"[warn] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}），"
+                      f"0x84 会被每拍覆盖，结论不可信")
+            all_zero(link)
             link.sleep(1.0)
 
             for test_name in motors:
@@ -655,12 +695,11 @@ def main():
                 print("\n================================================")
                 print(f"开始测试 {test_name}")
                 print(
-                    "驱动电机：%s、%s（60T） | 被测：%s（48T） | 闲置：%s（48T）"
+                    "驱动：%s、%s | 被测：%s"
                     % (
                         side_id_name(group["driver0"]),
                         side_id_name(group["driver1"]),
                         side_id_name(group["test"]),
-                        side_id_name(group["idle"]),
                     )
                 )
                 print("================================================")
@@ -703,6 +742,8 @@ def main():
             link.save_csv(args.csv, raw_rows, RAW_FIELDS)
         if args.summary and summary_rows:
             link.save_csv(args.summary, summary_rows, SUMMARY_FIELDS)
+        if args.png and summary_rows:
+            plot_neutral(link.out_path(args.png), summary_rows)
 
 
 if __name__ == "__main__":

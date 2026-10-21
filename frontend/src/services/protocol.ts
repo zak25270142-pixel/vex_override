@@ -30,7 +30,7 @@ export const enum CmdGet {
   SetTunable = 3,
   /** 请求动作命令目录（无 payload），主控分批回 CMDDirectory */
   RequestCommand = 4,
-  /** 心跳：每 1s 发一帧，无 payload，整帧 A5 FF FF */
+  /** 心跳：每 80ms 发一帧，无 payload，整帧 A5 FF FF */
   Ping = 0xff,
 }
 
@@ -90,15 +90,12 @@ export const enum CmdSpec {
 export function cmdSpec(tag: number): CmdSpec {
   return (tag & CMD_TAG_SPEC_MASK) as CmdSpec
 }
-export function cmdArgc(tag: number): number {
-  return (tag & CMD_TAG_ARGC_MASK) >> CMD_TAG_ARGC_SHIFT
-}
-export function cmdHasRange(tag: number): boolean {
-  return (tag & CMD_TAG_RANGE) !== 0
-}
 
 /** 单帧 payload 上限（整帧 448B < USB 单包 512B） */
 export const MAX_PAYLOAD = 445
+
+/** User 口是 USB CDC，波特率无实际意义，固定值仅为满足 Web Serial API */
+export const BAUD_CDC = 115200
 
 /** 各类型在帧里占的字节数；str/other 不上报，返回 0 */
 export function valueSize(type: ValueType): number {
@@ -224,46 +221,42 @@ export type RxEvent =
   | CmdDirectoryEvent
   | PongEvent
 
-/** 按类型从小端字节流解码值；调用方保证剩余字节足够 */
-function decodeValue(d: DataView, off: number, type: ValueType, le = true): CellValue {
+/** 按类型从小端字节流解码值（协议多字节数值一律小端）；调用方保证剩余字节足够 */
+function decodeValue(d: DataView, off: number, type: ValueType): CellValue {
   switch (type) {
     case ValueType.UInt8:
       return d.getUint8(off)
     case ValueType.Int8:
       return d.getInt8(off)
     case ValueType.UInt16:
-      return d.getUint16(off, le)
+      return d.getUint16(off, true)
     case ValueType.Int16:
-      return d.getInt16(off, le)
+      return d.getInt16(off, true)
     case ValueType.UInt32:
-      return d.getUint32(off, le)
+      return d.getUint32(off, true)
     case ValueType.Int32:
-      return d.getInt32(off, le)
+      return d.getInt32(off, true)
     case ValueType.Float:
-      return d.getFloat32(off, le)
+      return d.getFloat32(off, true)
     case ValueType.Double:
-      return d.getFloat64(off, le)
+      return d.getFloat64(off, true)
     case ValueType.UInt64:
       // 超过2^53会丢精度，监控场景可接受
-      return Number(d.getBigUint64(off, le))
+      return Number(d.getBigUint64(off, true))
     case ValueType.Int64:
-      return Number(d.getBigInt64(off, le))
+      return Number(d.getBigInt64(off, true))
     case ValueType.Bool:
     case ValueType.OnOff:
       return d.getUint8(off)
     case ValueType.Color: {
       const r = d.getUint8(off)
       const g = d.getUint8(off + 1)
-      const b = getUint8OrZero(d, off + 2)
+      const b = d.getUint8(off + 2)
       return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')
     }
     default:
       return 0
   }
-}
-
-function getUint8OrZero(d: DataView, off: number): number {
-  return off < d.byteLength ? d.getUint8(off) : 0
 }
 
 /* float32 往返比较用的复用缓冲：JS 数字都是 double，1.2f 进来就是 1.2000000476837158，
@@ -387,7 +380,7 @@ export function subscribe(index: number, sub: boolean, fast: boolean): Uint8Arra
   const tag = (sub ? MONITOR_TAG_SUB : 0) | (fast ? MONITOR_TAG_FAST : 0)
   return buildFrame(CmdGet.Subscribe, [index, tag])
 }
-/** 心跳帧 A5 FF FF，1s 一发；主控回同形帧 Pong */
+/** 心跳帧 A5 FF FF，80ms 一发；主控回同形帧 Pong */
 export function ping(): Uint8Array {
   return buildFrame(CmdGet.Ping)
 }
@@ -546,7 +539,7 @@ export class FrameParser {
             if (this.cmd === CmdPost.MonitorValue || this.cmd === CmdPost.TunableEcho) {
               // 两种帧外形相同：[index][值]，只是类型登记表不同
               const types = this.cmd === CmdPost.MonitorValue ? this.monitorType : this.tunableType
-              if (this.len >= 1) this.expect = 1 + valueSize(types[this.payload[0]!]!)
+              this.expect = 1 + valueSize(types[this.payload[0]!]!)
             } else if (this.cmd === CmdPost.CMDDirectory) {
               // 命令目录：payload 头 2B 就是内容长度，收够 2B 即定长
               const total = cmdDirLen(this.payload, this.len)

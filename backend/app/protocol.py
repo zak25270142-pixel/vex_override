@@ -13,9 +13,22 @@ include/communication.h 严格一一对应）
 
 import struct
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from enum import Enum, IntEnum
-from typing import Any, ClassVar
+from enum import IntEnum
+
+from .dataclass import (
+    CellValue,
+    CmdDirItem,
+    CmdDirectoryEvent,
+    CmdField,
+    DirTable,
+    DirectoryEvent,
+    EchoEvent,
+    MenuItem,
+    PongEvent,
+    RxEvent,
+    RxStats,
+    ValueEvent,
+)
 
 FRAME_HEAD = 0xA5 # 帧头
 
@@ -87,13 +100,8 @@ def tag_fast(tag: int) -> bool:
     return (tag & MONITOR_TAG_FAST) != 0
 
 
-def tag_kind(tag: int) -> int:
-    """从tag提取特殊类别"""
-    return tag & MONITOR_TAG_KIND_MASK
-
-
 # ---------- 动作命令 tag 位域 ----------
-#   bit7   RANGE  1=本帧在参数定义后面附带每段 8 字节的 (min,max) 浮点范围
+#   bit7   RANGE  1=本帧在参数定义后面附带各参数的 (min,max)，宽度按该参数类型的 value_size 定宽
 #   bit6~4 ARGC   参数个数（0~7）—— 这是参数个数的唯一来源，不是靠 payload 长度反推
 #   bit3~0 SPEC   命令类别（0=普通 1=停车）
 # 参数个数写进 tag 是因为命令帧 payload 是紧凑拼接的，收到帧时无法靠长度反推
@@ -111,19 +119,7 @@ def cmd_spec(tag: int) -> int:
     """从 tag 提取命令类别"""
     return tag & CMD_TAG_SPEC_MASK
 
-def cmd_argc(tag: int) -> int:
-    """从 tag 提取参数个数"""
-    return (tag & CMD_TAG_ARGC_MASK) >> CMD_TAG_ARGC_SHIFT
-
-def cmd_has_range(tag: int) -> bool:
-    """从 tag 提取是否带范围"""
-    return (tag & CMD_TAG_RANGE) != 0
-
 # ---------- 值编解码 ----------
-
-# 监控/调参项能取的值形态。注意这是"Python 侧解出来的类型"，
-# 与 ValueType 不是一一对应（多个 ValueType 都解成 int）。
-CellValue = int | float | bool
 
 def value_size(type_: int) -> int:
     """各类型在帧里占的字节数；str/other 不上报，返回 0（与 TS valueSize 一致）"""
@@ -267,118 +263,6 @@ def command_send(cmd_index: int, field_types: list[int], values: list[CellValue]
     for t, v in zip(field_types, values):
         payload.extend(encode_value(t, v))
     return build_frame(cmd_index, bytes(payload))
-
-
-# ---------- 目录数据结构（dataclass；/api/column 直接返回，FastAPI 自动转 JSON）----------
-
-
-@dataclass
-class CmdField:
-    """动作命令的一个参数。
-
-    min/max 只在 tag 的 bit7(RANGE) 置位时才有值，且**按本字段的 type 解码、与字段同型**：
-    整型字段解成 int、float/double 解成 float，不再一律当 float32。
-    """
-    type: int
-    name: str
-    min: float | int | None = None
-    max: float | int | None = None
-
-
-@dataclass
-class CmdDirItem:
-    """动作命令目录的一项。index 同时也是下发时的命令字。"""
-    index: int
-    tag: int
-    name: str
-    fields: list[CmdField] = field(default_factory=list)
-
-
-@dataclass
-class MenuItem:
-    """监控/调参目录项，两张表结构相同共用。value 是目录帧自带的当前值。"""
-    index: int
-    type: int   # 值类型码（ValueType）：FrameParser 靠它解后续 value/echo 帧
-    tag: int    # 位标志（MONITOR_TAG_*：订阅档位、GETTER 等）
-    name: str
-    unit: str
-    value: Any  # tunable 项的 value 会被 echo 回显覆盖成真实生效值
-
-# ---------- 解析事件类型（FrameParser 产出 / Hub 消费）----------
-
-
-class EventKind(Enum):
-    """FrameParser 解出的一个事件属于哪一类。"""
-
-    directory = "directory"        # 监控/调参目录项 → 填三张目录表
-    cmdDirectory = "cmdDirectory"  # 动作命令目录项 → 填命令表，顺带认出停车命令
-    value = "value"                # 监控值推送 → 更新最新值快照 + 按需记日志
-    echo = "echo"                  # 调参写回确认 → 回写调参项真实生效值
-    pong = "pong"                  # 心跳应答 → 时间戳在 SerialBridge 里已更新
-
-
-class DirTable(Enum):
-    """目录项属于哪张表（只对 EventKind.directory 有效）。"""
-
-    monitor = "monitor"
-    tunable = "tunable"
-
-
-# ---------- FrameParser 产出的事件（Hub 按类型消费）----------
-# 每种事件一个 dataclass；kind 是类级常量，用 isinstance 分派，语义比 dict 明确。
-
-
-@dataclass
-class RxEvent:
-    """事件基类。kind 标出具体类别（ClassVar，不进构造参数）。"""
-    kind: ClassVar[EventKind]
-
-
-@dataclass
-class DirectoryEvent(RxEvent):
-    """监控/调参目录项 → 填三张目录表。"""
-    kind: ClassVar[EventKind] = EventKind.directory
-    table: DirTable
-    item: MenuItem
-
-
-@dataclass
-class CmdDirectoryEvent(RxEvent):
-    """动作命令目录项 → 填命令表，顺带认出停车命令。"""
-    kind: ClassVar[EventKind] = EventKind.cmdDirectory
-    item: CmdDirItem
-
-
-@dataclass
-class ValueEvent(RxEvent):
-    """监控值推送 → 更新最新值快照 + 按需记日志。"""
-    kind: ClassVar[EventKind] = EventKind.value
-    index: int
-    value: CellValue
-
-
-@dataclass
-class EchoEvent(RxEvent):
-    """调参写回确认 → 回写调参项真实生效值。"""
-    kind: ClassVar[EventKind] = EventKind.echo
-    index: int
-    value: CellValue
-
-
-@dataclass
-class PongEvent(RxEvent):
-    """心跳应答 → 时间戳在 SerialBridge 里已更新。"""
-    kind: ClassVar[EventKind] = EventKind.pong
-
-
-@dataclass
-class RxStats:
-    """链路诊断计数（FrameParser 累计，UI/脚本直接读）。"""
-    bytes: int = 0        # 已收字节数
-    frames: int = 0       # 已收帧数
-    badChecksum: int = 0  # 校验失败：线路干扰 / 波特率不匹配 / 帧边界错位
-    unknownCmd: int = 0   # 收到不认识的命令字
-    overflow: int = 0     # payload 超过 MAX_PAYLOAD，状态机强制回到找帧头
 
 
 # ---------- 帧解析状态机 ----------
@@ -561,8 +445,7 @@ class FrameParser:
                             if self.cmd == CmdPost.MonitorValue
                             else self.tunable_type
                         )
-                        if self.len >= 1:
-                            self.expect = 1 + value_size(types[self.payload[0]])
+                        self.expect = 1 + value_size(types[self.payload[0]])
                     elif self.cmd == CmdPost.CMDDirectory:
                         total = _cmd_dir_len(bytes(self.payload[: self.len]), self.len)
                         if total >= 0:

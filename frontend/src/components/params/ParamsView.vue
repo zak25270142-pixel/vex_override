@@ -53,10 +53,10 @@
           <tr
             v-for="it in visibleRows"
             :key="it.index"
+            class="row--clickable"
             :class="{
               'row--sub': paramTable === 'monitor' && tagSubscribed(it.tag),
               'row--sel': isRowSel(it.index),
-              'row--clickable': true,
             }"
             :title="paramTable === 'tunable' ? '单击在右栏底部修改' : '单击在右栏底部查看实时值/订阅'"
             @click="onRowClick(it.index)"

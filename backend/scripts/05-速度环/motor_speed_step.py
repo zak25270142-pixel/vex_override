@@ -15,10 +15,10 @@
 记录交给后端：脚本只声明"记哪些项"，逐段发命令；每段是一段独立记录（start_log → 设目标 → 保持 → end_log），段末取波形/统计。
 
 用法示例（先启动后端 uvicorn app.main:app --host 127.0.0.1 --port 8000，再运行本脚本）：
-  python scripts/motor_speed_step.py --side L
-  python scripts/motor_speed_step.py --side R --steps 0,20,40,60,0 --hold 2.0
-  python scripts/motor_speed_step.py --side both --csv pytest/speed_step.csv
-  python scripts/motor_speed_step.py --base http://127.0.0.1:8000 --side L
+  python scripts/05-速度环/motor_speed_step.py --side L
+  python scripts/05-速度环/motor_speed_step.py --side R --steps 0,20,40,60,0 --hold 2.0
+  python scripts/05-速度环/motor_speed_step.py --side both --csv pytest/speed_step.csv
+  python scripts/05-速度环/motor_speed_step.py --base http://127.0.0.1:8000 --side L
 """
 
 from __future__ import annotations
@@ -28,9 +28,31 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from app.script_api import BackendLink  # noqa: E402
+
+
+def plot_steps(path, all_rows, steps):
+    """两栏（左/右）：每段的转速跟随曲线 + 该段目标水平线——看上升时间与超调。"""
+    from plot_util import subplots, save, legend
+
+    fig, axes = subplots(2)
+    for ax, sd, cn in ((axes[0][0], "L", "左"), (axes[0][1], "R", "右")):
+        name = MONITOR_WANT["L0_rpm" if sd == "L" else "R0_rpm"]
+        for tgt in steps:
+            pts = sorted((r["t_rel_s"], r["value"]) for r in all_rows
+                         if r["name"] == name and r["step_target"] == tgt)
+            if pts:
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], lw=1, label="目标 %gpct" % tgt)
+                ax.axhline(tgt, ls=":", lw=0.8, color="gray")
+        ax.set_xlabel("t / s（段内）")
+        ax.set_ylabel("转速 / pct")
+        ax.set_title("%s侧阶跃跟随（点线=各段目标）" % cn)
+        ax.grid(True, alpha=0.3)
+        legend(ax, fontsize=7)
+    save(fig, path)
 
 # 监控项中文名 → 逻辑键（与 LCD_menu.cpp monitor_menu_item 一致）
 MONITOR_WANT = {
@@ -260,7 +282,10 @@ def main() -> None:
         help="阶跃目标序列，逗号分隔，单位 pct（可负）",
     )
     ap.add_argument("--hold", type=float, default=1.5, help="每段保持时间（秒）")
-    ap.add_argument("--csv", default="pytest/motor_speed_step.csv", help="时序 CSV 路径，空字符串跳过")
+    ap.add_argument("--csv", default="motor_speed_step.csv",
+                    help="时序 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
+    ap.add_argument("--png", default="motor_speed_step.png",
+                    help="结果图文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
     args = ap.parse_args()
 
     steps = [float(x) for x in args.steps.split(",") if x.strip() != ""]
@@ -296,6 +321,8 @@ def main() -> None:
 
         if args.csv and all_rows:
             bl.save_csv(args.csv, all_rows, TIMING_FIELDS)
+        if args.png and all_rows:
+            plot_steps(bl.out_path(args.png), all_rows, steps)
 
 
 if __name__ == "__main__":

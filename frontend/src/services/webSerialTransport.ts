@@ -294,8 +294,8 @@ export class WebSerialTransport implements SerialTransport {
       }
     }
     await writeProbe()
-    // 主控 10ms 一拍即回 Pong，窗口内再补发一次只是兜底某些 CDC 实现的首批丢失
-    const rePing = window.setInterval(() => void writeProbe(), 100)
+    // 主控 10ms 一拍即回 Pong，每 30ms 补发一次兜底某些 CDC 实现的首批丢失
+    const rePing = window.setInterval(() => void writeProbe(), 30)
     type ReadResult = Awaited<ReturnType<typeof reader.read>>
     let readP: Promise<ReadResult> = reader.read()
     let timer = 0

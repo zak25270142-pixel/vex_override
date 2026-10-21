@@ -1,5 +1,5 @@
 #include "robot_action.h"
-#include "Control_func.h" // 仅本文件需要访问 Remote_Control 成员，头文件不暴露此依赖
+#include "Control_func.h" // 遥控输入源头文件；本文件只经构造函数注入的 int32_t* 使用其数据
 
 RobotAction::RobotAction(Chassis &chassis_ref,
                          int32_t *move,
@@ -187,7 +187,7 @@ void RobotAction::update_manual(uint32_t now)
         float right_cmd = mv - k * tn;
 
         // 杆量→外侧轮速度：杆量² 从死区到 127² 线性映射（小值压低，低速更可控）
-        float speed = (mv2tn2 - manual_deadzone) / (16129.0f - manual_deadzone) * 100.0f;
+        float speed = (mv2tn2 - manual_deadzone) / (127.0f * 127.0f - manual_deadzone) * 100.0f;
         float scale = speed / fmaxf(fabsf(left_cmd), fabsf(right_cmd));
         chassis.output(left_cmd * scale, right_cmd * scale);
         return;

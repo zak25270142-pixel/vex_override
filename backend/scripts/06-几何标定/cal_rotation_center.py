@@ -34,9 +34,9 @@ chassis.h 里两个 offset 的语义是"定位轮到车体**实际旋转中心**
 默认只转一圈（360°）——转之前确认 USB 线留足松量，别把线绞上。
 
 用法（先起后端：cd backend && uvicorn app.main:app --host 127.0.0.1 --port 8000）
-    python scripts/cal_rotation_center.py                 # 默认 V=25，正反各 1 圈
-    python scripts/cal_rotation_center.py -v 35 -t 720    # 快一点、转两圈
-    python scripts/cal_rotation_center.py --dir cw        # 只转一个方向
+    python scripts/06-几何标定/cal_rotation_center.py                 # 默认 V=25，正反各 1 圈
+    python scripts/06-几何标定/cal_rotation_center.py -v 35 -t 720    # 快一点、转两圈
+    python scripts/06-几何标定/cal_rotation_center.py --dir cw        # 只转一个方向
 
 出结果后把打印的两行填进 include/chassis.h，重新烧录，
 再跑一次看「每圈假平移」是否收敛到 0（那两个数就是还没消掉的残差）。
@@ -48,7 +48,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from app.script_api import BackendLink  # noqa: E402
 
 NAME_YAW = "航向"

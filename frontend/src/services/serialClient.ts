@@ -5,7 +5,7 @@ import { ConnectError, WebSerialTransport } from './webSerialTransport'
 import { WsTransport } from './wsTransport'
 import { MockTransport } from './mockTransport'
 import { loadPrefs, savePrefs } from './persist'
-import { FRAME_HEAD, ping } from './protocol'
+import { BAUD_CDC, FRAME_HEAD, ping } from './protocol'
 
 /** 口能打开但收不到 Pong 时的重试间隔：设备在、只是用户程序还没起来，尽快接住 */
 const RETRY_MS = 1500
@@ -16,8 +16,8 @@ const RETRY_MS = 1500
  */
 const RETRY_BUSY_MS = 7000
 
-/** 单口探测时长：有线 USB，主控收到 Ping 最迟下一拍（10ms）就回 Pong，200ms 足够 */
-const PROBE_TIMEOUT_MS = 200
+/** 单口探测时长：有线 USB，主控收到 Ping 最迟下一拍（10ms）就回 Pong，120ms 足够 */
+const PROBE_TIMEOUT_MS = 120
 
 /**
  * 识别 User 口的探测：发心跳 Ping，收到完整 Pong（A5 FF FF）才算这个口对。
@@ -64,7 +64,7 @@ class SerialClient {
   /** 上次转发的状态文案，用于抑制重试期间的重复刷屏 */
   private lastForwarded = ''
   /** 最近一次连接使用的波特率，掉线/设备重新接入事件触发重试时沿用 */
-  private lastBaud = 115200
+  private lastBaud = BAUD_CDC
 
   constructor() {
     // 设备断电恢复 / 重新插好 / 烧录完重启后，系统重新枚举完成才会发 connect 事件：

@@ -21,7 +21,7 @@
 
         <section class="meta">
           <div>当前端口：<b>{{ portLabel }}</b></div>
-          <div>接入方式：{{ demoMode ? '演示数据源' : 'Web Serial 实机' }}（波特率 115200，CDC 下仅占位）</div>
+          <div>接入方式：{{ demoMode ? '演示数据源（不走真实串口）' : backendMode ? '后端中转（串口由 Backend 独占）' : `Web Serial 实机（波特率 ${baud}，CDC 下仅占位）` }}</div>
         </section>
 
         <!-- 逐段计数 -->
@@ -75,7 +75,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { clearDiag, commLog, commStats as s, demoMode, diagOpen, statusText } from '@/stores/globle'
+import { baud, backendMode, clearDiag, commLog, commStats as s, demoMode, diagOpen, statusText } from '@/stores/globle'
 import { serialClient } from '@/services/serialClient'
 
 const portLabel = computed(() => serialClient.portLabel)

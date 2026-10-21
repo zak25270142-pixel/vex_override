@@ -31,6 +31,7 @@
 """
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -166,6 +167,18 @@ class VexScript:
         """
         return self._post("/api/stop")
 
+    def stop_move(self) -> dict:
+        """0x80 停止运动：只发停车帧，不置 abort（脚本自己还要继续跑时用）。
+
+        所有实车脚本开头都该调它交出底盘——boot 默认手柄控车（manual() 使 is_busy
+        恒真），期间 0x84/0x85 被固件静默拒绝，表现为"命令发了没反应"。
+
+        与 stop() 的区别：
+            stop()       上位机语义，置 abort，中断所有脚本
+            stop_move()  只发停车帧，不置 abort
+        """
+        return self.cmd("停止运动")
+
     def clear_abort(self) -> dict:
         """停车后继续跑新脚本前先清 abort。"""
         return self._post("/api/abort/clear")
@@ -245,11 +258,25 @@ class VexScript:
     def end_log(self) -> dict:
         return self._post("/api/log/end")
 
-    def print_log(self, path: str | None = None) -> dict:
-        """结束后导出记录并在本机打印摘要 JSON。格式由 path 后缀决定：
-        .json（无后缀默认）/ .csv / .png|.jpg（作图）；
-        path 里带子目录会自动创建；不传则默认落后端 pytest/log_<时间戳>.json。"""
-        info = self._post("/api/log/print", {"path": path})
+    def print_log(self, path: str | None = None, names=None) -> dict:
+        """导出记录并在本机打印摘要 JSON。格式由 path 后缀决定：
+        .json（无后缀默认）/ .csv（宽表）/ .png|.jpg（位图）/ .pdf|.svg（矢量）。
+
+        names 指定只导出这几项（中文名或 index，可混），不给=全部已登记项。
+        记录缓冲在 end_log 之后仍在（下次 start_log 才清），所以可以换组合反复导出：
+
+            v.print_log("probe_data/a.csv")                       # 全部项
+            v.print_log("probe_data/v.png", ["左0转速", "左0实际电压"])
+
+        path 里带子目录会自动创建；不传则默认落后端 pytest/probe_data/log_<时间戳>.json。
+        返回体带 columns（csv 列名）与 missing（每列空单元格数=丢包数）。
+        """
+        # names 为 None 必须原样传 None（=全部）：_as_list(None) 得到 []，
+        # 后端会当成"零项"导出空文件
+        info = self._post(
+            "/api/log/print",
+            {"path": path, "names": None if names is None else _as_list(names)},
+        )
         print(json.dumps(info, ensure_ascii=False, indent=2))
         return info
 
@@ -345,7 +372,7 @@ class BackendLink:
         """用 with 写法就不用每个脚本再抄一遍 try/finally 收车：
             with BackendLink() as bl:
                 bl.sub(...); bl.start_log(); ...
-        退出时 __exit__ 自动收车收尾（目标归零/8电机0V/刹车/停记录/退订/断连接）。"""
+        退出时 __exit__ 自动收车收尾（目标归零/6电机0V/刹车/停记录/退订/断连接）。"""
         return self
 
     def __exit__(self, *exc_info) -> None:
@@ -465,13 +492,38 @@ class BackendLink:
             out.setdefault(r["name"], []).append((r["t"] / 1000.0, r["value"]))
         return out
 
+    # ---------- 产物落盘 ----------
+
+    # 标定数据的落盘根：backend/pytest/probe_data（绝对路径，不随 CWD 漂移）
+    OUT_ROOT = Path(__file__).resolve().parent.parent / "pytest" / "probe_data"
+
+    def out_path(self, name: str) -> str:
+        """产物落盘路径：backend/pytest/probe_data/<层目录>/name。
+
+        层目录取当前脚本所在目录名（01-硬件体检 之类），同类数据自动聚在一起；
+        传绝对路径则原样返回，保留手动指定的自由。
+        脚本不要再写相对路径——相对路径会随"从哪个目录启动"落到别处。
+        """
+        p = Path(name)
+        if p.is_absolute():
+            return name
+        layer = ""
+        if sys.argv and sys.argv[0]:
+            parent = Path(sys.argv[0]).resolve().parent.name
+            if len(parent) > 2 and parent[0].isdigit() and "-" in parent:
+                layer = parent
+        return str(self.OUT_ROOT / layer / name) if layer else str(self.OUT_ROOT / name)
+
     def save_csv(self, path: str, rows: list[dict], columns: list[str] | None = None,
                  quiet: bool = False) -> str:
         """把 rows（dict 列表）写 CSV；不给 columns 就按第一行的键序，utf-8-sig 便于 Excel。
 
         utf-8-sig 带 BOM：不加的话 Excel 打开中文列会乱码。
         浮点数固定 6 位小数，避免科学计数法把小值搞得看不清。
+
+        path 走 out_path()：相对路径一律落到 probe_data 下，不随启动目录漂移。
         """
+        path = self.out_path(path)
         keys = list(columns or (rows[0].keys() if rows else []))
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
@@ -536,10 +588,10 @@ class BackendLink:
         用在"脚本自己要收车但还想继续跑后续步骤"的场景，
         比如扫参每一档之间停一下。
         """
-        return self.cmd("停止运动")
+        return self.v.stop_move()
 
     def set_volt(self, motor_id: int, volts: float) -> dict:
-        """设单个电机电压：motor_id 电机编号(0~7)，volts 目标电压(单位 V)。"""
+        """设单个电机电压：motor_id 电机编号(0~2=左1~3，3~5=右1~3，越界固件忽略)，volts 目标电压(单位 V)。"""
         return self.cmd("设置电机电压", int(motor_id), float(volts))
 
     def drive_volt(self, volts: float) -> None:

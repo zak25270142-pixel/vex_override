@@ -125,8 +125,15 @@ class TunableBody(BaseModel):
 
 
 class PrintLogBody(BaseModel):
-    """/api/log/print 请求体：导出路径；None=默认落后端 pytest/log_<时间戳>.json。"""
+    """/api/log/print 请求体：导出路径 + 要导出的项。
+
+    path：None=默认落后端 pytest/probe_data/log_<时间戳>.json；后缀决定格式
+          （json / csv / png / jpg / pdf / svg）。
+    names：只导出这几项（中文名或 index，可混）；None=全部已登记项。
+          记录缓冲 end_log 后仍在（下次 start_log 才清），可换组合反复导出。
+    """
     path: str | None = None
+    names: list[Any] | None = None
 
 
 @app.get("/api/status")
@@ -140,10 +147,10 @@ def api_connect():
     """前端连接/重连按钮入口：标记想连并异步触发探测，立即返回当前快照。
 
     返回: ConnectResult(ok, snapshot)
-    探测本身可能阻塞数秒，不等结果——进度靠 WS 状态消息感知；置意愿后掉线会自动重连。
+    探测本身有阻塞（逐口开/关，每口 ≤100ms），不等结果——进度靠 WS 状态消息感知；置意愿后掉线会自动重连。
     """
     # 前端连接/重连按钮入口：标记想连并立即尝试。
-    # 串口探测本身可能阻塞数秒，不等它出结果，交给重连线程反复试；
+    # 串口探测本身有阻塞，不等它出结果，交给重连线程反复试；
     # 前端看 WS 状态消息（connecting/connected/disconnected）感知进度。
     # 注意这是"意愿开关"：置 _want_connected=True 后，之后每次掉线都会自动重连。
     hub.ensure_connected()
@@ -268,12 +275,12 @@ def api_log_end():
 
 @app.post("/api/log/print")
 def api_log_print(body: PrintLogBody = PrintLogBody()):
-    """把本段记录导出到后端机器（格式由 path 后缀决定：json/csv/png/jpg）。
+    """把本段记录导出到后端机器（格式由 path 后缀决定：json/csv/png/jpg/pdf/svg）。
 
-    body: PrintLogBody（path，None=默认 pytest/log_<时间戳>.json）
-    返回: PrintLogResult(ok, path, format, samples, dropped)
+    body: PrintLogBody（path + names；names=None 导出全部已登记项）
+    返回: PrintLogResult(ok, path, format, samples, dropped, columns, missing)
     """
-    return hub.print_log(body.path)
+    return hub.print_log(body.path, body.names)
 
 
 @app.get("/api/log/stats")

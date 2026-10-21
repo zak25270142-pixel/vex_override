@@ -21,13 +21,8 @@ export class WsTransport implements SerialTransport {
   private ws: WebSocket | null = null
   /** CONNECTING 阶段积压的帧，onopen 时按序发出 */
   private pending: Uint8Array[] = []
-  /** 当前 WS 是否活着（无论串口状态如何），供串口掉线时本地重连判断 */
-  private wsAlive = false
 
-  constructor(
-    private cb: TransportCallbacks,
-    private url = DEFAULT_URL,
-  ) {}
+  constructor(private cb: TransportCallbacks) {}
 
   isPortReady(): boolean {
     // 后端模式无需选口授权，随时可连
@@ -39,7 +34,7 @@ export class WsTransport implements SerialTransport {
   }
 
   get portLabel(): string {
-    return this.url
+    return DEFAULT_URL
   }
 
   /** 让 Backend 去连下位机；串口探测阻塞交给后端重连线程，前端不等结果 */
@@ -53,10 +48,10 @@ export class WsTransport implements SerialTransport {
 
   async connect(_baudRate: number, _probe?: PortProbe): Promise<void> {
     if (this.ws?.readyState === WebSocket.OPEN) return
-    this.cb.onStatus('connecting', `连接后端 ${this.url} …`)
+    this.cb.onStatus('connecting', `连接后端 ${DEFAULT_URL} …`)
     await this.askBackendConnect()
     await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(this.url)
+      const ws = new WebSocket(DEFAULT_URL)
       ws.binaryType = 'arraybuffer'
       let settled = false
       const timer = window.setTimeout(() => {
@@ -72,11 +67,10 @@ export class WsTransport implements SerialTransport {
         settled = true
         window.clearTimeout(timer)
         this.ws = ws
-        this.wsAlive = true
         // 连接建立前积压的请求（自动拉目录等）一次性按序补发
         for (const f of this.pending) ws.send(this.toBuffer(f))
         this.pending = []
-        this.cb.onStatus('connected', `已连接后端 ${this.url}`)
+        this.cb.onStatus('connected', `已连接后端 ${DEFAULT_URL}`)
         resolve()
       }
       ws.onerror = () => {
@@ -88,7 +82,6 @@ export class WsTransport implements SerialTransport {
       }
       ws.onclose = () => {
         this.ws = null
-        this.wsAlive = false
         this.cb.onStatus('error', '后端已断开')
       }
       ws.onmessage = (ev) => {
@@ -128,7 +121,6 @@ export class WsTransport implements SerialTransport {
       ws.close()
     }
     this.ws = null
-    this.wsAlive = false
     this.pending = []
     this.cb.onStatus('idle', '已断开后端')
   }

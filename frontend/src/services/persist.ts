@@ -8,8 +8,8 @@ const KEY = 'v5.prefs.v1'
 const WRITE_DEBOUNCE_MS = 300
 
 /** x 轴窗口取值范围，与 ScopeConfig 的校验保持一致 */
-const WINDOW_MIN = 0.5
-const WINDOW_MAX = 60
+export const WINDOW_MIN = 0.5
+export const WINDOW_MAX = 60
 
 export interface PortIdentity {
   vid: number
@@ -72,7 +72,7 @@ function defaultLayout(): LayoutPrefs {
   return { rightWidthPct: RIGHT_WIDTH_DEFAULT, rightCollapsed: false }
 }
 
-export function defaultPrefs(): Prefs {
+function defaultPrefs(): Prefs {
   return {
     autoConnect: true,
     demo: false,

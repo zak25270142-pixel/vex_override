@@ -53,13 +53,13 @@
           <input
             class="num-input"
             type="number"
-            min="0.5"
-            max="60"
+            :min="WINDOW_MIN"
+            :max="WINDOW_MAX"
             step="0.5"
             :value="winDraft"
             @input="onWinInput(($event.target as HTMLInputElement).value)"
           />
-          <span class="unit-text">秒（0.5~60）</span>
+          <span class="unit-text">秒（{{ WINDOW_MIN }}~{{ WINDOW_MAX }}）</span>
         </div>
         <p v-if="winErr" class="err">{{ winErr }}</p>
       </section>
@@ -105,6 +105,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { WINDOW_MAX, WINDOW_MIN } from '@/services/persist'
 import {
   TRACE_MAX,
   addTrace,
@@ -174,11 +175,11 @@ function onWinInput(raw: string): void {
   winDraft.value = raw
   if (raw.trim() === '') return
   const n = Number(raw)
-  if (Number.isFinite(n) && n >= 0.5 && n <= 60) {
+  if (Number.isFinite(n) && n >= WINDOW_MIN && n <= WINDOW_MAX) {
     cfg.value.windowS = n
     winErr.value = ''
   } else {
-    winErr.value = '窗口需为 0.5~60 之间的数字'
+    winErr.value = `窗口需为 ${WINDOW_MIN}~${WINDOW_MAX} 之间的数字`
   }
 }
 

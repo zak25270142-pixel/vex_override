@@ -12,7 +12,7 @@
     cd backend
     uvicorn app.main:app --host 127.0.0.1 --port 8000
 然后：
-    python scripts/example_template.py
+    python scripts/tools/example_template.py
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from app.script_api import VexScript  # noqa: E402
 
@@ -34,18 +34,19 @@ def main() -> None:
         sys.exit(1)
     v.wait_dirs(8)
     v.clear_abort()
+    v.stop_move()   # 交出底盘：boot 默认手柄控车，is_busy 期间动作命令被固件静默拒绝
 
     # 先看目录里都有什么，名称以实车 JSON 为准
     print("监控项:", [(x["index"], x["name"]) for x in v.get_column("monitor")])
     print("命令:", [(hex(x["index"]), x["name"]) for x in v.get_column("cmd")])
 
     # 订阅：
-    #   push = 只要下位机推当前值（不记历史），看门狗读 x/y/yaw 用这个
+    #   push = 只要下位机推当前值（不记历史），看门狗读全局X/全局Y/航向用这个
     #   log  = 后端登记记录并自动提高速；both = 推送+记录
-    v.sub("x", "push", fast=True)
-    v.sub("y", "push", fast=True)
-    v.sub("yaw", "push", fast=True)
-    for name in ("左轮转速", "右轮转速"):  # 名称以实车 get_column("monitor") 为准
+    v.sub("全局X", "push", fast=True)
+    v.sub("全局Y", "push", fast=True)
+    v.sub("航向", "push", fast=True)
+    for name in ("左0转速", "右0转速"):  # 名称以实车 get_column("monitor") 为准
         try:
             v.sub(name, "log")
         except Exception as e:
@@ -66,12 +67,12 @@ def main() -> None:
             t0 = time.monotonic()
             while time.monotonic() - t0 < 1.0:
                 try:
-                    pos = v.read("x", "y", "yaw")  # 一次请求取多项 → {"x":..,"y":..,"yaw":..}
-                    drift = (pos["x"] ** 2 + pos["y"] ** 2) ** 0.5
-                    if drift > 0.25 or v.read_item("x")["age_s"] > 0.2:
+                    pos = v.read("全局X", "全局Y", "航向")  # 一次请求取多项
+                    drift = (pos["全局X"] ** 2 + pos["全局Y"] ** 2) ** 0.5
+                    if drift > 0.25 or v.read_item("全局X")["age_s"] > 0.2:
                         raise RuntimeError(f"看门狗触发：位移 {drift:.3f}m 或数据断流")
                 except KeyError:
-                    pass  # 目录里没有 x/y/yaw 时跳过看门狗
+                    pass  # 目录里没有这些项时跳过看门狗
                 time.sleep(0.03)  # 检查周期，v.sleep 没必要：这里本来就要持续轮询
     except RuntimeError as e:
         print("脚本被中止:", e)
@@ -80,14 +81,16 @@ def main() -> None:
         v.end_log()
         # 记录结束后取整段统计/波形：时间一律是"相对本段零点（start_log）的秒"
         try:
-            for it in v.stats(["x"], thresholds=[0.05])["items"]:
+            for it in v.stats(["全局X"], thresholds=[0.05])["items"]:
                 print(f"  {it['name']}: 样本{it['n']} 均值{it['mean']} "
                       f"峰值{it['abs_max']} 阈值占比{it['ratio_ge']}")
-            rows = v.wave(["x", "yaw"])["rows"]  # 长表 [{t,index,name,value}]
+            rows = v.wave(["全局X", "航向"])["rows"]  # 长表 [{t,index,name,value}]
             print(f"  原始样本 {len(rows)} 条，前 3 条：{rows[:3]}")
         except Exception as e:
             print("  （取统计/波形跳过：", e, "）")
-        v.print_log("pytest/example.json")  # 后缀决定格式：json/csv/png/jpg
+        v.print_log("example.json")  # 后缀决定格式：json/csv/png/jpg/pdf/svg，落 probe_data/
+        # 也可只导出某几项，且能换组合反复导出（记录缓冲到下次 start_log 才清）：
+        # v.print_log("example_v.png", ["左0转速", "左0实际电压"])
 
 
 if __name__ == "__main__":

@@ -34,22 +34,10 @@ import {
   monitorMap,
   selectMonitor,
   selectedMonitorIndex,
+  sortedMonitor,
 } from '@/stores/globle'
 
-const rows = computed(() => {
-  // 已订阅优先（高速排前），同档按 index
-  return Object.values(monitorMap).sort((a, b) => {
-    const sa = tagSubscribed(a.tag) ? 1 : 0
-    const sb = tagSubscribed(b.tag) ? 1 : 0
-    if (sa !== sb) return sb - sa
-    if (sa === 1) {
-      const fa = tagFast(a.tag) ? 1 : 0
-      const fb = tagFast(b.tag) ? 1 : 0
-      if (fa !== fb) return fb - fa
-    }
-    return a.index - b.index
-  })
-})
+const rows = computed(() => sortedMonitor(monitorMap))
 
 function shortName(name: string): string {
   return name.length > 5 ? name.slice(0, 5) + '…' : name
