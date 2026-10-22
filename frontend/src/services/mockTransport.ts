@@ -205,16 +205,23 @@ function directoryFrames(cmd: number, items: MockItem[]): Uint8Array[] {
   })
 }
 
-function valueFrame(index: number, item: MockItem): Uint8Array {
-  const payload: number[] = [index]
-  appendValue(payload, item.type, item.read())
-  return frame(CmdPost.MonitorValue, payload)
+/** 一帧最多并几项（与固件 MON_PACK_MAX 一致） */
+const MON_PACK_MAX = 16
+
+/** 拼监控值帧：[payloadlen][time 2B]([index][值])×N，与真机 flush_pack 同构 */
+function packFrame(indices: number[]): Uint8Array {
+  const body: number[] = []
+  for (const i of indices) {
+    body.push(i)
+    appendValue(body, monitorItems[i]!.type, monitorItems[i]!.read())
+  }
+  const t = Math.floor(performance.now()) & 0xffff // 模拟下位机毫秒时钟低16位
+  return frame(CmdPost.MonitorValue, [2 + body.length, t & 0xff, (t >> 8) & 0xff, ...body])
 }
 
 export class MockTransport implements SerialTransport {
   readonly kind = 'mock' as const
-  private fastTimer: ReturnType<typeof setInterval> | null = null
-  private slowTimer: ReturnType<typeof setInterval> | null = null
+  private tickTimer: ReturnType<typeof setInterval> | null = null
   private slowPhase = 0
   private monitorOn = false
 
@@ -289,26 +296,22 @@ export class MockTransport implements SerialTransport {
   private startTimers(): void {
     if (this.monitorOn) return
     this.monitorOn = true
-    // 高速项 10ms
-    this.fastTimer = setInterval(() => {
+    // 每 10ms 一拍：把本拍该发的项（高速全发 + 低速按 index%8 分相）打包成帧，
+    // 满 MON_PACK_MAX 项发一帧——与真机 monitor_tick 同构
+    this.tickTimer = setInterval(() => {
+      const due: number[] = []
       monitorItems.forEach((it, i) => {
-        if (tagSubscribed(it.tag) && tagFast(it.tag)) this.cb.onData(valueFrame(i, it))
-      })
-    }, 10)
-    // 低速项按 index%8 分相，80ms 一轮（演示源每项都在相0，简化）
-    this.slowTimer = setInterval(() => {
-      monitorItems.forEach((it, i) => {
-        if (tagSubscribed(it.tag) && !tagFast(it.tag) && (i & 7) === this.slowPhase)
-          this.cb.onData(valueFrame(i, it))
+        if (!tagSubscribed(it.tag)) return
+        if (tagFast(it.tag) || (i & 7) === this.slowPhase) due.push(i)
       })
       this.slowPhase = (this.slowPhase + 1) & 7
+      for (let k = 0; k < due.length; k += MON_PACK_MAX)
+        this.cb.onData(packFrame(due.slice(k, k + MON_PACK_MAX)))
     }, 10)
   }
 
   private stopTimers(): void {
-    if (this.fastTimer) clearInterval(this.fastTimer)
-    if (this.slowTimer) clearInterval(this.slowTimer)
-    this.fastTimer = null
-    this.slowTimer = null
+    if (this.tickTimer) clearInterval(this.tickTimer)
+    this.tickTimer = null
   }
 }

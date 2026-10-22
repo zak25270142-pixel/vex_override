@@ -617,7 +617,9 @@ def main():
     )
     ap.add_argument("--cooldown", type=float, default=0.5)
     ap.add_argument("--csv", default="neutral_curve_raw.csv",
-                    help="原始数据 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
+                    help="逐测试电压 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/。"
+                         "注意：名字里的 raw 只表示未做曲线拟合，每行仍是该段的聚合量"
+                         "（abs_mean 转速 / mean 电压电流），不是 10ms 原始点")
     ap.add_argument("--summary", default="neutral_curve_summary.csv",
                     help="曲线数据 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
     ap.add_argument("--png", default="neutral_curve.png",

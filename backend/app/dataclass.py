@@ -102,6 +102,8 @@ class ValueEvent(RxEvent):
     kind: ClassVar[EventKind] = EventKind.value
     index: int
     value: CellValue
+    t_ms: int = 0
+    '''下位机采样时刻：毫秒时钟低16位(uint16)，65.536s回绕；消费侧按无符号差分展开'''
 
 
 @dataclass

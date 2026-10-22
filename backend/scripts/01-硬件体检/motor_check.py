@@ -84,10 +84,17 @@ def main() -> None:
             bl.stop_move()
             bl.sleep(0.25)
 
-            rpm, cur = st_r["mean"] or 0.0, st_i["mean"] or 0.0
-            if abs(rpm) > 20:
+            n_rpm = int(st_r.get("n") or 0)
+            rpm = st_r["mean"] or 0.0            # 有符号均值（备查：净转方向）
+            rpm_abs = st_r["abs_mean"] or 0.0    # 幅值均值：来回抖动时它为大、有符号均值抵消成 0
+            cur = st_i["mean"] or 0.0
+            cur_abs = st_i["abs_mean"] or 0.0
+            # 先卡样本数：断流时 mean 会被拉成 0，直接按堵转判就是漏判
+            if n_rpm < 5:
+                state = "NO-DATA?"
+            elif rpm_abs > 20:
                 state = "FREE-SPIN?"
-            elif abs(cur) < 0.05:
+            elif cur_abs < 0.05:
                 state = "DISCONNECT?"
             else:
                 state = "stall(ok)"
@@ -95,18 +102,20 @@ def main() -> None:
                 "motor": name,
                 "vcmd": args.volt,
                 "rpm": rpm,
-                "abs_rpm": st_r["abs_mean"] or 0.0,
+                "abs_rpm": rpm_abs,
                 "cur": cur,
+                "cur_abs": cur_abs,
                 "x": pos["全局X"]["mean"] or 0.0,
                 "y": pos["全局Y"]["mean"] or 0.0,
                 "yaw": pos["航向"]["mean"] or 0.0,
-                "samples": st_r["n"],
+                "samples": n_rpm,
                 "state": state,
             })
             print(
-                "motor%d (%s): rpm=%6.1f I=%4.2fA  %-12s x=%+.3f y=%+.3f yaw=%+.1f  (n=%d)"
-                % (mid, name, rpm, cur, state,
-                   rows[-1]["x"], rows[-1]["y"], rows[-1]["yaw"], st_r["n"])
+                "motor%d (%s): |rpm|=%6.1f(rpm=%+6.1f) |I|=%4.2fA  %-12s "
+                "x=%+.3f y=%+.3f yaw=%+.1f  (n=%d)"
+                % (mid, name, rpm_abs, rpm, cur_abs, state,
+                   rows[-1]["x"], rows[-1]["y"], rows[-1]["yaw"], n_rpm)
             )
         if args.csv and rows:
             bl.save_csv(args.csv, rows)
@@ -114,7 +123,8 @@ def main() -> None:
             plot_check(bl.out_path(args.png), rows)
 
     bad = [r["motor"] for r in rows if r["state"] != "stall(ok)"]
-    print("\n判定：空转=平均|转速|>20pct；断线=平均电流<0.05A；其余记 stall(ok)")
+    print("\n判定口径（都用幅值均值，不用有符号均值——抖动会正负抵消成 0）：")
+    print("  无数据=样本<5；空转=平均|转速|>20pct；断线=平均|电流|<0.05A；其余记 stall(ok)")
     print("异常电机：%s" % (bad if bad else "无"))
 
 

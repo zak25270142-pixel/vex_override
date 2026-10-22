@@ -84,7 +84,8 @@ STATE = {"L": "左环状态", "R": "右环状态"}
 X_NAME = "全局X"
 WANT = ([I_NAME[m] for m in MOTORS] + [V_NAME[m] for m in MOTORS]
         + [W0["L"], W0["R"], STATE["L"], STATE["R"], X_NAME])
-CSV_COLS = (["trial", "phase", "o", "L_rpm", "R_rpm"]
+CSV_COLS = (["trial", "phase", "o", "L_rpm", "R_rpm",
+             "L_ma", "R_ma", "L_ratio", "R_ratio"]   # 判据的三个量（|转速|均值 / ≥1pct 占比）
             + [V_NAME[m] for m in MOTORS] + [I_NAME[m] for m in MOTORS])
 
 
@@ -146,12 +147,16 @@ def sample(bl, hold: float, items) -> dict:
 
 
 def sustained(rpms, move_pct: float, ratio: float):
-    """持续转动判据：窗内均值达标 且 ≥1pct 样本占比达标。挡掉齿隙抽动。"""
+    """持续转动判据：窗内均值达标 且 ≥1pct 样本占比达标。挡掉齿隙抽动。
+
+    返回 (达标?, 窗内|转速|均值, 占比) —— 三个都落盘。只留布尔的话，
+    "差一点没达标"和"完全没动"长得一样，事后没法判断差多少。
+    """
     if len(rpms) < 5:
-        return False, 0.0
+        return False, 0.0, 0.0
     m = sum(abs(x) for x in rpms) / len(rpms)
     r = sum(1 for x in rpms if abs(x) >= 1.0) / len(rpms)
-    return (m >= move_pct and r >= ratio), m
+    return (m >= move_pct and r >= ratio), m, r
 
 
 def return_to(bl, x_ref: float, tol=0.02, timeout=12.0) -> None:
@@ -227,10 +232,12 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
 
     # 2) 升压：per-side 首次"持续起步"档即该侧静摩擦点（起转前车体不动，两侧独立）
     rec = {}
+    ok = {}   # 本档两侧判据结果；布尔 + 均值/占比 都进 CSV
     o = args.o_from
     while (args.o_to - o) * sgn >= -1e-12 and len(rec) < 2:  # 未越过 o_to（sgn 决定爬坡方向）
         bl.check_abort()
         apply_map(bl, motor_volts(vmin, factor, args.vmax, o))
+        time.sleep(args.settle)  # 放掉换档/起步爬升，判据窗只看稳住的部分
         data = sample(bl, args.hold, WANT)
         x = mean(data[X_NAME])
         if abs(x - x_ref) > args.fence_m:
@@ -241,12 +248,16 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
         for m in MOTORS:
             row[V_NAME[m]] = round(mean(data[V_NAME[m]]), 4)
             row[I_NAME[m]] = round(mean(data[I_NAME[m]]), 4)
+        for side in "LR":
+            ok_s, m_abs, m_ratio = sustained(data[W0[side]], args.move_pct, args.ratio)
+            row[f"{side}_ma"] = round(m_abs, 3)
+            row[f"{side}_ratio"] = round(m_ratio, 3)
+            ok[side] = ok_s
         rows.append(row)
         for side in "LR":
             if side in rec:
                 continue
-            ok, _ = sustained(data[W0[side]], args.move_pct, args.ratio)
-            if ok:
+            if ok[side]:
                 rec[side] = {"o": o,
                              "vact": mean([mean(data[V_NAME[m]]) for m in SIDE_MOTORS[side]]),
                              "cur": {m: mean(data[I_NAME[m]]) for m in MOTORS}}
@@ -272,6 +283,7 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
         while (o - args.o_from) * sgn >= -1e-12:
             bl.check_abort()
             apply_map(bl, motor_volts(vmin, factor, args.vmax, o))
+            time.sleep(args.settle)  # 放掉降档瞬态
             data = sample(bl, args.hold, WANT)
             x = mean(data[X_NAME])
             if abs(x - x_ref) > args.fence_m:
@@ -282,8 +294,20 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
             for m in MOTORS:
                 row[V_NAME[m]] = round(mean(data[V_NAME[m]]), 4)
                 row[I_NAME[m]] = round(mean(data[I_NAME[m]]), 4)
+            # 整车判据沿用左右拼接，但两侧各自的量都落盘：
+            # 一侧已停、另一侧还在转时拼接均值仍可能过阈，动垫会偏低
+            ok_all, m_all, r_all = sustained(data[W0["L"]] + data[W0["R"]],
+                                             args.move_pct, args.ratio)
+            ok_l, m_l, r_l = sustained(data[W0["L"]], args.move_pct, args.ratio)
+            ok_r, m_r, r_r = sustained(data[W0["R"]], args.move_pct, args.ratio)
+            row["L_ma"], row["L_ratio"] = round(m_l, 3), round(r_l, 3)
+            row["R_ma"], row["R_ratio"] = round(m_r, 3), round(r_r, 3)
             rows.append(row)
-            ok, _ = sustained(data[W0["L"]] + data[W0["R"]], args.move_pct, args.ratio)
+            if ok_all and not (ok_l and ok_r):
+                print("  [warn] o=%.4f：整车判据为真但只有一侧在转（左%d 右%d），"
+                      "拼接均值把已停那侧也算进去了，动垫可能偏低"
+                      % (o, ok_l, ok_r))
+            ok = ok_all
             if ok:
                 stop = {"o": o, "vact": mean([mean(data[V_NAME[m]]) for m in MOTORS]),
                         "cur": {m: mean(data[I_NAME[m]]) for m in MOTORS}}
@@ -319,7 +343,10 @@ def main() -> None:
                          "传负=标定反向，o_to<o_from 即反向爬坡")
     ap.add_argument("--o-step", type=float, default=0.004, help="输出档步长 o（≈0.045V/档）")
     ap.add_argument("--over", type=float, default=0.02, help="降压段起点高出静摩擦点多少 o")
-    ap.add_argument("--hold", type=float, default=0.7, help="每档保持/采样时长 s")
+    ap.add_argument("--hold", type=float, default=0.7, help="每档采样窗时长 s")
+    ap.add_argument("--settle", type=float, default=0.4,
+                    help="换档后先等多久再开采样窗 s（排掉起步/降档瞬态；"
+                         "不加它窗内均值被瞬态稀释，静垫偏高、动垫偏低）")
     ap.add_argument("--move-pct", type=float, default=2.0, help="持续转动判据的转速阈值 pct")
     ap.add_argument("--ratio", type=float, default=0.7, help="持续转动判据的 ≥1pct 样本占比")
     ap.add_argument("--trials", type=int, default=3, help="重复轮数（试间随机化停位，取中位）")

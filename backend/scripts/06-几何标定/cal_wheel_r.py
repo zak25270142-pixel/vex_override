@@ -133,6 +133,21 @@ def main():
             print("\n  [warn] 偏差超过 5%%：先确认卷尺量的是直线距离、轮子没打滑，")
             print("         再怀疑定位轮直径标称值或轮子在地面有滑移。")
 
+        # 必须落盘：单次测量 + 全程只取首尾两个快照，
+        # 不落的话打滑/偏航/地面不平全折进一个比例系数，事后无从复核
+        bl.save_csv("cal_wheel_r.csv", [{
+            "used_r": args.used, "reported_m": round(reported, 4),
+            "actual_m": actual, "ratio": round(actual / reported, 4),
+            "new_r": round(new_r, 5),
+            "x0": round(x0, 4), "y0": round(y0, 4), "yaw0": round(yaw0, 2),
+            "x1": round(x1, 4), "y1": round(y1, 4), "yaw1": round(yaw1, 2),
+            "yaw_drift_deg": round(yaw1 - yaw0, 2),
+            "speed_pct": args.speed, "time_s": args.time,
+        }], ["used_r", "reported_m", "actual_m", "ratio", "new_r",
+             "x0", "y0", "yaw0", "x1", "y1", "yaw1", "yaw_drift_deg",
+             "speed_pct", "time_s"])
+        print("\n[out] 落盘 cal_wheel_r.csv（首尾位姿 + 比例，供事后复核）")
+
 
 if __name__ == "__main__":
     main()

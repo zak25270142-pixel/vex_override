@@ -62,8 +62,8 @@ public:
     StableJudge stable_judge;
 
     // ---- 动作判定容差 ----
-    float distance_tolerance = 0.008f;     // m
-    float linear_speed_tolerance = 0.035f; // m/s
+    float distance_tolerance = 0.05f;      // m
+    float linear_speed_tolerance = 0.08f;  // m/s
     float heading_tolerance = 1.0f;        // deg，直线段航向保持
     float angle_tolerance = 0.8f;          // deg，原地旋转/goto 最终朝向
     float angular_speed_tolerance = 5.0f;  // deg/s

@@ -385,16 +385,22 @@ class Hub:
         self.logging = False
         '''是否正在记录。start_log 置 True,end_log 置 False'''
 
-        # t_ms:相对 _log_t0 的毫秒,每条按时间升序 append；
-        self.log_dir: dict[int, list[tuple[float, Any]]] = {}
-        '''记录样本缓冲 {index: [(t_ms:float, value:Any), ...]}'''
+        # t_ms:相对 _log_stamp0 的下位机毫秒（不是到达时刻）,每条按时间升序 append；
+        self.log_dir: dict[int, list[tuple[int, Any]]] = {}
+        '''记录样本缓冲 {index: [(t_ms:int, value:Any), ...]}'''
 
         # >0 说明这轮记录不完整；end_log / print_log / snapshot 都会带上它。
         self.log_dropped = 0
         '''到 MAX_LOG_SAMPLES后 丢弃的新样本数'''
 
-        self._log_t0 = 0.0
-        '''start_log 时的 time.monotonic() 秒；样本里的 t_ms 都相对它'''
+        self._stamp_raw = -1
+        '''下位机时间戳展开：上一帧的原始 uint16；-1=还没收到过（与前端 expandStamp 同构）'''
+
+        self._stamp_ms = 0
+        '''下位机时间戳展开：累加出的连续时刻（毫秒）'''
+
+        self._log_stamp0 = 0
+        '''start_log 那一刻的下位机时刻；样本里的 t_ms 都相对它'''
 
         # 守护整份记录缓冲：rx 线程 100Hz 在 _record 里 append，
         # HTTP 线程同时在 _samples（取副本）/ start_log（清空）——不锁就会边读边改。
@@ -649,6 +655,9 @@ class Hub:
         logger.info("串口状态 %s: %s", state.value, message)
         # JSON 出口才转成字符串——前端按 state 的字符串值决定指示灯
         self._broadcast_json(StatusMessage(op="status", state=state.value, message=message))
+        # 连上（含重连）时丢掉旧的展开基准：断连期间下位机时钟与旧基准已不连续
+        if state is Status.connected:
+            self._stamp_raw = -1
         # 掉线了但用户还想连着 → 自动重连
         if state is Status.disconnected and self._want_connected and self._running:
             self.ensure_connected()
@@ -712,11 +721,12 @@ class Hub:
         elif isinstance(event, ValueEvent):
             idx = event.index
             val = event.value
+            stamp_ms = self._expand_stamp(event.t_ms)  # 下位机采样时刻（回绕已展开）
             # 只存"最新值"不存历史：历史由 log_dir 负责（且仅登记项才记）
             self.monitor_latest[idx] = MonitorSample(val, time.monotonic())  # 供 age_s 判新鲜度
             # 记录中 且 该被登记过 → 才落样本。未登记的高频项不会撑爆内存
             if self.logging and idx in self.log_reg:
-                self._record(idx, val)
+                self._record(idx, val, stamp_ms)
 
         elif isinstance(event, EchoEvent):
             # 调参回显：下位机把"实际生效值"发回来。用它覆盖目录里的 value，
@@ -1252,26 +1262,36 @@ class Hub:
 
     # ---------- 记录会话 ----------
     # 一段 = 一次 start_log → end_log。脚本在段内发命令、段末取整段数据；
-    # 后端不切窗口，样本时间戳是"相对本段零点（start_log）的毫秒"。
-    #
-    # 为什么用相对时间而不是墙上时钟：脚本关心的是"发完命令后这 0.4 秒怎么样"，
-    # 相对时间自足，也免了跟系统时钟、时区、NTP 校时打交道。
-    # 基准用 time.monotonic()，不受系统改时间影响。
+    # 后端不切窗口，样本时间戳是"相对本段零点（start_log）的毫秒"，零点取的是下位机时刻：
+    # 用采样时刻而非 PC 到达时刻，扫参/微分才不受 USB 批量到达与本机调度抖动影响。
+    # 相对时间自足：脚本关心的是"发完命令后这 0.4 秒怎么样"，也免了跟系统时钟、NTP 打交道。
 
-    def _record(self, idx: int, value: Any) -> None:
+    def _expand_stamp(self, raw: int) -> int:
+        """把下位机 uint16 时间戳展开成连续毫秒（与前端 expandStamp 同构）。
+
+        相邻帧取无符号差分累加：差分小于半圈算前进，否则算回退一整圈。
+        只要相邻两帧间隔 < 32.7s 就成立（掉线收车的几百毫秒远够）。
+        """
+        if self._stamp_raw >= 0:
+            diff = (raw - self._stamp_raw) & 0xFFFF
+            self._stamp_ms += diff if diff < 0x8000 else diff - 0x10000
+        self._stamp_raw = raw
+        return self._stamp_ms
+
+    def _record(self, idx: int, value: Any, stamp_ms: int) -> None:
         """记一条样本；超上限丢新样（防脚本忘 end_log 把内存吃光）。
 
         丢新不丢旧：保留的是从 start_log 开始的完整一段，
         对"扫参看趋势"更有用；丢尾部只是少记后面一点。
         """
         with self._log_lock:
-            # logging / _log_t0 都必须在锁内读：start_log 会在锁内重置零点并清空缓冲，
+            # logging / _log_stamp0 都必须在锁内读：start_log 会在锁内重置零点并清空缓冲，
             # 若在锁外算 t，就可能拿旧零点算出巨大时间戳落进新一段——
             # 那条样本会排到列表最前，破坏"时间升序"。
             if not self.logging:
                 return
-            # 时间轴零点：start_log 那一刻。样本里的 t 都是相对它的毫秒数
-            t = round((time.monotonic() - self._log_t0) * 1000, 2)
+            # 时间轴零点：start_log 那一刻的下位机时刻。样本里的 t 都是相对它的毫秒数
+            t = stamp_ms - self._log_stamp0
             if self.log_samples() >= MAX_LOG_SAMPLES:
                 self.log_dropped += 1
                 return
@@ -1294,7 +1314,7 @@ class Hub:
             # "重置零点 + 开始收样本"必须是同一个原子步骤
             self.log_dir.clear()
             self.log_dropped = 0
-            self._log_t0 = time.monotonic()
+            self._log_stamp0 = self._stamp_ms  # 零点取当前下位机时刻，样本 t 都相对它
             self.logging = True
         return StartLogResult(
             ok=True,
@@ -1322,7 +1342,7 @@ class Hub:
             names = [names]
         return [self.resolve_monitor(n) for n in names]
 
-    def _samples(self, idx: int) -> list[tuple[float, Any]]:
+    def _samples(self, idx: int) -> list[tuple[int, Any]]:
         """取某项整段样本的副本 [(t_ms, 值), ...]（按时间升序）。
 
         在锁内复制一份指针列表再放锁：既避免遍历时 rx 线程 setdefault 出新 key，

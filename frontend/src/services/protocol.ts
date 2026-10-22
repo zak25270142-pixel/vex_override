@@ -194,6 +194,8 @@ export class ValueEvent {
   constructor(
     readonly index: number,
     readonly value: CellValue,
+    /** 下位机采样时刻：毫秒时钟低16位，65.536s 回绕，同一拍发出的帧相同 */
+    readonly tMs: number,
   ) {}
 }
 
@@ -407,7 +409,9 @@ export function commandSend(item: CmdDirItem, values: CellValue[]): Uint8Array {
 /* ===== 解帧（接收状态机，与下位机 refresh 里的状态机同构） =====
    注意：上行帧全是变长帧——
    目录帧 = 4B定长头 + 名字(nameLen) + 单位长1B + 单位(unitLen) + 值(宽度由type决定)
-   监控帧 = 1B index + 值(宽度查目录登记表)
+   监控帧 = 1B payloadlen + 2B time + ([index][值])×N
+            payloadlen 已给总长；帧内既无项数也无值宽，靠目录登记表推进偏移走到末尾
+   调参回显 = 1B index + 值(宽度查调参登记表)
    长度要边收边算，不能像下行命令那样查固定长度表。 */
 
 const enum RxState {
@@ -536,10 +540,12 @@ export class FrameParser {
 
           // 收到足够的前置字节后才能算出本帧总 payload 长度
           if (this.expect < 0) {
-            if (this.cmd === CmdPost.MonitorValue || this.cmd === CmdPost.TunableEcho) {
-              // 两种帧外形相同：[index][值]，只是类型登记表不同
-              const types = this.cmd === CmdPost.MonitorValue ? this.monitorType : this.tunableType
-              this.expect = 1 + valueSize(types[this.payload[0]!]!)
+            if (this.cmd === CmdPost.MonitorValue) {
+              // 监控值帧自带 1B 长度前缀，不必先拿到目录；len 只算它后面那些字节，+1 是 len 自身
+              if (this.payload[0]! > 0) this.expect = 1 + this.payload[0]!
+            } else if (this.cmd === CmdPost.TunableEcho) {
+              // 调参回显：[index][值]，类型查调参登记表
+              this.expect = 1 + valueSize(this.tunableType[this.payload[0]!]!)
             } else if (this.cmd === CmdPost.CMDDirectory) {
               // 命令目录：payload 头 2B 就是内容长度，收够 2B 即定长
               const total = cmdDirLen(this.payload, this.len)
@@ -595,13 +601,29 @@ export class FrameParser {
         break
       }
       case CmdPost.MonitorValue: {
-        // [index][值]，类型查目录登记表
-        if (this.len < 1) return
-        const index = p[0]!
-        const type = this.monitorType[index] as ValueType
-        if (valueSize(type) === 0) return
-        const value = decodeValue(new DataView(p.buffer, p.byteOffset + 1), 0, type)
-        onEvent(new ValueEvent(index, value))
+        // [payloadlen][time 2B]([index][值])×N：没有项数字段，靠类型表推进偏移走到 payload 末尾
+        if (this.len < 3) return
+        const tMs = p[1]! | (p[2]! << 8)
+        // 先走一趟核对偏移：必须正好落在末尾，对不上说明类型表与发送方不一致，整帧放弃（不产脏事件）
+        let off = 3
+        let ok = true
+        while (off < this.len) {
+          const sz = valueSize(this.monitorType[p[off]!] as ValueType)
+          if (sz === 0) {
+            ok = false
+            break
+          }
+          off += 1 + sz
+        }
+        if (!ok || off !== this.len) return
+        off = 3
+        while (off < this.len) {
+          const index = p[off]!
+          const type = this.monitorType[index] as ValueType
+          const value = decodeValue(new DataView(p.buffer, p.byteOffset + off + 1), 0, type)
+          onEvent(new ValueEvent(index, value, tMs))
+          off += 1 + valueSize(type)
+        }
         break
       }
       case CmdPost.TunableEcho: {

@@ -18,6 +18,7 @@
 //     Cmd     1B命令字，说明这帧是干什么的（见下面两个枚举）
 //     Payload 0~445B数据，有些命令没有数据
 //     XOR     1B校验，把Cmd和Payload每个字节依次异或得到；传错一个字节就对不上
+//   监控值帧（Monitor_Post）是唯一带长度前缀的：Cmd后紧跟1B len，见下面枚举处说明。
 //
 // 订阅档位存在每个监控项的 tag 字段里（见 MENU_ITEM / my_main.h 位域说明）：
 //   bit7 SUB：是否推送；bit6 FAST：高速/低速；bit5 GETTER：函数指针取数；
@@ -85,7 +86,12 @@ private:
         // [index 1B][数据类型 1B][tag 1B][名称长度 1B][名称][单位长度 1B][单位][当前值?B取决于type]
         Post_Tunable_Directory, // 调参目录（tag 位调参表固定为0）
         Post_Monitor_Directory, // 监控目录；其中 tag 为位域字节（见 my_main.h）
-        Monitor_Post,           // 有内容命令 [CMD 1B][index索引1B][当前数值?B取决于type][XOR]
+        // 监控值帧 Payload: [payloadlen 1B][time 2B]([index 1B][值?B取决于type])×N
+        //   payloadlen 本字段之后到校验前的总字节数；收信方收1B就能定帧长(=1+payloadlen)
+        //   项数N不单独给：上位机按目录里的类型表逐项推进偏移，走到payload末尾为止
+        //   值宽也不单独给：同上，由该项在目录里登记的类型决定
+        //   time 下位机毫秒时钟低16位，小端，65.536s自然回绕；同一帧的项采样时刻相同
+        Monitor_Post, // 监控值推送：一帧可含多项，最多 MON_PACK_MAX 项
         Tunable_Echo,           // 有内容命令 [CMD 1B][index索引1B][实际生效值?B取决于type][XOR]
         Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][tag 1B][名长][名][参数量][每参:类型+字段名长+字段名][bit7=1时:每参min+max，各按该参类型定宽]，一命令一帧
         Pong = 0xFF,
@@ -119,6 +125,7 @@ private:
     // Payload上限445B：整帧最长448B(A5+Cmd+445+XOR)，仍小于USB单包512B，一帧不会被USB拆开。
     static constexpr uint16_t MAX_PAYLOAD = 445;
     static constexpr uint8_t SLOW_PHASES = 8; // 低速项轮转相数：单项刷新周期=8×10ms=80ms
+    static constexpr uint8_t MON_PACK_MAX = 16; // 监控值帧最多并几项：满额先发一帧（最宽8B值也只有150B，payloadlen 1B 装得下）
     static constexpr uint8_t DIR_BATCH = 8;   // 调参/监控目录分批：每个10ms拍最多连续发8项
     static constexpr uint8_t UNIT_MAX = 8;    // 目录帧单位名截断长度（字节），如 m/s、deg/s
     static constexpr uint8_t DIR_NAME_MAX = 30; // 目录帧名称截断长度（字节）
@@ -144,6 +151,7 @@ private:
     const CMD_ITEM *cmd_items;
     uint8_t cmd_count;
 
+    uint16_t tx_stamp = 0; // 本拍时间戳：get_time_ms()低16位，tx_tick开头取一次，同拍的监控帧共用
     uint8_t tick = 0;    // 节拍计数，每拍+1，uint8自然溢出回0，只用于低速项按 tick%8 轮转。
     uint8_t dir_tun = 0; // 目录发送倒计时：收到目录请求时置"还剩几批"，每发一批-1，到0结束。
     uint8_t dir_mon = 0; // 三张表各一个；同一拍内只发一个表的一批（tunable优先），保证目录不并行。

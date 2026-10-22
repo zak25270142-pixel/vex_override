@@ -60,6 +60,7 @@ import {
   channelTraces,
   connected,
   focusCh,
+  getLatestT,
   getSeries,
   monitorMap,
   plottableItems,
@@ -140,13 +141,14 @@ function baseOption(extra: echarts.EChartsCoreOption): echarts.EChartsCoreOption
   }
 }
 
-/** 取某条追踪曲线当前窗口内的点；t 换算成"距现在的秒数"（最新点≈0）。
+/** 取某条追踪曲线当前窗口内的点；t 换算成"距最新样本的秒数"（最新点≈0）。
+    基准取下位机采样时刻而非 performance.now()：与缓冲里存的时间戳同源，不受到达抖动影响。
     缓冲是环形（时间升序），从最旧端线性走到最新端，早于窗口起点的直接跳过 */
 function tracePoints(index: number | undefined, windowS: number): [number, number][] {
   if (index === undefined) return []
   const buf = getSeries(index)
   if (!buf || buf.len < 2) return []
-  const now = performance.now() / 1000
+  const now = getLatestT()
   const t0 = now - windowS
   const out: [number, number][] = []
   const start = (buf.head - buf.len + TRACE_BUF_CAP) % TRACE_BUF_CAP

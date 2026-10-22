@@ -377,8 +377,8 @@ class FrameParser:
         '''当前 payload 缓冲区'''
         
         # monitor/tunable 每项 value 类型靠各自目录帧登记，收推送时按 index 查。
-        # 这是关键：监控值推送帧里只有 [index][值]，没有类型字节，
-        # 必须先收到目录帧才知道该项该按几个字节、什么类型解。
+        # 这是关键：监控值推送帧里只有一串 [index][值]，既没有类型字节也没有项数，
+        # 必须先收到目录帧才知道每项该按几个字节、什么类型解（靠宽度推进偏移到 payloadlen 末尾）。
         # 所以目录没拉到之前收到的监控值帧会被解成 0（value_size(0)=1 → UInt8）。
         # 两张表不能合并：index 是各自目录数组的下标（固件里 tunable_items 与
         # monitor_items 是两个独立数组），同号 index 在两张表里是毫不相干的两项、
@@ -438,14 +438,13 @@ class FrameParser:
 
                 if self.expect < 0:
                     # 边收边试算长度：收到足够字节能确定总长就定下来。
-                    # 目录帧要收完名字长度、单位长度才能算；监控值帧收 1 字节 index 就能查类型表算。
-                    if self.cmd in (CmdPost.MonitorValue, CmdPost.TunableEcho):
-                        types = (
-                            self.monitor_type
-                            if self.cmd == CmdPost.MonitorValue
-                            else self.tunable_type
-                        )
-                        self.expect = 1 + value_size(types[self.payload[0]])
+                    # 目录帧要收完名字长度、单位长度才能算；调参回显收 1 字节 index 查类型表；
+                    # 监控值帧自带 1B 长度前缀，收 1 字节就能定长（不依赖先拿到目录）。
+                    if self.cmd == CmdPost.MonitorValue:
+                        if self.payload[0] > 0:
+                            self.expect = 1 + self.payload[0] # len 只算它后面那些字节，加上 len 自身才是总长
+                    elif self.cmd == CmdPost.TunableEcho:
+                        self.expect = 1 + value_size(self.tunable_type[self.payload[0]])
                     elif self.cmd == CmdPost.CMDDirectory:
                         total = _cmd_dir_len(bytes(self.payload[: self.len]), self.len)
                         if total >= 0:
@@ -516,17 +515,38 @@ class FrameParser:
             )
             return
 
-        if cmd in (CmdPost.MonitorValue, CmdPost.TunableEcho):
+        if cmd == CmdPost.MonitorValue:
+            # [payloadlen][time 2B]([index][值])×N：没有项数字段，靠类型表推进偏移走到payload末尾
+            if self.len < 3:
+                return
+            t_ms = p[1] | (p[2] << 8)
+            # 先走一趟核对偏移：必须正好落在末尾，对不上说明类型表与发送方不一致，整帧放弃（不产脏事件）
+            off = 3
+            ok = True
+            while off < self.len:
+                sz = value_size(self.monitor_type[p[off]])
+                if sz == 0:
+                    ok = False
+                    break
+                off += 1 + sz
+            if not (ok and off == self.len):
+                return
+            off = 3
+            while off < self.len:
+                index = p[off]
+                type_ = self.monitor_type[index]
+                value = decode_value(p, off + 1, type_)
+                on_event(ValueEvent(index=index, value=value, t_ms=t_ms))
+                off += 1 + value_size(type_)
+            return
+
+        if cmd == CmdPost.TunableEcho:
             if self.len < 1:
                 return
             index = p[0]
-            types = self.monitor_type if cmd == CmdPost.MonitorValue else self.tunable_type
-            type_ = types[index]
+            type_ = self.tunable_type[index]
             value = decode_value(p, 1, type_) if value_size(type_) else 0
-            if cmd == CmdPost.MonitorValue:
-                on_event(ValueEvent(index=index, value=value))
-            else:
-                on_event(EchoEvent(index=index, value=value))
+            on_event(EchoEvent(index=index, value=value))
             return
 
         if cmd == CmdPost.CMDDirectory:

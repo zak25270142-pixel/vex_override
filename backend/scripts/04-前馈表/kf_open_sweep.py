@@ -392,6 +392,15 @@ def main() -> None:
             w.writerows(rows)
         print("[out] 原始数据: %s" % out)
 
+        # 节点表也要落盘：note 里记着哪些点是"沿用上一节点/钳到端点/非单调"，
+        # 只打印到控制台的话，事后拿到的表看不出哪些 y 是造的、哪些是实测的
+        node_rows = [{"side": sd, "x": x, "y": round(y, 6), "note": note}
+                     for sd in tables for x, y, note in tables[sd]]
+        if node_rows:
+            bl.save_csv(f"kf_open_{args.tag}_nodes.csv", node_rows,
+                        ["side", "x", "y", "note"])
+            print("[out] 节点表(带来源备注): kf_open_%s_nodes.csv" % args.tag)
+
         png = "" if args.png == "" else (args.png or f"kf_open_{args.tag}.png")
         if png:
             plot_result(bl.out_path(png), rows, tables)

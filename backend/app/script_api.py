@@ -198,10 +198,10 @@ class VexScript:
           type="log"  只在后端登记记录，登记时自动把该项提升为高速推送
           type="both" 推送 + 记录都要
 
-        ⚠️ 注意 fast 默认是 None（跟随 on），而 BackendLink.sub 默认 type="both"。
-        在 hub 里只有 type=="log" 才做"非高速自动提升"，所以走 both 时
-        日志采样率会跟着下位机原有档位（低速项约 80ms）。
-        要 100Hz 数据请显式 sub(..., fast=True)。
+        fast 只在 type 含 "push" 时有意义：不传就跟随 on（订阅即高速、取消即低速）。
+        所以默认的 sub(x)（type="both"）本身就是高速推送，能直接拿到 100Hz；
+        type="log" 分支不看 fast，登记时若该项还不是高速会自动补一次提升。
+        （旧注释说"走 both 会掉到 80ms"是错的，与 hub.py 的实现不符，已更正。）
         """
         return self._post(
             "/api/sub",

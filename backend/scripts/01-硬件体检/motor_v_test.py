@@ -87,6 +87,9 @@ def main() -> None:
     ap.add_argument("--vmax", type=float, default=5.0, help="降压扫描起始电压 V（跑动 V-v 线）")
     ap.add_argument("--down-step", type=float, default=0.1, help="降压扫描步长 V（粗）")
     ap.add_argument("--hold", type=float, default=0.35)
+    ap.add_argument("--settle", type=float, default=0.3,
+                    help="换档后先等多久再开始记录 s（排掉起步/降档瞬态；"
+                         "不加它窗内均值会被瞬态稀释，启动电压随 hold 漂移）")
     ap.add_argument("--csv", default="motor_v_result.csv",
                     help="结果 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
     ap.add_argument("--png", default="motor_v_result.png",
@@ -117,8 +120,9 @@ def main() -> None:
             """逐档扫描：每档一段独立记录，end_log 后取本段统计（升压/降压/点检共用）。"""
             ids = names[motor]
             for v in voltages:
-                bl.start_log()
                 bl.set_volt(motor_id(motor), v)
+                bl.sleep(args.settle)   # 先放掉换档瞬态
+                bl.start_log()          # 只把稳态段记进来
                 bl.sleep(args.hold)
                 bl.end_log()
                 if args.log:
@@ -207,6 +211,11 @@ def main() -> None:
                    if r["motor"] == motor and r["phase"] == "up"
                    and r["vact"] is not None and (r["pct_abs"] or 0) >= 2.0]
         band = [p for p in pts if p[0] <= 40.0] or pts
+        if len(band) < len(pts):
+            print("  [注意] %s 拟合剔除了 %d 个 >40pct 的点（斜率只代表中低速段）"
+                  % (motor, len(pts) - len(band)))
+        elif pts and min(p[0] for p in pts) > 40.0:
+            print("  [warn] %s 所有点都 >40pct，已退回全段拟合，口径与其余台不一致" % motor)
         if len(band) < 2:
             return None
         mx = sum(p[0] for p in band) / len(band)  # 转速均值

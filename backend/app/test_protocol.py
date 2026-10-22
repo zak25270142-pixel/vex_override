@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import struct
 
+from .dataclass import EventKind
 from .protocol import (
     FRAME_HEAD,
     CmdPost,
     CmdGet,
-    EventKind,
     MAX_PAYLOAD,
     ValueType,
-    build_frame,
     decode_value,
     encode_value,
     ping,
@@ -51,6 +50,12 @@ def test_parser_pong():
     assert len(events) == 1 and events[0].kind is EventKind.pong
 
 
+def _monitor_value_frame(index: int, value: float, t_ms: int = 0x1234) -> bytes:
+    """监控值帧: [len 1B][time 2B 小端][index 1B][值 4B float]"""
+    body = struct.pack("<H", t_ms & 0xFFFF) + bytes([index]) + struct.pack("<f", value)
+    return _frame(CmdPost.MonitorValue, bytes([len(body)]) + body)
+
+
 def test_parser_monitor_value_after_directory():
     """喂一条监控目录登记类型，再喂推送值，验证按目录类型解码。"""
     events = []
@@ -60,11 +65,40 @@ def test_parser_monitor_value_after_directory():
     p.feed(_frame(CmdPost.MonitorDirectory, dir_payload), events.append)
     assert events[-1].item.name == "v"
 
-    val_payload = bytes([2]) + struct.pack("<f", 1.0)
-    p.feed(_frame(CmdPost.MonitorValue, val_payload), events.append)
+    p.feed(_monitor_value_frame(2, 1.0), events.append)
     assert events[-1].kind is EventKind.value
     assert events[-1].index == 2
     assert abs(events[-1].value - 1.0) < 1e-6
+
+
+def test_parser_monitor_value_len_prefix_without_directory():
+    """没拿到目录也能靠 1B 长度前缀定长：帧边界不丢，粘在后面的帧照常解析。"""
+    events = []
+    p = FrameParser()
+    # 目录还没到 → 类型表对不上发送方的宽度，整帧放弃（不再按 uint8 解出脏值）
+    p.feed(_monitor_value_frame(2, 1.0) + bytes([0xA5, 0xFF, 0xFF]), events.append)
+    assert [e.kind for e in events] == [EventKind.pong]  # 值帧被放弃，后一帧没被带偏
+
+
+def test_parser_monitor_value_multi_item_frame():
+    """一帧多项：没有 num 字段，靠类型表推进偏移，逐项派发；同帧共享一个时间戳。"""
+    events = []
+    p = FrameParser()
+    for idx, ty in ((1, ValueType.Int32), (5, ValueType.Float)):
+        dir_payload = bytes([idx, ty, 0, 1]) + b"v" + bytes([0]) + struct.pack("<f", 0.0)
+        p.feed(_frame(CmdPost.MonitorDirectory, dir_payload), events.append)
+
+    body = (
+        struct.pack("<H", 0x1234)
+        + bytes([1])
+        + struct.pack("<i", -7)
+        + bytes([5])
+        + struct.pack("<f", 2.5)
+    )
+    p.feed(_frame(CmdPost.MonitorValue, bytes([len(body)]) + body), events.append)
+    vals = [e for e in events if e.kind is EventKind.value]
+    assert [(e.index, e.value) for e in vals] == [(1, -7), (5, 2.5)]
+    assert all(e.t_ms == 0x1234 for e in vals)
 
 
 def test_parser_cmd_directory_with_ranges():
@@ -133,6 +167,8 @@ if __name__ == "__main__":
     test_encode_float()
     test_parser_pong()
     test_parser_monitor_value_after_directory()
+    test_parser_monitor_value_len_prefix_without_directory()
+    test_parser_monitor_value_multi_item_frame()
     test_parser_cmd_directory_with_ranges()
     test_parser_cmd_directory_ranges_follow_field_type()
     test_parser_bad_checksum_and_half_frame()

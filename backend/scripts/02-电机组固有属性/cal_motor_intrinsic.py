@@ -349,6 +349,7 @@ def main() -> None:
 
             for lv in levels:
                 print(f"===== Phase B 等流搜索 level={lv:.2f}V =====")
+                row0 = len(rows)   # 本 level 在 rows 里的起点，收敛后回填标记
                 v_fin, s_fin, ok = search_balance(
                     bl, sides, lv, args.alpha, args.tol, args.max_rounds,
                     args.settle, args.hold, args.i_min_valid, volt_max,
@@ -366,6 +367,10 @@ def main() -> None:
                              "达标" if ok else "未收敛"))
                 bal[lv] = v_fin
                 converged[lv] = ok
+                # 未达标水平拟合时会剔除——必须在本行留标记，
+                # 否则 CSV 里这些行看不出被排除了，口径与拟合结果对不上
+                for r in rows[row0:]:
+                    r["converged"] = int(ok)
                 print()
             bl.stop_move()
         finally:
@@ -434,7 +439,7 @@ def main() -> None:
     print("   base 总量 = 摩擦垫 + volt_min，垫子大了直接砍（在线调参，不用烧录）。")
 
     out = Path(bl.out_path(f"cal_motor_{args.tag}.csv"))
-    cols = (["phase", "level", "round"]
+    cols = (["phase", "level", "round", "converged"]
             + [f"{tag_of(i)}_{k}" for i in ALL_IDS for k in ("vcmd", "vact", "I", "rpm")])
     bl.save_csv(str(out), rows, cols)  # 本地写文件，不依赖 HTTP 会话
     plot_balance(out.with_suffix(".png"), all_fits)

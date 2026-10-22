@@ -47,36 +47,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from app.script_api import BackendLink  # noqa: E402
 
 
-def plot_groups(path, sum_rows, targets):
-    """一栏：各增益组的稳态误差 vs 目标——哪组在中低速最贴 0 一目了然。"""
-    from plot_util import subplots, save, legend
-
-    fig, axes = subplots(1, width=7.5)
-    ax = axes[0][0]
-    groups = sorted({r[0] for r in sum_rows if r[0].startswith("closed_")})
-    for gname in groups:
-        xs, ys = [], []
-        for t in targets:
-            for r in sum_rows:
-                if (r[0] == gname and r[1] == "tgt=%g" % t and len(r) > 6
-                        and isinstance(r[6], str) and r[6].startswith("err=")):
-                    xs.append(t)
-                    ys.append(float(r[6][4:]))
-        if xs:
-            ax.plot(xs, ys, "o-", ms=3, lw=1, label=gname.replace("closed_", ""))
-    ax.axhline(0, color="gray", ls=":", lw=1)
-    ax.set_xlabel("目标 / pct")
-    ax.set_ylabel("稳态误差 / pct")
-    ax.set_title("各增益组稳态误差（越贴 0 越好）")
-    ax.grid(True, alpha=0.3)
-    legend(ax, fontsize=7, ncol=2)
-    save(fig, path)
-
 # 关心的监控项中文名（来自 LCD_menu.cpp 注册表）
 MON_OPEN = ["左0转速", "右0转速", "左0实际电压", "右0实际电压", "全局X", "全局Y", "航向"]
 MON_CLOSED = ["左指令转速", "右指令转速", "左0转速", "右0转速",
               "左0指令电压", "右0指令电压", "左0实际电压",
               "左0电流", "左1电流", "左2电流", "右0电流", "右1电流", "右2电流",  # 看 factor 载荷分担
+              # 速度环内部量：稳态误差到底是谁造成的，只能靠这几个分辨——
+              # 前馈没到位 / 积分顶着 / 状态机在 Track↔Stable 反复跳，处置完全不同
+              "左PID积分", "右PID积分",     # I 是否在硬扛静差
+              "左PID误差", "右PID误差",     # 环路实际看到的误差
+              "左前馈", "右前馈",           # 前馈给到不到位
+              "左环状态", "右环状态",       # 0=Stopped 1=Transit 2=Track 3=Stable 4=Recover 5=Stall
+              "左转速(慢1拍)", "右转速(慢1拍)",  # 速度环内部用的速度，与误差同源
+              "左加速度(慢1拍)", "右加速度(慢1拍)",
               "全局X", "全局Y", "航向"]
 NAME_X, NAME_Y, NAME_YAW = "全局X", "全局Y", "航向"
 
@@ -115,9 +98,8 @@ PAD_NAMES = ["左静摩擦", "左动摩擦", "右静摩擦", "右动摩擦"] + \
             [f"左{i}最小电压" for i in range(3)] + [f"右{i}最小电压" for i in range(3)]
 SPEED_TARGETS = [3.0, 5.0, 10.0, 20.0]   # pct；3/5pct 是低速重点，10/20pct 验证高速不欠速
 
-# 指标汇总 CSV 的列名（sum_rows 每行按顺序落位，短行后面留空）
-SUM_COLS = ["phase", "step", "L_mean", "R_mean", "L_std", "R_std",
-            "note1", "note2", "note3", "note4"]
+# 汇总 CSV 的列名：只做波形索引（哪一档、多少点、是否截断），不再承载稳态指标
+SUM_COLS = ["phase", "step", "points", "spin_s", "note1", "note2", "note3", "note4"]
 
 # 开环电压扫描（V）：6电机同电压（整车直线，左右抵消转向力矩）
 def build_volts(vmax: float, step: float = 0.1):
@@ -133,13 +115,13 @@ FENCE_X_M = 1.0       # 相对会话原点的纵向围栏：越过立即收车�
 FENCE_Y_M = 0.30      # 横向围栏（走偏保护）
 FENCE_YAW_DEG = 30.0  # 航向围栏（防止扫成转圈绕线）
 PULSE_VOLT_S = 0.5    # 开环单档脉冲时长
-PULSE_SPIN_S = 0.8    # 闭环单目标脉冲时长
-RETURN_TOL_M = 0.03    # 回到原点 3cm 内视为复位
-RETURN_TIMEOUT_S = 8.0 # 倒车复位总时限 s（全局X闭环收敛，含近圈修正）
+PULSE_SPIN_S = 1.5    # 闭环单目标脉冲时长上限（到位移预算也会提前停）
+RETURN_TOL_M = 0.08    # 回到原点 8cm 内视为复位（只求别累积出场地，不追求精度）
+RETURN_TIMEOUT_S = 8.0 # 倒车复位时限下限 s（实际按残余距离动态加长）
 HOME_GUARD_S = 0.35   # 脉冲后静止滑行观察时间
 STOP_SETTLE_S = 1.5   # 倒车前先刹停并等待真正零速的最长时间
 WD_PERIOD_S = 0.03    # 围栏主动 check 的周期
-PULSE_BUDGET_M = 0.25 # 单个测试脉冲自身的位移预算（不含倒车复位）
+PULSE_BUDGET_M = 1.0  # 单个测试脉冲自身的位移预算（不含倒车复位）
 OVERSPEED_HOLD_S = 0.12  # 超速持续多久才判定蹿冲（滤掉单样本毛刺）
 # ---- 原地旋转模式专用（高速段标定；防车飘、防线缆缠绕）----
 ROTATE_DRIFT_M = 0.15      # 单脉冲旋转中心 2D 飘移上限：超过即收车（车飘了）
@@ -328,10 +310,13 @@ class Probe:
         self.wd.end_pulse()  # 复位是受控动作，关掉脉冲预算，只保留会话围栏+超速保护
         self.L.stop_move()   # 电机制动（不是0V惰行），尽快消掉前进余速
         self._wait_stop()
-        self.apply_settings(0.008, 0.0, 0.0, None, remember=False)  # 回程用纯前馈（pads=None 不碰摩擦垫）
+        # 回程给一点 ki：kf 表在标定完成前是占位值，纯前馈（ki=0）回程会走不到位
+        self.apply_settings(0.01, 0.1, 0.0, None, remember=False)  # pads=None 不碰摩擦垫
         self.wd.begin_pulse(vlim=20.0, budget=None)
         try:
-            t_end = time.perf_counter() + RETURN_TIMEOUT_S
+            # 超时按残余距离给：固定 8s 在退回距离变长后必然不够
+            adx0 = abs(self.L.latest(NAME_X) - self.wd.ox)
+            t_end = time.perf_counter() + max(RETURN_TIMEOUT_S, adx0 * 20.0)
             while time.perf_counter() < t_end:
                 self.wd.check()
                 dx = self.L.latest(NAME_X) - self.wd.ox
@@ -366,7 +351,8 @@ class Probe:
         self.L.drive_volt(0.0)
         dx = self.L.latest(NAME_X) - self.wd.ox
         print(f"    [复位] 残差 {dx:+.3f}m")
-        if abs(dx) > 0.10:
+        # 阈值放宽：有人监管 + 前端可紧急停车，不该为"没退到位"中止整轮实验
+        if abs(dx) > 0.25:
             raise RuntimeError(f"复位失败，残差 {dx:+.3f}m，人工检查")
 
     def save_wave(self, prefix, wave):
@@ -475,7 +461,7 @@ class Probe:
             self.cur_settings = (kp, ki_s, kd_s, pads)
 
     def phase_closed(self, no_prompt=False, group_filter=None, rotate=False,
-                     targets=None, budget_max=0.65):
+                     targets=None, budget_max=1.0, spin_s=PULSE_SPIN_S):
         L = self.L
         L.clear_subs()
         L.sub(MON_CLOSED)  # 登记要记录的项
@@ -509,28 +495,24 @@ class Probe:
                     s = 1.0 if pulse_i % 2 == 0 else -1.0
                     ltgt, rtgt = s * tgt, -s * tgt
                 else:
-                    # 超速：目标1.8倍+6pct持续120ms即收车；预算按实测物理速度约2.6cm/s/pct给1.4倍余量
-                    budget = min(budget_max, 0.12 + tgt * 0.025 * 1.4)
-                    self.wd.begin_pulse(vlim=tgt * 1.8 + 6.0, budget=budget)
+                    # 位移预算就是硬阈值：走到它立刻停，不需要预估速度。
+                    # （旧的"2.6cm/s/pct"无来源记录、也不对应当前车，已废弃）
+                    self.wd.begin_pulse(vlim=tgt * 1.8 + 6.0, budget=budget_max)
                     ltgt, rtgt = tgt, tgt
                 try:
                     L.spin_target(ltgt, rtgt)
-                    self._sleep(PULSE_SPIN_S)
-                    L.spin_target(0.0, 0.0)
-                    self._sleep(ROTATE_SETTLE_S if rotate else HOME_GUARD_S)
+                    self._sleep(spin_s)   # 时长上限；位移先到预算会被 watchdog 截停
+                    self.halt()           # 真停车：目标归零 → stop_move → 6电机0V，不是挂 0 目标滑行
                 except RuntimeError:
                     reason = self.wd.tripped or ""
                     L.end_log()    # 先冻结本段，再取波形
                     w = L.wave(MON_CLOSED)
                     self.save_wave(f"closed_{gname}_t{tgt:g}_ABORT", w)
                     self.wd.end_pulse()
-                    lv2 = [abs(v) for tt, v in w["左0转速"] if tt >= 0.2]
-                    rv2 = [abs(v) for tt, v in w["右0转速"] if tt >= 0.2]
-                    lm2, _, _, ls2 = stats(lv2)
-                    rm2, _, _, rs2 = stats(rv2)
+                    n_pts = len(w.get("左0转速") or [])
                     self.sum_rows.append([f"closed_{gname}", f"tgt={tgt:g}",
-                                          f"{lm2:.2f}", f"{rm2:.2f}", f"{ls2:.2f}",
-                                          f"{rs2:.2f}", f"ABORT:{reason[:14]}"])
+                                          f"n={n_pts}", f"spin_s={spin_s:g}",
+                                          f"ABORT:{reason[:14]}"])
                     print(f"  tgt {tgt:3.0f}  [截停] {reason}")
                     if rotate or "单脉冲" not in reason:
                         # 旋转截停=车飘/缠线风险，必须人工看线；直线蹿冲/越围栏同理硬中止
@@ -546,28 +528,14 @@ class Probe:
                 w = L.wave(MON_CLOSED)
                 self.save_wave(f"closed_{gname}_t{tgt:g}", w)
 
-                # 指标只取后 50% 稳态窗；旋转时右轮为反转，取绝对值与目标比
-                # 时间轴从 start_log 起算，所以稳态窗起点就是 PULSE_SPIN_S 的一半
-                tw = PULSE_SPIN_S * 0.5
-                win_len = PULSE_SPIN_S * 0.5
-                lv = [v for t, v in w["左0转速"] if t >= tw]
-                rv = [(abs(v) if rotate else v) for t, v in w["右0转速"] if t >= tw]
-                vcmd = [v for t, v in w["左0指令电压"] if t >= tw]
-                lm, _, _, lstd = stats(lv)
-                rm, _, _, rstd = stats(rv)
-                vm, vmin, vmax, _ = stats(vcmd)
-                neg = sum(1 for v in vcmd if v < -0.1) / max(1, len(vcmd))
-                flips = sum(1 for a, b in zip(vcmd, vcmd[1:])
-                            if (a > 0.1 and b < -0.1) or (a < -0.1 and b > 0.1)) / win_len
-                err = ((tgt - lm) + (tgt - rm)) / 2
+                # 不做稳态指标：原始点已全量落 *_wave.csv，判读交给看图的人 / AI。
+                # 这里只留索引信息（哪一档、录了多少点、是否截断），
+                # 不再压成 err/std/neg/flips——那几个数会掩盖曲线本身，且窗口怎么取都是造的
+                n_pts = len(w.get("左0转速") or [])
                 self.sum_rows.append([f"closed_{gname}", f"tgt={tgt:g}",
-                                      f"{lm:.2f}", f"{rm:.2f}", f"{lstd:.2f}",
-                                      f"{rstd:.2f}", f"err={err:+.2f}",
-                                      f"Vcmd {vm:+.2f}[{vmin:+.2f},{vmax:+.2f}]",
-                                      f"neg={neg:.2f}", f"flips/s={flips:.1f}"])
-                print(f"  tgt {tgt:4.0f}  L {lm:6.2f}±{lstd:4.2f}  R {rm:6.2f}±{rstd:4.2f}"
-                      f"  err {err:+5.2f} | Vcmd {vm:+5.2f}[{vmin:+4.1f},{vmax:+4.1f}]"
-                      f"  负压 {neg:.2f}  反打 {flips:.1f}/s")
+                                      f"n={n_pts}", f"spin_s={spin_s:g}", "ok"])
+                print(f"  tgt {tgt:4.0f}  波形 {n_pts} 点 / {spin_s:g}s  → "
+                      f"{self.tag}_closed_{gname}_t{tgt:g}_*_wave.csv")
                 if rotate:
                     # 车不位移：刹停等零速即可，脉冲间额外停顿便于人工观察线缆
                     self.halt()
@@ -604,9 +572,10 @@ def main():
                     help="闭环目标速度档 pct，逗号分隔（高速直行测试加 30,40 等）")
     ap.add_argument("--fence-x", type=float, default=FENCE_X_M,
                     help="纵向会话围栏 m（默认 %.1f，高速直行测试调大，人看线）" % FENCE_X_M)
-    ap.add_argument("--budget-max", type=float, default=0.65, help="闭环单脉冲位移预算上限 m（高速档要调大）")
-    ap.add_argument("--png", default="speed_loop.png",
-                    help="汇总图文件名，空字符串跳过；落 backend/pytest/probe_data/05-速度环/<tag>/")
+    ap.add_argument("--budget-max", type=float, default=1.0,
+                    help="闭环单脉冲位移预算 m（走到它就停；靠实测定位轮，不需要预估速度）")
+    ap.add_argument("--spin-s", type=float, default=PULSE_SPIN_S,
+                    help="闭环单脉冲时长上限 s（默认 %.1f；与位移预算竞争，先到先停）" % PULSE_SPIN_S)
     args = ap.parse_args()
 
     volt_up, volt_down = build_volts(args.volt_max)
@@ -677,10 +646,11 @@ def main():
         if args.phase in ("closed", "all") and not (probe and probe.abort):
             gf = None if args.groups == "all" else set(args.groups.split(","))
             probe.phase_closed(args.no_prompt, gf, rotate=args.rotate,
-                               targets=targets, budget_max=args.budget_max)
+                               targets=targets, budget_max=args.budget_max,
+                               spin_s=args.spin_s)
         probe.write_summary()
-        if args.png and probe.sum_rows:
-            plot_groups(os.path.join(outdir, args.png), probe.sum_rows, targets)
+        print("\n[看图] python scripts/tools/wave_plot.py %s   "
+              "（画的是原始点，不是聚合指标）" % args.tag)
 
         # 还原调参（闭环实验改过 kp/ki/kd 与摩擦垫；kf 表不动，无需还原）
         if saved_gains:

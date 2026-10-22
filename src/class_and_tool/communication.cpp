@@ -389,16 +389,31 @@ void USB_Comm::monitor_tick()
     if (!monitor_active || !link_ok)
         return;
 
-    // 发一个监控项的完整链路：直接在tx_frame里写[index][当前值]，再封帧发出。
-    // 不带类型——上位机从目录里已知index→类型对应。
+    // 本拍要发的项打包成若干帧：满 MON_PACK_MAX 项就先发一帧，tx_frame 原地复用接着攒。
+    // 一帧= [A5][CMD][payloadlen][time 2B]([index][值])×N [XOR]，不带类型与项数——
+    // 上位机按目录里登记的index→类型推进偏移，走到payload末尾即止。
+    uint8_t pack_num = 0;
+    uint16_t pos = 5; // tx_frame[2]=payloadlen(回填) [3][4]=time，项从[5]起
+
+    auto flush_pack = [&]()
+    {
+        tx_frame[2] = static_cast<uint8_t>(pos - 3); // payloadlen：time+全部项
+        send_frame(Monitor_Post, static_cast<uint16_t>(pos - 2));
+        pack_num = 0;
+        pos = 5;
+    };
+
     auto post_item = [&](uint8_t index)
     {
         const MENU_ITEM &item = monitor_items[index];
         if (item.data_type == type_str || item.data_type == type_other)
             return;
-        tx_frame[2] = index;
-        uint8_t vlen = append_value(&tx_frame[3], item); // 值最多8B，写在index后面
-        send_frame(Monitor_Post, 1 + vlen);
+        if (pack_num >= MON_PACK_MAX)
+            flush_pack(); // 攒满一帧先发，后面的项进下一帧
+        tx_frame[pos++] = index;
+        uint8_t vlen = append_value(&tx_frame[pos], item);
+        pos += vlen;
+        pack_num++;
     };
 
     uint8_t phase = tick & (SLOW_PHASES - 1); // SLOW_PHASES是2的幂，用掩码代替取模
@@ -412,6 +427,8 @@ void USB_Comm::monitor_tick()
         else if ((i & (SLOW_PHASES - 1)) == phase)
             post_item(i); // 低速项轮到自己所在的相才发
     }
+    if (pack_num > 0)
+        flush_pack(); // 发最后不满一帧的尾巴
 }
 
 // 10ms发送节拍：先回心跳Pong和调参回显，再发目录倒计时的当前批，然后推送监控值，
@@ -419,6 +436,8 @@ void USB_Comm::monitor_tick()
 // 这是全程序唯一write串口的地方（接收任务只置标志），所以各帧天然不会互相穿插。
 void USB_Comm::tx_tick()
 {
+    tx_stamp = static_cast<uint16_t>(get_time_ms()); // 本拍时间戳，同拍发出的监控帧共用同一个
+
     // Pong最高优先：3字节小帧，收到Ping后最迟下一拍就回，上位机拿它算往返/在线
     if (pong_pending)
     {

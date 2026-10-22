@@ -115,6 +115,14 @@ class Sample:
     rpm: list
     tgt: list      # 左右指令转速
     ff: list       # 左右前馈
+    rpm_std: list = None   # 六台转速的整段标准差：看"是否真稳"，光看均值看不出来
+    rpm_n: list = None     # 六台转速的样本数：看有没有丢包（n 太少说明这段没记到）
+    cur_amax: list = None  # 六台电流的 |峰值|：电流保护要看真峰值，不能看窗口均值的最大值
+
+
+def nz(x, default=float("nan")):
+    """None → nan 用于打印。宁可显示 nan 也不要拿 0.0 冒充实测值。"""
+    return x if x is not None else default
 
 
 def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float) -> Sample:
@@ -124,9 +132,25 @@ def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float) -> Sam
     bl.end_log()
     st = bl.stats(WANT)
 
-    def m(name: str) -> float:
+    def m(name: str):
+        """整段均值。该项没数据/没样本时返回 None——绝不拿 0.0 冒充实测值。"""
         d = st.get(name) or {}
-        return float(d.get("mean") or 0.0)
+        v = d.get("mean")
+        return None if v is None else float(v)
+
+    def sd(name: str):
+        d = st.get(name) or {}
+        v = d.get("std")
+        return None if v is None else float(v)
+
+    def amax(name: str):
+        d = st.get(name) or {}
+        v = d.get("abs_max")
+        return None if v is None else float(v)
+
+    def cnt(name: str) -> int:
+        d = st.get(name) or {}
+        return int(d.get("n") or 0)
 
     return Sample(
         volt_cmd=volt_cmd,
@@ -136,6 +160,9 @@ def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float) -> Sam
         rpm=[m(mon(sd, i, "转速")) for sd in "LR" for i in range(3)],
         tgt=[m("左指令转速"), m("右指令转速")],
         ff=[m("左前馈"), m("右前馈")],
+        rpm_std=[sd(mon(sd, i, "转速")) for sd in "LR" for i in range(3)],
+        rpm_n=[cnt(mon(sd, i, "转速")) for sd in "LR" for i in range(3)],
+        cur_amax=[amax(mon(sd, i, "电流")) for sd in "LR" for i in range(3)],
     )
 
 
@@ -277,6 +304,10 @@ def main() -> None:
                 row[f"{t}_vact"] = s.vact[i]
                 row[f"{t}_I"] = s.cur[i]
                 row[f"{t}_rpm"] = s.rpm[i]
+                # 均值之外同时落 std/n：光看均值分不出"稳"和"均值为 0"
+                row[f"{t}_rpm_std"] = s.rpm_std[i]
+                row[f"{t}_rpm_n"] = s.rpm_n[i]
+                row[f"{t}_I_peak"] = s.cur_amax[i]
             rows.append(row)
 
         if args.verify:
@@ -299,9 +330,16 @@ def main() -> None:
                     s = measure(bl, v, args.settle, args.hold)
                     collect(s, "verify")
                     idx = {"L": 0, "R": 1}
-                    print("  目标 %5.1fpct → 左 %6.2f  右 %6.2f pct   ff=[%.4f %.4f]"
-                          % (v, s.rpm[mid("L", 0)], s.rpm[mid("R", 0)], s.ff[0], s.ff[1]))
-                    verify_rows.append((v, v, s.rpm[mid("L", 0)], s.rpm[mid("R", 0)]))
+                    rl, rr = s.rpm[mid("L", 0)], s.rpm[mid("R", 0)]
+                    print("  目标 %5.1fpct → 左 %6.2f  右 %6.2f pct   ff=[%.4f %.4f]  "
+                          "抖动[%.2f %.2f]  样本[%d %d]"
+                          % (v, nz(rl), nz(rr), nz(s.ff[0]), nz(s.ff[1]),
+                             nz(s.rpm_std[mid("L", 0)]), nz(s.rpm_std[mid("R", 0)]),
+                             s.rpm_n[mid("L", 0)], s.rpm_n[mid("R", 0)]))
+                    if rl is None or rr is None:
+                        print("    [warn] 本档转速无数据（没登记/丢包），不进验证散点")
+                    else:
+                        verify_rows.append((v, v, rl, rr))
                     bl.spin_target(0.0, 0.0)
                     bl.sleep(0.4)
                 bl.stop_move()
@@ -321,16 +359,24 @@ def main() -> None:
                     bl.set_volt(i, v)
                 s = measure(bl, v, args.settle, args.hold)
                 collect(s, "sweep")
-                print("  V=%5.2f  左转速 %6.2f  右转速 %6.2f pct   "
-                      "Vact=[%.2f %.2f]  I=[%.2f %.2f]A"
-                      % (v, s.rpm[mid("L", 0)], s.rpm[mid("R", 0)],
-                         s.vact[mid("L", 0)], s.vact[mid("R", 0)],
-                         s.cur[mid("L", 0)], s.cur[mid("R", 0)]))
+                print("  V=%5.2f  左转速 %6.2f±%.2f  右转速 %6.2f±%.2f pct   "
+                      "Vact=[%.2f %.2f]  I=[%.2f %.2f]A  样本[%d %d]"
+                      % (v, nz(s.rpm[mid("L", 0)]), nz(s.rpm_std[mid("L", 0)]),
+                         nz(s.rpm[mid("R", 0)]), nz(s.rpm_std[mid("R", 0)]),
+                         nz(s.vact[mid("L", 0)]), nz(s.vact[mid("R", 0)]),
+                         nz(s.cur[mid("L", 0)]), nz(s.cur[mid("R", 0)]),
+                         s.rpm_n[mid("L", 0)], s.rpm_n[mid("R", 0)]))
                 for sd in sides:
-                    curve[sd].append((v, abs(s.rpm[mid(sd, 0)])))
-                peak = max(abs(s.cur[i]) for i in ALL_IDS)
+                    r0 = s.rpm[mid(sd, 0)]
+                    if r0 is None or s.rpm_n[mid(sd, 0)] == 0:
+                        print(f"  [warn] {SIDE_CN[sd]}0转速无数据，{v}V 档不进曲线")
+                        continue
+                    curve[sd].append((v, abs(r0)))
+                # 电流保护看真峰值（abs_max），不是"窗口均值的最大值"——后者会漏掉尖峰
+                peaks = [s.cur_amax[i] for i in ALL_IDS if s.cur_amax[i] is not None]
+                peak = max(peaks) if peaks else 0.0
                 if peak > args.i_max:
-                    print(f"  [保护] 电流 {peak:.2f}A 超过 {args.i_max:g}A，中止后续档位")
+                    print(f"  [保护] 电流峰值 {peak:.2f}A 超过 {args.i_max:g}A，中止后续档位")
                     break
                 for i in ALL_IDS:
                     bl.set_volt(i, 0.0)
@@ -382,7 +428,8 @@ def main() -> None:
         # ---------- 输出 ----------
         out_csv = Path(bl.out_path(f"cal_kf_{args.tag}.csv"))
         cols = (["phase", "volt_cmd"]
-                + [f"{tag_of(i)}_{k}" for i in ALL_IDS for k in ("vcmd", "vact", "I", "rpm")])
+                + [f"{tag_of(i)}_{k}" for i in ALL_IDS
+                   for k in ("vcmd", "vact", "I", "rpm", "rpm_std", "rpm_n", "I_peak")])
         bl.save_csv(str(out_csv), rows, cols)
         out_png = out_csv.with_suffix(".png")
         plot_result(out_png, curve, table, verify_rows)

@@ -154,6 +154,16 @@ def main():
         if args.dir in ("both", "ccw"):
             runs.append(("左转",) + run_one(bl, -args.volt_pct, args.target_deg, "左转"))
 
+        # 必须落盘：整段只取首尾两个快照，中间有没有打滑零数据支撑，
+        # 不落的话"两向差 3mm"这个结论事后无从复核
+        bl.save_csv("cal_rotation_center.csv",
+                    [{"dir": r[0], "dyaw_deg": round(r[1], 2),
+                      "df_m": round(r[2], 5), "ds_m": round(r[3], 5),
+                      "offset_f_mm": round(r[4] * 1000.0, 2),
+                      "offset_s_mm": round(r[5] * 1000.0, 2)} for r in runs],
+                    ["dir", "dyaw_deg", "df_m", "ds_m", "offset_f_mm", "offset_s_mm"])
+        print("[out] 落盘 cal_rotation_center.csv（两向各自的 Δθ/Δf/Δs，供事后复核）")
+
     print("\n===== 结果 =====")
     print("  方向    Δθ(°)      Δf(m)      Δs(m)    offset_f(mm)  offset_s(mm)")
     for name, dyaw, df, ds, off_f, off_s in runs:

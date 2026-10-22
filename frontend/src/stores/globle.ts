@@ -450,6 +450,24 @@ const seriesBuf = new Map<number, SeriesBuf>()
 const rawLatest: Record<number, CellValue> = {}
 const rawPose = { x: 0, y: 0, yaw: 0 }
 
+/* ===== 下位机时间戳展开：帧里带的是毫秒时钟低16位（65.536s回绕），曲线要的是单调时间轴 =====
+   按相邻帧的无符号差分累加成连续毫秒：差分小于半圈算前进，否则算回退一整圈。
+   差分跨回绕天然成立，只要求相邻两帧间隔 < 32.7s（掉线收车的几百毫秒远够）。 */
+let stampRaw = -1
+let stampMs = 0
+function expandStamp(raw: number): number {
+  if (stampRaw >= 0) {
+    const diff = (raw - stampRaw + 65536) % 65536
+    stampMs += diff < 32768 ? diff : diff - 65536
+  }
+  stampRaw = raw
+  return stampMs
+}
+/** 最新样本的下位机时刻（秒）：曲线 x 轴与导出的"现在"以此为准，与 performance.now() 不同源 */
+export function getLatestT(): number {
+  return stampMs / 1000
+}
+
 /* ===== 实参缩略卡 5s 简易示波缓冲（仅当前选中的一个 monitor index，不强制提速） ===== */
 const MINI_CAP = 512 // 5s @ 100Hz 足够；环形覆盖最旧点
 const miniBuf: SeriesBuf = {
@@ -508,7 +526,7 @@ export function getSeries(index: number): SeriesBuf | undefined {
  * 没有任何数据时返回空串。
  */
 export function buildExportText(): string {
-  const now = performance.now() / 1000
+  const now = getLatestT() // 与缓冲里的采样时刻同源；不用 performance.now()（到达时刻有抖动）
   // 导出列：位姿 x/y/yaw 优先置于最前（分析里程/轨迹常用），随后是被追踪的量。
   // 同一量只出一份（位姿被通道追踪时也在其中），只保留真出过历史点的
   const cols: number[] = []
@@ -529,23 +547,18 @@ export function buildExportText(): string {
   }
   if (cols.length === 0) return ''
 
-  // 对齐节拍：各序列相邻间隔的中位数里最小的那个（最快的那档就是采样节拍，通常 10ms）
+  // 对齐节拍：取相邻样本时间戳的最小正间隔（时间戳精确到毫秒，不必再靠中位数估计）
   let period = FAST_PERIOD
-  let fastest = Infinity
   for (const idx of cols) {
     const buf = seriesBuf.get(idx)!
     if (buf.len < 8) continue
     const start = bufStart(buf)
-    const gaps: number[] = []
     for (let k = 1; k < buf.len; k++) {
       const dt = buf.t[(start + k) % TRACE_BUF_CAP]! - buf.t[(start + k - 1) % TRACE_BUF_CAP]!
-      if (dt > 1e-4) gaps.push(dt)
+      if (dt > 1e-4) period = Math.min(period, Math.round(dt * 1000) / 1000)
     }
-    if (gaps.length < 4) continue
-    gaps.sort((a, b) => a - b)
-    fastest = Math.min(fastest, gaps[gaps.length >> 1]!)
   }
-  if (Number.isFinite(fastest)) period = Math.min(Math.max(fastest, 1e-3), 10)
+  period = Math.min(Math.max(period, 1e-3), 10)
 
   // 归行：row=(t-t0)/period 四舍五入；同一行同一列出现多次时保留最新
   let t0 = Infinity
@@ -625,6 +638,8 @@ function clearMonitorData(): void {
   for (const k of Object.keys(monitorMap)) delete monitorMap[Number(k)]
   for (const k of Object.keys(monitorLatest)) delete monitorLatest[Number(k)]
   seriesBuf.clear() // 位姿历史也在 seriesBuf 里，一并清掉
+  stampRaw = -1 // 时间戳展开从头开始：重连后下位机时钟与旧基准不再连续
+  stampMs = 0
   parser.resetMonitorTypes()
   pose.valid = false
   poseIndex.x = -1
@@ -705,14 +720,15 @@ function handleEvent(e: RxEvent): void {
 
   if (typeof e.value === 'number' && (isTraced(index) || kind !== MonitorKind.None)) {
     // 留历史的两类量：①被通道追踪的（画曲线/导出）②位姿 x/y/yaw（场地图/导出）。
-    // t 存绝对接收时刻（秒），显示/导出时换算成"距现在"，实现示波器式右对齐时间轴。
+    // t 存下位机采样时刻（秒，回绕已展开），显示/导出时换算成"距最新样本"，实现示波器式右对齐。
     // 每帧一个样本，跟随主控推送节拍（高速区 10ms 即 100Hz）。环形缓冲写满即覆盖最旧点
+    const t = expandStamp(e.tMs)
     let buf = seriesBuf.get(index)
     if (!buf) {
       buf = { t: new Float64Array(TRACE_BUF_CAP), v: new Float64Array(TRACE_BUF_CAP), head: 0, len: 0 }
       seriesBuf.set(index, buf)
     }
-    buf.t[buf.head] = performance.now() / 1000
+    buf.t[buf.head] = t
     buf.v[buf.head] = e.value
     buf.head = (buf.head + 1) % TRACE_BUF_CAP
     if (buf.len < TRACE_BUF_CAP) buf.len++
@@ -723,7 +739,7 @@ function handleEvent(e: RxEvent): void {
     else if (kind === MonitorKind.PosY) rawPose.y = e.value
     else if (kind === MonitorKind.Yaw) rawPose.yaw = e.value
     // 实参缩略卡的 5s 简图：只存当前选中的那一个量，不强制提速，独立于曲线通道
-    if (index === selectedMonitorIndex.value) miniPush(performance.now() / 1000, e.value)
+    if (index === selectedMonitorIndex.value) miniPush(expandStamp(e.tMs), e.value)
   }
 }
 

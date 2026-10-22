@@ -48,6 +48,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { tagFast, tagSubscribed, type CellValue } from '@/services/protocol'
 import {
   formatValue,
+  getLatestT,
   getMiniSeries,
   monitorLatest,
   selectedMonitorItem,
@@ -142,7 +143,7 @@ function draw(): void {
     return
   }
 
-  const now = performance.now() / 1000
+  const now = getLatestT() // 与缓冲里存的下位机采样时刻同源
   const WINDOW_S = 5
   const t0 = now - WINDOW_S
   const start = (head - len + cap) % cap

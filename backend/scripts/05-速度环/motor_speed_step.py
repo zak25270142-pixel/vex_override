@@ -72,6 +72,10 @@ SUB_KEYS = list(MONITOR_WANT.keys())
 # 时序长表 CSV 列
 TIMING_FIELDS = ["t_rel_s", "side", "step_target", "index", "name", "value"]
 
+# 判定"进入带宽后停得住"的最短停留时间 s：
+# 只看"首次进入"会被噪声穿越提前命中，报出一个漂亮但假的上升时间
+SETTLE_HOLD_S = 0.15
+
 
 def resolve_indices(mon_dir: Dict[str, int]) -> Dict[str, int]:
     """按中文名把监控目录映射到 index；缺项抛错。"""
@@ -106,19 +110,23 @@ def steady_metrics(
         return {"n": 0}
     mean = sum(tail) / len(tail)
     peak = max(abs(v) for v in (r[rpm_key] for r in rows if r.get(rpm_key) is not None))
-    # 上升时间：向非零目标时，首次进入目标±5%（至少 1pct 带宽）
+    # 上升时间：进入目标±5%（至少 1pct 带宽）**且之后停得住**
     rise_t = None
     if abs(target) >= 1.0:
         band = max(abs(target) * 0.05, 1.0)
         lo, hi = target - band, target + band
-        for r in rows:
+        for i, r in enumerate(rows):
             v = r.get(rpm_key)
-            if v is not None and lo <= v <= hi:
+            if v is None or not (lo <= v <= hi):
+                continue
+            t_hold = r["t"] + SETTLE_HOLD_S
+            if all(rr.get(rpm_key) is not None and lo <= rr.get(rpm_key) <= hi
+                   for rr in rows[i:] if rr["t"] <= t_hold):
                 rise_t = r["t"]
                 break
+        # 超调：负值 = 峰值没到目标（欠调）。不许归零——
+        # 归零会把"根本没跟上"显示成"超调 0%"，是最典型的误导
         overshoot = (peak - abs(target)) / abs(target) * 100.0 if abs(target) > 1e-6 else 0.0
-        if overshoot < 0:
-            overshoot = 0.0
     else:
         overshoot = 0.0
     ss_err = mean - target
@@ -213,6 +221,8 @@ def run_side(
                     ("%.3fs" % m["rise_t"]) if m["rise_t"] is not None else "-",
                 )
             )
+            if m["overshoot_pct"] < -0.5:
+                print("     [注意] 峰值未达目标（欠调 %.1f%%），不是超调" % m["overshoot_pct"])
             # 对照指令目标回读
             tgt_mean = st[tgt_name]["mean"]
             if tgt_mean is not None:
