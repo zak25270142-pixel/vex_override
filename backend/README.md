@@ -70,8 +70,8 @@ with BackendLink() as bl:
     bl.save_csv("pytest/l0_start.csv", rows)
 ```
 
-`stats()` 统计本段全部样本；想避开开头的阶跃过渡，用 `wave()` 拿原始点自己在本地筛
-（后端不切窗口）。想提前停直接 `break`（比如"一旦转起来就停"），已 end_log 的段不受影响。
+`stats()` 统计本段全部样本；想避开开头的阶跃过渡，用 `calc(expr, window=[t0_ms, t1_ms])`
+让后端按子区间算（聚合或逐点序列）。想提前停直接 `break`（比如"一旦转起来就停"），已 end_log 的段不受影响。
 原始曲线按段 `print_log(路径)` 落盘，格式看后缀：`.json` / `.csv` / `.png` / `.jpg`（无后缀默认 json）。
 
 ### 记录会话：脚本只管发命令，记录由后端干
@@ -90,16 +90,17 @@ for volt in (0.5, 1.0, 1.5):
     print(volt, st["n"], st["mean"], st["abs_max"])
 
 v.stats(["左0转速"], thresholds=[5.0])             # thresholds 给"|值|>=阈值"的样本占比
-v.wave(["左0转速"])                                # 整段原始长表，自己画图/筛选/落盘
+v.calc("左0转速", agg="mean", window=[100, 400])  # 子区间聚合（window 单位 ms，相对本段零点）
 v.print_log("pytest/run.csv")                      # 导出 CSV（后缀决定格式）
 ```
 
 - `print_log(路径)` 按后缀选格式：`.json`（无后缀默认）/ `.csv` / `.png`|`.jpg`（按项作图）；
-  路径带子目录会自动创建；不传则落后端 `pytest/log_<时间戳>.json`
+  路径带子目录会自动创建；不传则落后端 `pytest/probe_data/log_<时间戳>.json`
 
 - `stats` 字段：`n / mean / abs_mean / min / max / abs_max / std / rate_hz / ratio_ge`
   （`ratio_ge` 是 `|值| >= 阈值` 的样本占比；无样本时 `n=0`，其余为 `None`）
-- 后端只做整段统计/整段原始点，**不提供时间窗口参数**；要子区间就本地筛 `wave()` 的点
+- `calc()` 带 `window=[t0_ms, t1_ms]` 时间窗口参数（相对本段零点），子区间统计/逐点都走它；
+  要整段原始点就 `print_log` 导 csv/json 本地处理
 - **记录缓冲上限 50 万条，超了丢新样**。段化写法天然不会累积；万一一次记录跨很多样本，
   中途再调一次 `start_log()`（会清缓冲并重置零点）即可。
 
@@ -176,7 +177,7 @@ while ...:
 
 - 停车（上位机停车按钮或 `/api/stop`）优先级最高：立即发停车帧、清空脚本待发队列、置 abort，脚本的 `cmd()`/`sleep()` 随即抛错中止
 - `cmd` 参数个数必须与命令目录完全一致，少参/多参都会 400（不再静默补 0）；目录里带取值范围的字段（tag bit7）还会校验上下限，越界同样 400
-- 心跳与重连：后端约 1s 一发 Ping；下位机约 2.5s 收不到 Ping 会停推监控（link_ok）；后端 5s 收不到 Pong 判定串口掉线并自动重连（重连后自动重拉目录、补发订阅）。重连每 5s 一轮，只开带 VEX 标识的口（VID 0x2888 / 描述符含 vex·user），非 VEX 设备的串口一律不抢占；每个候选口最多等 100ms Pong，认不出就关掉换下一个
+- 心跳与重连：后端 80ms 一发 Ping；下位机 300ms 收不到 Ping 会停推监控（link_ok，communication.h LINK_PATROL_TICKS=30）；后端 300ms 收不到 Pong 判定串口掉线并自动重连（重连后自动重拉目录、补发订阅）。重连每 5s 一轮，只开带 VEX 标识的口（VID 0x2888 / 描述符含 vex·user），非 VEX 设备的串口一律不抢占；每个候选口最多等 120ms Pong，认不出就关掉换下一个
 - 目录缓存：连上后自动拉三张表并按 index 缓存原始帧，多客户端重复请求不打车；怀疑缓存过期/半表时 `POST /api/dirs/refresh` 强制刷新（或脚本里 `v.refresh_dirs()`）
 - 脚本退出：曾 `sub("push"/"both")` 的项应显式 `unsub`，或 finally 里 `v.clear_script_subs()` 一键清掉 script 侧订阅意图
 - 不内置看门狗，按测试场景自行在脚本里超时 `v.stop()`

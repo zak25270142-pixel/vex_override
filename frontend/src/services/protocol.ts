@@ -295,12 +295,39 @@ export function encodeValue(type: ValueType, value: CellValue): Uint8Array {
 
 /**
  * 把值编码成定长 8B 小端区域（SetTunable 的 value 段），与下位机 write_value 对应。
- * 不足 8B 的类型高位天然为 0；bool 收 0/1；color 收 '#RRGGBB'。
+ * 不足 8B 的类型高位天然为 0；bool 收 0/1（仅开关字段）；color 收 '#RRGGBB'。
+ * 类型不符直接抛错，绝不静默编 0——与 backend protocol.py 的 encode_value8 一一对应。
  */
 function encodeValue8(type: ValueType, value: CellValue): Uint8Array {
   const buf = new ArrayBuffer(8)
   const d = new DataView(buf)
-  const n = typeof value === 'number' ? value : 0
+  // 类型纪律：这是"值→字节"的最后一站，value 必须已经是目录字段声明类型的对应物
+  // ——数值字段 number、Color 字段 '#RRGGBB' 字符串。类型不符直接抛错：
+  // 静默编 0 会把笔误伪装成"生效且值为 0"，是最难排查的一类故障。
+  // 第一道校验在 UI 输入处（面板转 Number / 颜色串）。
+  if (type === ValueType.Color) {
+    if (typeof value !== 'string') {
+      throw new TypeError(`Color 字段需要 '#RRGGBB' 字符串，收到 ${typeof value}: ${value}`)
+    }
+    const m = /^#?([0-9a-f]{6})$/i.exec(value)
+    if (!m) throw new Error(`Color 需要 6 位十六进制（如 '#ff0000'），收到 ${value}`)
+    const rgb = parseInt(m[1]!, 16)
+    d.setUint8(0, (rgb >> 16) & 0xff)
+    d.setUint8(1, (rgb >> 8) & 0xff)
+    d.setUint8(2, rgb & 0xff)
+    return new Uint8Array(buf)
+  }
+  // 其余均为数值型（含 Bool/OnOff）：bool 仅开关字段放行。
+  // 旧代码 `typeof value === 'number' ? value : 0` 会把 true 编成 0（Python 侧编 1），
+  // 两边对布尔输入行为不一致，顺手修正
+  if (typeof value === 'boolean') {
+    if (type !== ValueType.Bool && type !== ValueType.OnOff) {
+      throw new TypeError(`数值字段收到布尔值 ${value}`)
+    }
+  } else if (typeof value !== 'number') {
+    throw new TypeError(`数值字段需要 number，收到 ${typeof value}: ${value}`)
+  }
+  const n = Number(value)
   switch (type) {
     case ValueType.UInt8:
       d.setUint8(0, n)
@@ -336,16 +363,6 @@ function encodeValue8(type: ValueType, value: CellValue): Uint8Array {
     case ValueType.OnOff:
       d.setUint8(0, n ? 1 : 0)
       break
-    case ValueType.Color: {
-      const m = /^#?([0-9a-f]{6})$/i.exec(String(value))
-      if (m) {
-        const rgb = parseInt(m[1]!, 16)
-        d.setUint8(0, (rgb >> 16) & 0xff)
-        d.setUint8(1, (rgb >> 8) & 0xff)
-        d.setUint8(2, rgb & 0xff)
-      }
-      break
-    }
     default:
       break // str/other 不允许调参，编码全 0
   }
@@ -541,8 +558,14 @@ export class FrameParser {
           // 收到足够的前置字节后才能算出本帧总 payload 长度
           if (this.expect < 0) {
             if (this.cmd === CmdPost.MonitorValue) {
-              // 监控值帧自带 1B 长度前缀，不必先拿到目录；len 只算它后面那些字节，+1 是 len 自身
-              if (this.payload[0]! > 0) this.expect = 1 + this.payload[0]!
+              // 监控值帧自带 1B 长度前缀，不必先拿到目录；len 只算它后面那些字节，+1 是 len 自身。
+              // payloadlen==0 非法（固件 monitor_tick 仅在 pack_num>0 时 flush、每帧必含 2B
+              // 时间戳），只可能是流错位——直接回找帧头，不猜长度
+              if (this.payload[0]! === 0) {
+                this.state = RxState.WaitHead
+              } else {
+                this.expect = 1 + this.payload[0]!
+              }
             } else if (this.cmd === CmdPost.TunableEcho) {
               // 调参回显：[index][值]，类型查调参登记表
               this.expect = 1 + valueSize(this.tunableType[this.payload[0]!]!)

@@ -23,48 +23,15 @@
     python scripts/01-硬件体检/motor_start_repeat.py
 """
 
-import sys
 import argparse
-# 不引 statistics：沙箱环境可能拦截其 pyc 写入，中位数自己算即可
+import os
+import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))   # backend 根，供 import app
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 from app.script_api import BackendLink  # noqa: E402
 from motor_names import motor_names  # noqa: E402
-
-
-def median(xs):
-    s = sorted(xs)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
-
-
-def plot_repeat(path, rows, motors):
-    """一栏：每台各次试验的持续启动电压（圆）与抽动电压（菱形）——看的是分散度。"""
-    from plot_util import subplots, save, legend
-
-    fig, axes = subplots(1, width=7.0)
-    ax = axes[0][0]
-    for i, m in enumerate(motors):
-        rs = [r for r in rows if r["motor"] == m]
-        off = lambda k: i + 0.03 * (k - len(rs) / 2.0)   # 横向抖开，避免重叠
-        starts = [(off(k), r["start_v"]) for k, r in enumerate(rs)
-                  if r["start_v"] is not None]
-        tws = [(off(k), r["twitch_v"]) for k, r in enumerate(rs)
-               if r["twitch_v"] is not None]
-        if starts:
-            ax.scatter([p[0] for p in starts], [p[1] for p in starts], s=30, label=m)
-        if tws:
-            ax.scatter([p[0] for p in tws], [p[1] for p in tws], marker="d",
-                       s=20, alpha=0.55, color="gray")
-    ax.set_xticks(range(len(motors)), motors)
-    ax.set_ylabel("启动电压 / V")
-    ax.set_title("静止启动电压重复试验（圆=持续启动，灰菱形=抽动）")
-    ax.grid(True, alpha=0.3)
-    if len(motors) > 1:
-        legend(ax, fontsize=8, ncol=2)
-    save(fig, path)
 
 
 def sustained(stats):
@@ -85,11 +52,8 @@ def main():
     ap.add_argument("--vstart", type=float, default=0.20)
     ap.add_argument("--vmax", type=float, default=1.20)
     ap.add_argument("--hold", type=float, default=0.40)
-    ap.add_argument("--csv", default="motor_start_repeat.csv",
-                    help="每次试验一行，空字符串跳过；落 backend/pytest/probe_data/<层>/")
-    ap.add_argument("--png", default="motor_start_repeat.png",
-                    help="结果图文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
-    ap.add_argument("--log", default="", help="非空则每段原始记录导出到该目录（每段一对 json/csv）")
+    ap.add_argument("--tag", default="run1",
+                    help="原始段目录后缀；落 backend/pytest/probe_data/<层>/motor_start_repeat_<tag>/")
     args = ap.parse_args()
 
     motors = args.motors.split(",")
@@ -99,6 +63,8 @@ def main():
 
     # with 退出时 __exit__ 自动收车收尾（6电机0V / 刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
+        out_dir = bl.out_path("motor_start_repeat_%s" % args.tag)   # 每档一段原始 CSV
+        os.makedirs(out_dir, exist_ok=True)
         print("监控表共 %d 项" % len(bl.mon_dir))
         alias = {m: motor_names(m) for m in motors if m[:1] in "LR" and m[1:].isdigit()}
         missing = ["%s:%s" % (m, k) for m in motors for k in ("rpm", "vact", "cur")
@@ -147,8 +113,9 @@ def main():
                     bl.set_volt(motor_id, v)
                     bl.sleep(args.hold)
                     bl.end_log()
-                    if args.log:
-                        bl.print_log(bl.out_path("%s/%s_t%d_v%.2f" % (args.log, motor, trial, v)))
+                    seg = os.path.join(out_dir, "%s_t%d_v%.2f" % (motor, trial, v))
+                    bl.print_log(seg + ".csv")
+                    bl.print_log(seg + ".png")
                     st_r = bl.stats([names["rpm"]], thresholds=[1.0, 3.0])[names["rpm"]]
                     st_v = bl.stats([names["vact"]])[names["vact"]]
                     # 抽动：本段峰值过3pct（越过齿槽动了一下但没转起来）
@@ -178,24 +145,8 @@ def main():
                 bl.set_volt(motor_id, 0.0)  # 本轮收电压
                 bl.sleep(0.4)
 
-        if args.csv and rows:
-            bl.save_csv(args.csv, rows)
-        if args.png and rows:
-            plot_repeat(bl.out_path(args.png), rows, motors)
-
-    print("\n================ 启动电压分布（指令电压 V）================")
-    print("电机  最小值  中位值  最大值  未启动次数  各次抽动电压")
-    for motor in motors:
-        starts = [v for v in results[motor] if v is not None]
-        none_n = results[motor].count(None)
-        if starts:
-            print("%s   %5.2f   %5.2f   %5.2f   %d          %s"
-                  % (motor, min(starts), median(starts), max(starts), none_n,
-                     ["%.2f" % v if v is not None else ">" for v in twitches[motor]]))
-        else:
-            print("%s   全程未持续启动（>%.2fV），抽动: %s"
-                  % (motor, args.vmax,
-                     ["%.2f" % v if v is not None else ">" for v in twitches[motor]]))
+    print("\n原始段目录：%s" % out_dir)
+    print("（启动电压分布的解算交给日抛分析脚本读这些 CSV）")
 
 
 if __name__ == "__main__":

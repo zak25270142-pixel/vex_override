@@ -24,35 +24,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from app.script_api import BackendLink  # noqa: E402
-
-
-def plot_steps(path, all_rows, steps):
-    """两栏（左/右）：每段的转速跟随曲线 + 该段目标水平线——看上升时间与超调。"""
-    from plot_util import subplots, save, legend
-
-    fig, axes = subplots(2)
-    for ax, sd, cn in ((axes[0][0], "L", "左"), (axes[0][1], "R", "右")):
-        name = MONITOR_WANT["L0_rpm" if sd == "L" else "R0_rpm"]
-        for tgt in steps:
-            pts = sorted((r["t_rel_s"], r["value"]) for r in all_rows
-                         if r["name"] == name and r["step_target"] == tgt)
-            if pts:
-                ax.plot([p[0] for p in pts], [p[1] for p in pts], lw=1, label="目标 %gpct" % tgt)
-                ax.axhline(tgt, ls=":", lw=0.8, color="gray")
-        ax.set_xlabel("t / s（段内）")
-        ax.set_ylabel("转速 / pct")
-        ax.set_title("%s侧阶跃跟随（点线=各段目标）" % cn)
-        ax.grid(True, alpha=0.3)
-        legend(ax, fontsize=7)
-    save(fig, path)
 
 # 监控项中文名 → 逻辑键（与 LCD_menu.cpp monitor_menu_item 一致）
 MONITOR_WANT = {
@@ -69,14 +48,6 @@ MONITOR_WANT = {
 # 全程要记的监控键
 SUB_KEYS = list(MONITOR_WANT.keys())
 
-# 时序长表 CSV 列
-TIMING_FIELDS = ["t_rel_s", "side", "step_target", "index", "name", "value"]
-
-# 判定"进入带宽后停得住"的最短停留时间 s：
-# 只看"首次进入"会被噪声穿越提前命中，报出一个漂亮但假的上升时间
-SETTLE_HOLD_S = 0.15
-
-
 def resolve_indices(mon_dir: Dict[str, int]) -> Dict[str, int]:
     """按中文名把监控目录映射到 index；缺项抛错。"""
     out: Dict[str, int] = {}
@@ -91,77 +62,14 @@ def resolve_indices(mon_dir: Dict[str, int]) -> Dict[str, int]:
     return out
 
 
-def steady_metrics(
-    rows: List[dict],
-    rpm_key: str,
-    target: float,
-    settle_frac: float = 0.35,
-) -> dict:
+def capture(bl: BackendLink, out_dir: str, tag: str) -> None:
+    """把本段（start_log → end_log）的原始样本整段落盘。
+
+    后端缓冲在下一段 start_log 时清空，原始段必须在本段内立刻导出。
     """
-    用后 settle_frac 比例窗口做稳态统计；上升时间取首次进入 ±5% 带宽的时刻。
-    target≈0 时不做超调/上升时间。
-    """
-    if not rows:
-        return {"n": 0}
-    n = len(rows)
-    start = int(n * (1.0 - settle_frac))
-    tail = [r[rpm_key] for r in rows[start:] if r.get(rpm_key) is not None]
-    if not tail:
-        return {"n": 0}
-    mean = sum(tail) / len(tail)
-    peak = max(abs(v) for v in (r[rpm_key] for r in rows if r.get(rpm_key) is not None))
-    # 上升时间：进入目标±5%（至少 1pct 带宽）**且之后停得住**
-    rise_t = None
-    if abs(target) >= 1.0:
-        band = max(abs(target) * 0.05, 1.0)
-        lo, hi = target - band, target + band
-        for i, r in enumerate(rows):
-            v = r.get(rpm_key)
-            if v is None or not (lo <= v <= hi):
-                continue
-            t_hold = r["t"] + SETTLE_HOLD_S
-            if all(rr.get(rpm_key) is not None and lo <= rr.get(rpm_key) <= hi
-                   for rr in rows[i:] if rr["t"] <= t_hold):
-                rise_t = r["t"]
-                break
-        # 超调：负值 = 峰值没到目标（欠调）。不许归零——
-        # 归零会把"根本没跟上"显示成"超调 0%"，是最典型的误导
-        overshoot = (peak - abs(target)) / abs(target) * 100.0 if abs(target) > 1e-6 else 0.0
-    else:
-        overshoot = 0.0
-    ss_err = mean - target
-    return {
-        "n": len(tail),
-        "ss_mean": mean,
-        "ss_err": ss_err,
-        "peak_abs": peak,
-        "overshoot_pct": overshoot,
-        "rise_t": rise_t,
-    }
-
-
-def _rpm_rows(seg: dict, rpm_name: str, rpm_key: str) -> List[dict]:
-    """从本段波形里抽转速那条，做成 steady_metrics 要的 [{t, rpm_key}] 序列。"""
-    return [{"t": ts, rpm_key: val} for ts, val in seg.get(rpm_name, [])]
-
-
-def _capture(bl: BackendLink, side: str, target: float, all_rows: List[dict]) -> dict:
-    """取本段 8 项波形：追加到长表，并返回波形供算稳态/上升时间。
-
-    wave() 的 t 是"相对本段开始记录的秒"；每段都是独立记录，所以直接可用。
-    """
-    seg = bl.wave(list(MONITOR_WANT.values()))
-    for name, series in seg.items():
-        for ts, val in series:
-            all_rows.append({
-                "t_rel_s": ts,
-                "side": side,
-                "step_target": target,
-                "index": bl.mon_dir.get(name),
-                "name": name,
-                "value": val,
-            })
-    return seg
+    seg = os.path.join(out_dir, tag)
+    bl.print_log(seg + ".csv")
+    bl.print_log(seg + ".png")
 
 
 def run_side(
@@ -169,18 +77,14 @@ def run_side(
     side: str,
     steps: List[float],
     hold: float,
-    all_rows: List[dict],
-) -> List[Tuple[float, dict]]:
-    """
-    side: 'L' | 'R'
-    对侧始终 0；返回 [(target, metrics), ...]
-    """
+    out_dir: str,
+) -> None:
+    """side: 'L' | 'R'，对侧始终 0；每段一个原始 CSV。"""
     assert side in ("L", "R")
     rpm_key = "L0_rpm" if side == "L" else "R0_rpm"
     tgt_key = "L_tgt" if side == "L" else "R_tgt"
     rpm_name = MONITOR_WANT[rpm_key]
     tgt_name = MONITOR_WANT[tgt_key]
-    summary: List[Tuple[float, dict]] = []
 
     # 起始停车，确保 is_busy=false 且速度环可接收 0x85
     bl.stop_move()
@@ -200,49 +104,30 @@ def run_side(
         bl.sleep(hold)
         bl.end_log()
 
-        seg = _capture(bl, side, target, all_rows)  # 本段 8 项长表
-
-        rpm_rows = _rpm_rows(seg, rpm_name, rpm_key)
-        m = steady_metrics(rpm_rows, rpm_key, target)
-        summary.append((target, m))
+        capture(bl, out_dir, "%s_t%+g" % (side, target))
 
         st = bl.stats([rpm_name, tgt_name])
-        # 即时打印本段
         if st[rpm_name]["n"] == 0:
             print("     （本段无有效转速样本）")
         else:
-            print(
-                "     稳态转速=%.2f  误差=%+.2f  峰值=%.2f  超调=%.1f%%  上升≈%s"
-                % (
-                    m["ss_mean"],
-                    m["ss_err"],
-                    m["peak_abs"],
-                    m["overshoot_pct"],
-                    ("%.3fs" % m["rise_t"]) if m["rise_t"] is not None else "-",
-                )
-            )
-            if m["overshoot_pct"] < -0.5:
-                print("     [注意] 峰值未达目标（欠调 %.1f%%），不是超调" % m["overshoot_pct"])
-            # 对照指令目标回读
-            tgt_mean = st[tgt_name]["mean"]
-            if tgt_mean is not None:
-                print("     回读 %s 均值=%.2f（应接近目标）" % (tgt_key, tgt_mean))
+            print("     转速均值=%.2f  |转速|峰=%.2f  回读 %s=%.2f"
+                  % (st[rpm_name]["mean"] or 0.0,
+                     st[rpm_name]["abs_max"] or 0.0,
+                     tgt_key, st[tgt_name]["mean"] or 0.0))
 
     # 段末停车
     bl.spin_target(0.0, 0.0)
     bl.sleep(0.3)
     bl.stop_move()
-    return summary
 
 
 def run_both(
     bl: BackendLink,
     steps: List[float],
     hold: float,
-    all_rows: List[dict],
-) -> List[Tuple[float, dict, dict]]:
-    """双侧同目标阶跃，用于看左右对齐。"""
-    summary = []
+    out_dir: str,
+) -> None:
+    """双侧同目标阶跃，用于看左右对齐；每段一个原始 CSV。"""
     bl.stop_move()
     bl.sleep(0.3)
     bl.spin_target(0.0, 0.0)
@@ -255,26 +140,15 @@ def run_both(
         bl.sleep(hold)
         bl.end_log()
 
-        seg = _capture(bl, "both", target, all_rows)
-
-        ml = steady_metrics(_rpm_rows(seg, MONITOR_WANT["L0_rpm"], "L0_rpm"), "L0_rpm", target)
-        mr = steady_metrics(_rpm_rows(seg, MONITOR_WANT["R0_rpm"], "R0_rpm"), "R0_rpm", target)
-        summary.append((target, ml, mr))
-        print(
-            "     L稳态=%.2f(err%+.2f)  R稳态=%.2f(err%+.2f)  左右差=%.2f"
-            % (
-                ml.get("ss_mean", float("nan")),
-                ml.get("ss_err", float("nan")),
-                mr.get("ss_mean", float("nan")),
-                mr.get("ss_err", float("nan")),
-                (ml.get("ss_mean", 0) - mr.get("ss_mean", 0)),
-            )
-        )
+        capture(bl, out_dir, "both_t%+g" % target)
+        st = bl.stats([MONITOR_WANT["L0_rpm"], MONITOR_WANT["R0_rpm"]])
+        print("     L转速均值=%.2f  R转速均值=%.2f"
+              % (st[MONITOR_WANT["L0_rpm"]]["mean"] or 0.0,
+                 st[MONITOR_WANT["R0_rpm"]]["mean"] or 0.0))
 
     bl.spin_target(0.0, 0.0)
     bl.sleep(0.3)
     bl.stop_move()
-    return summary
 
 
 def main() -> None:
@@ -292,10 +166,8 @@ def main() -> None:
         help="阶跃目标序列，逗号分隔，单位 pct（可负）",
     )
     ap.add_argument("--hold", type=float, default=1.5, help="每段保持时间（秒）")
-    ap.add_argument("--csv", default="motor_speed_step.csv",
-                    help="时序 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
-    ap.add_argument("--png", default="motor_speed_step.png",
-                    help="结果图文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
+    ap.add_argument("--tag", default="run1",
+                    help="原始段目录后缀；落 backend/pytest/probe_data/<层>/motor_speed_step_<tag>/")
     args = ap.parse_args()
 
     steps = [float(x) for x in args.steps.split(",") if x.strip() != ""]
@@ -303,9 +175,10 @@ def main() -> None:
         print("阶跃序列为空")
         sys.exit(1)
 
-    all_rows: List[dict] = []
     # with 退出时 __exit__ 自动收车收尾（目标归零 / 8电机0V / 刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
+        out_dir = bl.out_path("motor_speed_step_%s" % args.tag)   # 每段一个原始 CSV
+        os.makedirs(out_dir, exist_ok=True)
         print("监控表共 %d 项" % len(bl.mon_dir))
         indices = resolve_indices(bl.mon_dir)
         for k in SUB_KEYS:
@@ -318,21 +191,12 @@ def main() -> None:
               % (args.side, steps, args.hold))
 
         if args.side == "both":
-            run_both(bl, steps, args.hold, all_rows)
+            run_both(bl, steps, args.hold, out_dir)
         else:
-            run_side(bl, args.side, steps, args.hold, all_rows)
+            run_side(bl, args.side, steps, args.hold, out_dir)
 
-        print("\n调参提示：")
-        print("  · 稳态偏低且 Vcmd 未饱和 → 略增 kf 或 kp")
-        print("  · 超调大/振荡 → 降 kp，kd 小量试")
-        print("  · 静差长期不消 → 略增 ki（注意抗饱和已开启）")
-        print("  · 启动迟缓 → 查 volt_min / static_deadzone（先用 motor_v_test 核对开环）")
-        print("  · 左右同目标稳态差大 → 回查 volt_factor / 机械阻力")
-
-        if args.csv and all_rows:
-            bl.save_csv(args.csv, all_rows, TIMING_FIELDS)
-        if args.png and all_rows:
-            plot_steps(bl.out_path(args.png), all_rows, steps)
+    print("\n原始段目录：%s" % out_dir)
+    print("（上升时间 / 超调 / 稳态误差交给日抛分析脚本读这些 CSV）")
 
 
 if __name__ == "__main__":

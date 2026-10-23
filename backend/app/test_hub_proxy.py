@@ -12,11 +12,14 @@ from __future__ import annotations
 import asyncio
 import struct
 
+from .dataclass import DirTable, DirectoryEvent, MenuItem, MonitorSample, ValueEvent
 from .hub import Hub
 from .protocol import (
     CmdDirItem,
     CmdField,
     CmdPost,
+    MenuItem,
+    ValueType,
     build_frame,
     encode_value,
     ping,
@@ -152,6 +155,207 @@ def main() -> None:
     except ValueError:
         pass
     print("[ok] cmd 参数严格校验")
+
+    # --- 4.1 参数类型严格校验：字符串/布尔不进编帧层，明确报错 ---
+    try:
+        hub.cmd("直行", "0.1", 2.0)
+        raise AssertionError("字符串参数应报错")
+    except ValueError as e:
+        assert "需要数值" in str(e), e
+    try:
+        hub.cmd("直行", True, 2.0)
+        raise AssertionError("布尔参数应报错")
+    except ValueError:
+        pass
+    r = hub.cmd("直行", 1, 2)  # int 也放行（数值家族）
+    assert r.ok and r.args == [1, 2]
+    print("[ok] cmd 参数类型严格校验")
+
+    # --- 4.2 set_tunable 类型校验 + resolve_tunable 吃数字字符串 ---
+    hub.tunable_dir[7] = MenuItem(index=7, type=ValueType.Float, tag=0, name="kp", unit="", value=1.0)
+    hub._name_to_tun["kp"] = 7
+    assert hub.resolve_tunable("7") == 7, "数字字符串应按 index 解析（与 resolve_monitor 一致）"
+    assert hub.resolve_tunable("kp") == 7
+    try:
+        hub.set_tunable_value("kp", "1.5")
+        raise AssertionError("字符串值应报错")
+    except ValueError as e:
+        assert "需要数值" in str(e), e
+    r = hub.set_tunable_value("kp", 1.5)
+    assert r.ok and r.index == 7
+    print("[ok] set_tunable 类型校验 + resolve_tunable 数字字符串")
+
+    # --- 4.3 calc 白名单：常量只收数值，字符串/布尔/None 明确拒绝 ---
+    hub.monitor_dir[0] = MenuItem(index=0, type=ValueType.Float, tag=0, name="x", unit="m", value=0.0)
+    hub._name_to_mon["x"] = 0
+    try:
+        hub.calc("x + 'abc'")
+        raise AssertionError("字符串常量应报错")
+    except ValueError as e:
+        assert "只允许数值常量" in str(e), e
+    for bad in ("x + None", "x + True", "x + [1]", "x if 1 else 0", "len(x)"):
+        try:
+            hub.calc(bad)
+            raise AssertionError(f"{bad!r} 应报错")
+        except ValueError:
+            pass
+    # 数值常量放行：纯常量没有监控项名，报的是"没有监控项"而非常量错误
+    try:
+        hub.calc("1 + 2")
+        raise AssertionError("纯常量应因无监控项报错")
+    except ValueError as e:
+        assert "没有监控项" in str(e), e
+    # 名字不存在仍由 resolve_monitor 抛 KeyError（删掉的白名单死条件不背这个锅）
+    try:
+        hub.calc("不存在的项 + 1")
+        raise AssertionError("不存在的项应报 KeyError")
+    except KeyError:
+        pass
+    print("[ok] calc 白名单常量校验")
+
+    # --- 4.4 calc 端到端：运算符/同拍配对/window/agg 全链路 ---
+    hub.monitor_dir[1] = MenuItem(index=1, type=ValueType.Float, tag=0, name="y", unit="m", value=0.0)
+    hub._name_to_mon["y"] = 1
+    hub.monitor_dir[2] = MenuItem(index=2, type=ValueType.Float, tag=0, name="z", unit="m", value=0.0)
+    hub._name_to_mon["z"] = 2
+    hub.monitor_latest[2] = MonitorSample(1.0, None)  # z 无历史序列，只有当前值
+    hub.log_reg.update({0, 1})
+    hub._stamp_ms = 1000
+    hub.start_log()
+    hub._record(0, 10.0, 1000)
+    hub._record(1, 2.0, 1000)
+    hub._record(0, 20.0, 1010)
+    hub._record(1, 4.0, 1010)
+    hub.end_log()
+    r = hub.calc("x - y", agg="mean")
+    assert r.value == 12.0 and r.n == 2, r            # (10-2 + 20-4)/2
+    r = hub.calc("x - y")
+    assert r.agg == "none" and r.series == [(0, 8.0), (10, 16.0)], r
+    r = hub.calc("x - y", agg="sum")
+    assert r.value == 24.0, r
+    r = hub.calc("x - y", agg="mean", window=[0, 5])
+    assert r.value == 8.0, r                          # 窗口只留 t=0 那一拍
+    r = hub.calc("x + z", agg="mean")
+    assert r.value == 16.0 and "z" in r.missing, r    # z 全程用当前值 1.0
+    try:
+        hub.calc("x - y", agg="avg")
+        raise AssertionError("不支持的 agg 应报错")
+    except ValueError as e:
+        assert "不支持的聚合" in str(e), e
+    print("[ok] calc 端到端（运算/配对/window/agg/单值项）")
+
+    # --- 4.5 calc 运算符白名单收紧：% // 位运算必须 400，不能到 eval 才 KeyError ---
+    # 放行 ast.operator 基类时它们能过校验，然后 ops 表查不到 → KeyError → 路由当 404
+    # （伪装成"监控项不存在"）。这里连 KeyError 一起断言，防止以后又改成放行基类。
+    for bad in ("x % 2", "x // 2", "x & 1", "x | 1", "x ^ 1", "x << 1", "x >> 1"):
+        try:
+            hub.calc(bad)
+            raise AssertionError(f"{bad!r} 应报错")
+        except KeyError:
+            raise AssertionError(f"{bad!r} 漏过白名单，到 eval 才 KeyError（会被路由当 404）")
+        except ValueError as e:
+            assert "只允许监控项名" in str(e), e
+    print("[ok] calc 未支持的运算符一律 400（% // 位运算不再伪装 404）")
+
+    # --- 4.6 calc 结果收口：复数/溢出就地 400，不留到 JSON 序列化时才炸 ---
+    for bad, why in (("(-x) ** 0.5", "复数"), ("x ** 10000", "溢出")):
+        try:
+            hub.calc(bad)
+            raise AssertionError(f"{bad!r} 应报{why}")
+        except ValueError as e:
+            assert "不是有限实数" in str(e) or "溢出" in str(e), e
+    print("[ok] calc 复数/溢出结果就地报错")
+
+    # --- 4.7 window 形状校验：长度不足不能 500，反序要明说 ---
+    for bad, kw in (([100], "元素"), ([400, 100], "反")):
+        try:
+            hub.calc("x - y", window=bad)
+            raise AssertionError(f"window={bad} 应报错")
+        except ValueError as e:
+            assert kw in str(e), e
+    print("[ok] calc window 形状校验（长度/反序都 400，不再 IndexError 500）")
+
+    # --- 4.8 "在目录里但从没收到过值" 必须 400，不能伪装 404 ---
+    hub.monitor_dir[3] = MenuItem(index=3, type=ValueType.Float, tag=0, name="nov",
+                                  unit="m", value=0.0)
+    hub._name_to_mon["nov"] = 3     # 故意不放 monitor_latest：从没收到过任何值
+    for expr in ("nov", "nov + z"):
+        try:
+            hub.calc(expr)
+            raise AssertionError(f"{expr!r} 应报错")
+        except KeyError:
+            raise AssertionError(f"{expr!r} 漏出 KeyError（会被路由当 404「项不存在」）")
+        except ValueError as e:
+            assert "还没有任何取值" in str(e), e
+    print("[ok] calc 无取值项报 400（不再伪装 404）")
+
+    # --- 4.9 agg 校验先于配点：拼错的 agg 不能被"没有可配对的有效点"盖掉 ---
+    try:
+        hub.calc("x - y", agg="avg", window=[900, 999])
+        raise AssertionError("拼错的 agg 应报错")
+    except ValueError as e:
+        assert "不支持的聚合" in str(e), e
+    print("[ok] calc agg 校验先于配点")
+
+    # --- 4.10 有效点数 = 各项同拍交集，与谁是基准项无关 ---
+    # 基准项取 sorted(seq)[0]（按项名）。让"样本少的项"当基准，点数仍应是交集大小 3。
+    hub.monitor_dir[4] = MenuItem(index=4, type=ValueType.Float, tag=0, name="a1",
+                                  unit="m", value=0.0)
+    hub._name_to_mon["a1"] = 4
+    hub.log_reg.update({0, 4})
+    hub.start_log()
+    for t in (0, 10, 20, 30, 40):          # x 5 点
+        hub._record(0, float(t), 3000 + t)
+    for t in (0, 10, 20):                  # a1 只有 3 点，且名字排在 x 前 → 当基准
+        hub._record(4, 5.0, 3000 + t)
+    hub.end_log()
+    r = hub.calc("a1 + x", agg="mean")
+    assert r.n == 3, r
+    print("[ok] calc 有效点数取各项同拍交集（与基准项是谁无关）")
+
+    # --- 4.11 lag_ms：固件时间轴上的新鲜度主判据（看门狗用）---
+    # 直接注事件（帧解码由 test_protocol 覆盖，这里测 Hub 侧消费）：
+    # ValueEvent.t_ms 是固件原始 16bit 戳；DirectoryEvent 建目录项。
+    for i, nm in ((0, "x"), (1, "yaw")):
+        hub._on_serial_event(DirectoryEvent(
+            table=DirTable.monitor,
+            item=MenuItem(index=i, type=ValueType.Float, tag=0, name=nm, unit="m", value=0.0)))
+    hub._on_serial_event(DirectoryEvent(
+        table=DirTable.monitor,
+        item=MenuItem(index=5, type=ValueType.Float, tag=0, name="w", unit="m", value=0.0)))
+    assert hub.read_item("w").lag_ms is None, "只有目录初值（无推送史）lag 应为 None"
+
+    hub._on_serial_event(ValueEvent(index=0, value=1.0, t_ms=1000))
+    hub._on_serial_event(ValueEvent(index=1, value=2.0, t_ms=1000))
+    assert hub.read_item("x").lag_ms == 0.0 and hub.read_item("yaw").lag_ms == 0.0
+
+    hub._on_serial_event(ValueEvent(index=0, value=1.1, t_ms=1100))   # 只有 x 的新帧
+    assert hub.read_item("x").lag_ms == 0.0
+    assert hub.read_item("yaw").lag_ms == 100.0, hub.read_item("yaw").lag_ms
+
+    hub._on_serial_event(ValueEvent(index=0, value=1.2, t_ms=2000))
+    assert hub.read_item("yaw").lag_ms == 1000.0, "停推项应落后 1000ms（>300 即旧）"
+
+    # 回绕：65530 → 6 实际只差 12ms（先断流跳到 65530，再连续回绕）
+    hub._fw_frontier_at -= 2.0
+    hub._on_serial_event(ValueEvent(index=0, value=1.3, t_ms=65530))
+    hub._on_serial_event(ValueEvent(index=1, value=2.3, t_ms=65530))
+    hub._on_serial_event(ValueEvent(index=0, value=1.4, t_ms=6))
+    assert hub._fw_frontier == 6, hub._fw_frontier
+    assert hub.read_item("yaw").lag_ms == 12.0, hub.read_item("yaw").lag_ms
+
+    # 断流 >1s 后第一帧无条件采纳为前沿：mod 意义下"落后"也可能是掉线恢复的新流
+    hub._fw_frontier_at -= 2.0
+    hub._on_serial_event(ValueEvent(index=0, value=1.5, t_ms=40000))
+    assert hub._fw_frontier == 40000, hub._fw_frontier
+    assert hub.read_item("x").lag_ms == 0.0
+    # 跳变后还没拿到新帧的项：mod 差巨大 → 正确判旧
+    assert hub.read_item("yaw").lag_ms == 40006.0, hub.read_item("yaw").lag_ms
+    # 连续流中"落后"的帧只可能是重复帧：不推进前沿
+    hub._on_serial_event(ValueEvent(index=1, value=2.9, t_ms=39000))
+    assert hub._fw_frontier == 40000, "重复帧不应推动前沿"
+    assert hub.read_item("yaw").lag_ms == 1000.0, hub.read_item("yaw").lag_ms
+    print("[ok] lag_ms 新鲜度判据（无推送史/同帧/停推/回绕/断流跳变/重复帧）")
 
     # --- 5. 停车命令识别 ---
     hub._stop_cmd_index = 0x80

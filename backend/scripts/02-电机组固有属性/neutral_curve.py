@@ -75,16 +75,6 @@ from motor_names import motor_names  # noqa: E402
 # ------------------------------------------------------------
 
 
-def motor_id(motor_name: str) -> int:
-    side = motor_name[0].upper()
-    n = int(motor_name[1])
-    if side == "L":
-        return n
-    if side == "R":
-        return 3 + n
-    raise ValueError(f"非法电机名称：{motor_name}")
-
-
 def side_id_name(mid: int) -> str:
     if 0 <= mid < 3:
         return f"L{mid}"
@@ -338,14 +328,6 @@ def make_voltage_list(vmax: float, step: float) -> list[float]:
     if not values or values[-1] < vmax - 1e-9:
         values.append(round(vmax, 5))
     return values
-
-
-def fine_range(lo: float, hi: float, step: float) -> list[float]:
-    lo = max(0.0, lo)
-    hi = max(lo, hi)
-    return make_voltage_list(hi, step)[
-        : int(math.floor(lo / step + 1e-9)) + 1
-    ] + []
 
 
 def unique_sorted(values):

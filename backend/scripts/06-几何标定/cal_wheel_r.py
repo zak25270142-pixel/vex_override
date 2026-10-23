@@ -31,6 +31,7 @@ set_spin 是最朴素的双侧同速，够用。
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -51,10 +52,8 @@ def main():
     ap.add_argument("-s", "--speed", type=float, default=15.0,
                     help="双侧目标速度 pct（默认 15；慢一点好量）")
     ap.add_argument("-t", "--time", type=float, default=2.0, help="走多久 s")
-    ap.add_argument("--used", type=float, default=0.034925,
-                    help="当前 chassis.h 里的 wheel_r，单位 m（默认 0.034925 = 2.75 英寸直径的半径）")
-    ap.add_argument("--actual", type=float, default=None,
-                    help="卷尺量到的实际位移 m；不给则走完交互式询问")
+    ap.add_argument("--tag", default="run1",
+                    help="原始段目录后缀；落 backend/pytest/probe_data/<层>/cal_wheel_r_<tag>/")
     args = ap.parse_args()
 
     if args.speed <= 0 or args.speed > 100:
@@ -64,6 +63,8 @@ def main():
 
     want = POS_NAMES + [NAME_YAW] + SPEED_NAMES
     with BackendLink(args.base) as bl:
+        out_dir = bl.out_path("cal_wheel_r_%s" % args.tag)   # 行驶段原始波形
+        os.makedirs(out_dir, exist_ok=True)
         missing = [n for n in want if n not in bl.mon_dir]
         if missing:
             sys.exit("监控表缺项: %s\n已有: %s" % (missing, sorted(bl.mon_dir)))
@@ -84,6 +85,7 @@ def main():
 
         print("\n  起点  X=%+.3f Y=%+.3f  yaw=%+.1f°" % (x0, y0, yaw0))
         print("  走 %.0f pct × %.1f s …" % (args.speed, args.time))
+        bl.start_log()
         bl.spin_target(args.speed, args.speed)
 
         t_end = time.perf_counter() + args.time
@@ -98,6 +100,10 @@ def main():
 
         bl.spin_target(0.0, 0.0)
         bl.sleep(0.3)
+        bl.end_log()
+        seg = os.path.join(out_dir, "run")
+        bl.print_log(seg + ".csv")
+        bl.print_log(seg + ".png")
         bl.stop_move()
         bl.sleep(SETTLE_S)
 
@@ -111,42 +117,7 @@ def main():
             print("\n  位移太小，没法定标：加大 -s 或 -t，或先确认车真的在走")
             return
 
-        actual = args.actual
-        if actual is None:
-            try:
-                actual = float(input("\n  卷尺量到的实际直线距离 (m) > ").strip())
-            except (EOFError, ValueError):
-                print("  没拿到实测值，退出")
-                return
-        if actual <= 0:
-            raise ValueError("实测距离必须 > 0")
-
-        new_r = args.used * actual / reported
-        print("\n===== 结果 =====")
-        print("  当前 wheel_r      %.5f m" % args.used)
-        print("  里程计读数        %.4f m" % reported)
-        print("  实际位移          %.4f m" % actual)
-        print("  比例 实际/读数    %.4f" % (actual / reported))
-        print("\n  填进 include/chassis.h：")
-        print("    float wheel_r = %.5ff;  // 定位轮半径，单位 m" % new_r)
-        if abs(actual / reported - 1.0) > 0.05:
-            print("\n  [warn] 偏差超过 5%%：先确认卷尺量的是直线距离、轮子没打滑，")
-            print("         再怀疑定位轮直径标称值或轮子在地面有滑移。")
-
-        # 必须落盘：单次测量 + 全程只取首尾两个快照，
-        # 不落的话打滑/偏航/地面不平全折进一个比例系数，事后无从复核
-        bl.save_csv("cal_wheel_r.csv", [{
-            "used_r": args.used, "reported_m": round(reported, 4),
-            "actual_m": actual, "ratio": round(actual / reported, 4),
-            "new_r": round(new_r, 5),
-            "x0": round(x0, 4), "y0": round(y0, 4), "yaw0": round(yaw0, 2),
-            "x1": round(x1, 4), "y1": round(y1, 4), "yaw1": round(yaw1, 2),
-            "yaw_drift_deg": round(yaw1 - yaw0, 2),
-            "speed_pct": args.speed, "time_s": args.time,
-        }], ["used_r", "reported_m", "actual_m", "ratio", "new_r",
-             "x0", "y0", "yaw0", "x1", "y1", "yaw1", "yaw_drift_deg",
-             "speed_pct", "time_s"])
-        print("\n[out] 落盘 cal_wheel_r.csv（首尾位姿 + 比例，供事后复核）")
+        print("\n  原始段：%s（用卷尺量出实际直线距离后，由分析脚本算 wheel_r）" % out_dir)
 
 
 if __name__ == "__main__":

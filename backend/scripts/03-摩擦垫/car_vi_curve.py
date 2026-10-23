@@ -29,7 +29,7 @@ o 爬到 per-side 持续起步 → 该侧三台 vact 的均值即固件起步所
 位置让单次读数差 2~3 个量化档），取中位。
 
 【前置】
-  1. 着地（垫子补的就是地面阻力分摊），标定方向留空 ~0.6m（正向=车前、反向=车后），
+  1. 着地（垫子补的就是地面阻力分摊），标定方向留空 ~1.5m（正向=车前、反向=车后），
      USB 松量固定，人手旁
   2. ① 的 volt_min/factor 已知（--vmin/--factor 传入；未传默认全 0.5/全 1.0，
      此时 map 退化成近似恒压，仅作兜底）
@@ -64,7 +64,7 @@ o 爬到 per-side 持续起步 → 该侧三台 vact 的均值即固件起步所
 """
 
 import argparse
-import csv
+import os
 import sys
 import time
 from pathlib import Path
@@ -84,22 +84,9 @@ STATE = {"L": "左环状态", "R": "右环状态"}
 X_NAME = "全局X"
 WANT = ([I_NAME[m] for m in MOTORS] + [V_NAME[m] for m in MOTORS]
         + [W0["L"], W0["R"], STATE["L"], STATE["R"], X_NAME])
-CSV_COLS = (["trial", "phase", "o", "L_rpm", "R_rpm",
-             "L_ma", "R_ma", "L_ratio", "R_ratio"]   # 判据的三个量（|转速|均值 / ≥1pct 占比）
-            + [V_NAME[m] for m in MOTORS] + [I_NAME[m] for m in MOTORS])
-
-
 def mean(xs):
     xs = [x for x in xs if x is not None]
     return sum(xs) / len(xs) if xs else float("nan")
-
-
-def median(xs):
-    xs = sorted(xs)
-    n = len(xs)
-    if n == 0:
-        return float("nan")
-    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
 
 
 def parse_kv(text: str, what: str) -> dict:
@@ -133,8 +120,24 @@ def zero_all(bl) -> None:
     apply_map(bl, {m: 0.0 for m in MOTORS})
 
 
-def sample(bl, hold: float, items) -> dict:
-    """hold 秒内 ~40ms 轮询采样监控缓存，返回 {item: [values]}。"""
+# 稳态转速上叠着"轮子每转一次"的周期起伏，周期(s) × 转速(pct) ≈ 10.1（实测）。
+# 摩擦垫标定工作在 1~3pct 蠕动区，周期可达 3~10s——窗固定 0.7s 时，
+# 窗切到波峰判"转了"、切到波谷判"没转"，同一档换个时刻结论可能相反。
+RIPPLE_CYCLE_PCT_S = 10.1
+MIN_CYCLES = 3.0
+HOLD_CAP_S = 8.0     # 蠕动区 3 个周期要几十秒，封顶免得单档拖太久
+
+
+def sample(bl, hold: float, items,
+           min_cycles: float = MIN_CYCLES, hold_cap: float = HOLD_CAP_S) -> dict:
+    """按当前转速定窗长，窗内 ~40ms 轮询采样监控缓存，返回 {item: [values]}。"""
+    v = abs(bl.latest(W0["L"]) or 0.0)
+    if v >= 1.0:
+        need = min_cycles * RIPPLE_CYCLE_PCT_S / v
+        if need > hold:
+            hold = min(need, hold_cap)
+            print("    [窗长] %.1fpct → 周期%.2fs，采样放 %.1fs（%.1f 个周期）"
+                  % (v, RIPPLE_CYCLE_PCT_S / v, hold, hold * v / RIPPLE_CYCLE_PCT_S))
     data = {k: [] for k in items}
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < hold:
@@ -177,44 +180,6 @@ def return_to(bl, x_ref: float, tol=0.02, timeout=12.0) -> None:
     time.sleep(0.2)
 
 
-def plot_pads(path, rows, move_pct, results):
-    """两栏：升压段 per-side 起步、降压段整车滚停，竖线标判据命中的那一档。"""
-    from plot_util import subplots, save, legend
-
-    def med(xs):
-        xs = sorted(xs)
-        n = len(xs)
-        return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
-
-    start_o = {s: med([r["static"][s]["o"] for r in results if s in r["static"]])
-               for s in "LR"}
-    stop_o = med([r["dynamic"]["o"] for r in results if r["dynamic"]]) if any(
-        r["dynamic"] for r in results) else None
-
-    fig, axes = subplots(2)
-    for ax, ph, title in ((axes[0][0], "up", "升压：per-side 持续起步"),
-                          (axes[0][1], "down", "降压：整车滚停")):
-        rs = [r for r in rows if r["phase"] == ph]
-        if rs:
-            ax.plot([r["o"] for r in rs], [r["L_rpm"] for r in rs], "o-", ms=3, label="左0转速")
-            ax.plot([r["o"] for r in rs], [r["R_rpm"] for r in rs], "s-", ms=3, label="右0转速")
-        ax.axhline(move_pct, color="gray", ls=":", lw=1)
-        ax.set_xlabel("输出档 o")
-        ax.set_ylabel("转速 / pct")
-        ax.set_title(title + ("（虚线=持续转动判据 %.1fpct）" % move_pct))
-        ax.grid(True, alpha=0.3)
-        legend(ax, fontsize=8)
-    for s, cn in (("L", "左"), ("R", "右")):
-        if start_o[s] is not None:
-            axes[0][0].axvline(start_o[s], color="tab:red", ls="--", lw=1)
-            axes[0][0].text(start_o[s], move_pct, " %s侧起步" % cn, fontsize=8,
-                            color="tab:red")
-    if stop_o is not None:
-        axes[0][1].axvline(stop_o, color="tab:green", ls="--", lw=1)
-        axes[0][1].text(stop_o, move_pct, " 整车滚停", fontsize=8, color="tab:green")
-    save(fig, path)
-
-
 def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
     """一轮：随机化停位 → 升压找 per-side 持续起步 → 降压找整车滚停 → 复位。"""
     print("\n===== 第 %d/%d 试 =====" % (idx + 1, args.trials))
@@ -238,7 +203,12 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
         bl.check_abort()
         apply_map(bl, motor_volts(vmin, factor, args.vmax, o))
         time.sleep(args.settle)  # 放掉换档/起步爬升，判据窗只看稳住的部分
-        data = sample(bl, args.hold, WANT)
+        bl.start_log()
+        data = sample(bl, args.hold, WANT, args.min_cycles, args.hold_cap)
+        bl.end_log()
+        seg = os.path.join(args.out_dir, "t%d_up_o%.4f" % (idx, o))
+        bl.print_log(seg + ".csv")
+        bl.print_log(seg + ".png")
         x = mean(data[X_NAME])
         if abs(x - x_ref) > args.fence_m:
             zero_all(bl)
@@ -284,7 +254,12 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
             bl.check_abort()
             apply_map(bl, motor_volts(vmin, factor, args.vmax, o))
             time.sleep(args.settle)  # 放掉降档瞬态
-            data = sample(bl, args.hold, WANT)
+            bl.start_log()
+            data = sample(bl, args.hold, WANT, args.min_cycles, args.hold_cap)
+            bl.end_log()
+            seg = os.path.join(args.out_dir, "t%d_down_o%.4f" % (idx, o))
+            bl.print_log(seg + ".csv")
+            bl.print_log(seg + ".png")
             x = mean(data[X_NAME])
             if abs(x - x_ref) > args.fence_m:
                 zero_all(bl)
@@ -331,7 +306,6 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description="② 静/动摩擦垫标定：着地·等流 map 爬坡")
     ap.add_argument("--base", default="http://127.0.0.1:8000", help="后端地址")
-    ap.add_argument("--tag", default=time.strftime("%Y%m%d_%H%M"), help="数据文件标记")
     ap.add_argument("--vmin", default="", help="① 的各台 volt_min，如 L0=0.51,L1=0.48（缺省全 0.5）")
     ap.add_argument("--factor", default="", help="① 的各台 volt_factor，如 L0=1,L1=0.93（缺省全 1.0）")
     ap.add_argument("--vm0", type=float, default=0.5,
@@ -344,16 +318,19 @@ def main() -> None:
     ap.add_argument("--o-step", type=float, default=0.004, help="输出档步长 o（≈0.045V/档）")
     ap.add_argument("--over", type=float, default=0.02, help="降压段起点高出静摩擦点多少 o")
     ap.add_argument("--hold", type=float, default=0.7, help="每档采样窗时长 s")
+    ap.add_argument("--min-cycles", type=float, default=MIN_CYCLES,
+                    help="低速档采样窗至少覆盖几个 1 次/圈周期（场地短时可降到 1）")
+    ap.add_argument("--hold-cap", type=float, default=HOLD_CAP_S,
+                    help="单档采样窗上限 s（场地短时降低，避免一档走太远）")
     ap.add_argument("--settle", type=float, default=0.4,
                     help="换档后先等多久再开采样窗 s（排掉起步/降档瞬态；"
                          "不加它窗内均值被瞬态稀释，静垫偏高、动垫偏低）")
     ap.add_argument("--move-pct", type=float, default=2.0, help="持续转动判据的转速阈值 pct")
     ap.add_argument("--ratio", type=float, default=0.7, help="持续转动判据的 ≥1pct 样本占比")
     ap.add_argument("--trials", type=int, default=3, help="重复轮数（试间随机化停位，取中位）")
-    ap.add_argument("--fence-m", type=float, default=0.6, help="相对本轮起点的位移围栏 m")
-    ap.add_argument("--csv", default="", help="结果 CSV（默认 probe_data/<层>/cal_pads_<tag>.csv）")
-    ap.add_argument("--png", default=None,
-                    help="结果图（默认 cal_pads_<tag>.png，落 probe_data/<层>/）；空字符串跳过")
+    ap.add_argument("--fence-m", type=float, default=1.5, help="相对本轮起点的位移围栏 m")
+    ap.add_argument("--tag", default=time.strftime("%Y%m%d_%H%M"),
+                    help="原始段目录；落 backend/pytest/probe_data/<层>/cal_pads_<tag>/")
     args = ap.parse_args()
 
     vmin = {m: 0.5 for m in MOTORS}
@@ -368,6 +345,8 @@ def main() -> None:
     rows = []
     results = []
     with BackendLink(args.base) as bl:
+        args.out_dir = bl.out_path("cal_pads_%s" % args.tag)   # 每档一段原始 CSV
+        os.makedirs(args.out_dir, exist_ok=True)
         missing = [n for n in WANT if n not in bl.mon_dir]
         if missing:
             sys.exit("监控表缺项: %s" % missing)
@@ -399,53 +378,8 @@ def main() -> None:
             bl.spin_target(0.0, 0.0)
             bl.stop_move()
 
-    # ---------- 汇总：各试中位 → 垫子建议 ----------
-    print("\n================ 摩擦垫建议（在线调参项，不用烧录）================")
-    out = {}
-    for side in "LR":
-        # 反向时 vact 为负，统一取幅值再减记账口径
-        vals = [abs(r["static"][side]["vact"]) - args.vm0
-                for r in results if side in r["static"]]
-        if vals:
-            out["%s_st" % side] = median(vals)
-            print("  %s静摩擦 = %.3f V   （各试 %s，减 vm0=%.2f）"
-                  % (SIDE_CN[side], out["%s_st" % side],
-                     " ".join("%.3f" % v for v in vals), args.vm0))
-        else:
-            print("  %s静摩擦 = 无有效数据" % SIDE_CN[side])
-    dvals = [abs(r["dynamic"]["vact"]) - args.vm0 for r in results if r["dynamic"]]
-    if dvals:
-        out["dy"] = median(dvals)
-        print("  动摩擦 = %.3f V（左右同值；各试 %s，减 vm0=%.2f）"
-              % (out["dy"], " ".join("%.3f" % v for v in dvals), args.vm0))
-    else:
-        print("  动摩擦 = 无有效数据")
-
-    # ① 的负载下复核：起步档各台电流应大致相等（同侧三台比）
-    print("\n① 复核（起步档各台电流比，同侧内应≈1；明显不齐=① 的 factor/volt_min 可疑）：")
-    for r in results:
-        for side in "LR":
-            if side not in r["static"]:
-                continue
-            c = r["static"][side]["cur"]
-            a = c[side + "0"]
-            if abs(a) > 1e-6:  # 反向时电流为负
-                print("  %s侧: I1/I0=%.2f  I2/I0=%.2f  (I0=%.2fA)"
-                      % (SIDE_CN[side], c[side + "1"] / a, c[side + "2"] / a, a))
-
-    print("\n验收：填垫后闭环纯前馈（kp=ki=kd=0）打 1/2/3pct 蠕行——")
-    print("  恰好跟住=对；蹿出去=垫子大砍；不动=垫子小加（在线调 1~2 轮收敛）。")
-
-    csv_path = bl.out_path(args.csv or "cal_pads_%s.csv" % args.tag)
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:  # BOM：Excel 中文友好
-        w = csv.DictWriter(f, fieldnames=CSV_COLS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
-    print("\nCSV：%s（%d 行）" % (csv_path, len(rows)))
-
-    png = "" if args.png == "" else (args.png or "cal_pads_%s.png" % args.tag)
-    if png and rows:
-        plot_pads(bl.out_path(png), rows, args.move_pct, results)
+    print("\n原始段目录：%s" % args.out_dir)
+    print("（静/动摩擦垫 = 起步/滚停档 vact 幅值 - vm0，交给日抛分析脚本算）")
 
 
 if __name__ == "__main__":

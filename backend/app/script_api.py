@@ -27,7 +27,7 @@
 
 取整段统计/波形（一段 = 一次 start_log → end_log，时间是"相对本段零点的秒"）：
     v.stats(["x"])                      # 后端算好 n/mean/abs_mean/... 直接给（整段）
-    v.wave(["x"])                       # 整段原始长表，自己画图或自行筛区间
+    v.print_log("run.csv")              # 整段原始点落盘（后缀决定 csv/png/json）
 """
 
 import json
@@ -136,7 +136,8 @@ class VexScript:
           v.read("x", "y", "yaw")   → {"x":.., "y":.., "yaw":..}（一次请求取多项）
         前提：该项已 sub(..., "push"/"log"/"both")，值才会持续更新。
         ⚠️ 读到的是后端缓存的最新值，推送断了以后会一直返回旧值。
-        做看门狗时务必用 read_item() 看 age_s，否则"值正常"可能是假象。
+        做看门狗时务必用 read_item() 看 lag_ms（落后最新帧 >300ms 或 None 即旧），
+        否则"值正常"可能是假象；age_s 只是到达新近度，恒定传输延迟下会骗人。
         """
         if not index_or_name:
             raise ValueError("read 至少给一个 index 或名字")
@@ -147,7 +148,8 @@ class VexScript:
         return {it["name"]: it["value"] for it in items}
 
     def read_item(self, index_or_name) -> dict:
-        """读单项完整信息：{index,name,value,unit,age_s}，age_s 为距上次推送秒数。"""
+        """读单项完整信息：{index,name,value,unit,age_s,lag_ms}。
+        看门狗主判 lag_ms（None 或 >300ms 即旧）；age_s 仅诊断 PC/传输侧抖动。"""
         return self._get("/api/value", index_or_name=index_or_name)[0]
 
     def read_many(self, keys: list[Any], missing_ok: bool = False) -> list[dict]:
@@ -283,19 +285,22 @@ class VexScript:
     def stats(self, names=None, thresholds=()) -> dict:
         """整段统计（后端算好，脚本不用自己攒样本）：names 不给就统计全部已记录的项。
         thresholds 里每个阈值 th 额外给出 ratio_ge[th]=|值|>=th 的样本占比。
-        只看子区间的话，用 wave() 拿原始点自己筛。"""
+        要原始点就 print_log 导 csv，再交给分析脚本读。"""
         return self._get(
             "/api/log/stats",
             index_or_name=_as_list(names),
             thresholds=list(thresholds),
         )
 
-    def wave(self, names=None) -> dict:
-        """整段原始样本长表：{"rows":[{"t","index","name","value"}]}。"""
-        return self._get(
-            "/api/log/window",
-            index_or_name=_as_list(names),
-        )
+    def calc(self, expr: str, agg: str = "", window=None) -> dict:
+        """对本段记录做表达式计算：监控项名 + 算术运算，再按需聚合。
+
+        expr：如 "左0电流 - 左1电流"、"(左0电流 + 左1电流 + 左2电流) / 3"
+        agg ：mean / sum / rms / std / max / min / abs_mean / count / median；
+              空串返回逐点序列 [[t_ms, value], ...]
+        """
+        return self._post("/api/log/calc",
+                          {"expr": expr, "agg": agg, "window": window})
 
     # ---------- 时序 ----------
 
@@ -338,7 +343,7 @@ class BackendLink:
             bl.sleep(0.4)
             bl.end_log()
             st = bl.stats(["左0转速"])["左0转速"]              # 本段整段统计
-            pts = bl.wave(["左0转速"])["左0转速"]              # 本段原始点（要筛子区间就自己筛）
+            bl.print_log("seg.csv")                            # 本段原始点落盘
         bl.print_log("pytest/motor_v.csv")       # 后缀决定格式：csv/json/png/jpg
         bl.close()
 
@@ -469,7 +474,7 @@ class BackendLink:
         """导出记录到后端机器（脚本和后端通常同机），并打印摘要。
 
         格式由 path 后缀决定：.json（无后缀默认）/ .csv / .png|.jpg（作图）。
-        path 带子目录会自动创建；不传则默认 pytest/log_<时间戳>.json。
+        path 带子目录会自动创建；不传则默认落后端 pytest/probe_data/log_<时间戳>.json。
         """
         return self.v.print_log(path)
 
@@ -481,16 +486,9 @@ class BackendLink:
             return {it["name"]: it for it in items}
         return dict(zip(_as_list(names), items))
 
-    def wave(self, names=None) -> dict:
-        """整段原始波形：{名字: [(相对本段零点的秒, 值), ...]}。
-        请求了却没数据的项也会给空列表，省得脚本到处判 KeyError。
-
-        与 stats() 的分工：stats 给整段统计量；wave 给原始点（画图、或自己筛子区间）。
-        """
-        out: dict[str, list] = {n: [] for n in _as_list(names) if isinstance(n, str)}
-        for r in self.v.wave(names)["rows"]:
-            out.setdefault(r["name"], []).append((r["t"] / 1000.0, r["value"]))
-        return out
+    def calc(self, expr: str, agg: str = "", window=None) -> dict:
+        """对本段记录做表达式计算并聚合（转发 VexScript.calc）。"""
+        return self.v.calc(expr, agg, window)
 
     # ---------- 产物落盘 ----------
 
@@ -546,7 +544,7 @@ class BackendLink:
         ⚠️ default 默认是 0.0 —— 取不到值时返回 0 而不是抛错。
         做安全围栏时要小心：传感器断线时 latest 会返回 0，
         看起来像"速度为零、很安全"，实际是"没数据"。
-        真要判安全，用 read() 拿完整信息看 age_s。
+        真要判安全，用 read_item() 拿完整信息看 lag_ms（None 或 >300ms 即旧）。
         """
         idx = self._idx(name_or_idx)
         if idx is None:
@@ -591,8 +589,13 @@ class BackendLink:
         return self.v.stop_move()
 
     def set_volt(self, motor_id: int, volts: float) -> dict:
-        """设单个电机电压：motor_id 电机编号(0~2=左1~3，3~5=右1~3，越界固件忽略)，volts 目标电压(单位 V)。"""
-        return self.cmd("设置电机电压", int(motor_id), float(volts))
+        """设单个电机电压：motor_id 电机编号(0~2=左1~3，3~5=右1~3，越界固件忽略)，volts 目标电压(单位 V)。
+
+        类型即契约，不做偷偷强转：motor_id 传 int、volts 传 int/float。
+        传字符串会被后端按目录字段类型挡下报 400（静默编 0 的坑已堵死）——
+        在封装里强转只会让"脚本通道放行字符串、HTTP 通道拒绝"，行为不一致。
+        """
+        return self.cmd("设置电机电压", motor_id, volts)
 
     def drive_volt(self, volts: float) -> None:
         """6 个电机全给同一个电压（开环测试用，绕开速度环直接看电机响应）。
@@ -603,8 +606,12 @@ class BackendLink:
             self.set_volt(mid, volts)
 
     def spin_target(self, left: float, right: float) -> dict:
-        """下发"设置底盘目标速度"：left/right 为左、右两侧的目标速度（走速度环）。"""
-        return self.cmd("设置底盘目标速度", float(left), float(right))
+        """下发"设置底盘目标速度"：left/right 为左、右两侧的目标速度（走速度环）。
+
+        类型即契约（同 set_volt）：传数字，别传字符串——后端按目录字段类型校验，
+        字符串会拿到信息明确的 400，而不是被静默编成 0。
+        """
+        return self.cmd("设置底盘目标速度", left, right)
 
     def set_tunable(self, name: str, value: float) -> dict:
         """写调参项（转发 VexScript.set_tunable）；下位机回显后上位机表格自会更新。"""

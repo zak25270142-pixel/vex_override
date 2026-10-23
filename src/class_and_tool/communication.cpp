@@ -395,6 +395,12 @@ void USB_Comm::monitor_tick()
     uint8_t pack_num = 0;
     uint16_t pos = 5; // tx_frame[2]=payloadlen(回填) [3][4]=time，项从[5]起
 
+    // 时间字段（小端）：本拍各帧共用 tx_stamp（tx_tick 开头已刷新）。
+    // 不填的话后端收到的时间戳恒定，整段样本会挤在同一个 10ms 桶里，
+    // 导出的宽表 CSV 只剩一行、时间轴全丢（波形与差分都没法做）。
+    tx_frame[3] = static_cast<uint8_t>(tx_stamp & 0xFF);
+    tx_frame[4] = static_cast<uint8_t>((tx_stamp >> 8) & 0xFF);
+
     auto flush_pack = [&]()
     {
         tx_frame[2] = static_cast<uint8_t>(pos - 3); // payloadlen：time+全部项

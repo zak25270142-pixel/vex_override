@@ -24,4 +24,6 @@ extern bool pc_took_control;
 extern const CMD_ITEM robot_cmds[];
 extern const uint8_t robot_cmd_count;
 
+extern void robot_init();
+
 #endif

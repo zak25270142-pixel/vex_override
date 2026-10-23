@@ -180,9 +180,34 @@ def encode_value8(type_: int, value: CellValue) -> bytes:
 
     为什么 SetTunable 用定长 8B：不然下位机在只知道cmd的情况下
     仍不能推断长度，处理会很麻烦，是一种妥协。
+
+    类型纪律：这是"值→字节"的最后一站，value 必须已经是目录字段声明类型的
+    Python 对应物——数值字段 int/float、Color 字段 "#RRGGBB" 字符串。类型不符
+    直接抛错，绝不静默编 0：静默 0 会让笔误（如把 "6.0" 当电压传给车）伪装成
+    "指令生效且值为 0"，是最难排查的一类故障。第一道校验在
+    hub.cmd / hub.set_tunable_value（边界处按目录字段类型挡，以 400 呈现），
+    这里是纵深防御，正常不可达。
     """
     buf = bytearray(8)
-    n = float(value) if isinstance(value, (int, float)) else 0.0
+    if type_ == ValueType.Color:
+        if not isinstance(value, str):
+            raise TypeError(f"Color 字段需要 '#RRGGBB' 字符串，收到 {type(value).__name__}: {value!r}")
+        s = value[1:] if value.startswith("#") else value
+        if len(s) != 6:
+            raise ValueError(f"Color 需要 6 位十六进制（如 '#ff0000'），收到 {value!r}")
+        rgb = int(s, 16)  # 非十六进制字符在此抛 ValueError
+        buf[0] = (rgb >> 16) & 0xFF
+        buf[1] = (rgb >> 8) & 0xFF
+        buf[2] = rgb & 0xFF
+        return bytes(buf)
+    # 其余均为数值型（含 Bool/OnOff）。bool 是 int 的子类，但把 true 当
+    # 电压/转速传几乎总是笔误——仅开关字段放行布尔
+    if isinstance(value, bool):
+        if type_ not in (ValueType.Bool, ValueType.OnOff):
+            raise TypeError(f"数值字段收到布尔值 {value!r}（类型码 {type_}）")
+    elif not isinstance(value, (int, float)):
+        raise TypeError(f"数值字段需要 int/float，收到 {type(value).__name__}: {value!r}")
+    n = float(value)
     if type_ == ValueType.UInt8:
         buf[0] = int(n) & 0xFF
     elif type_ == ValueType.Int8:
@@ -205,15 +230,6 @@ def encode_value8(type_: int, value: CellValue) -> bytes:
         struct.pack_into("<q", buf, 0, int(n))
     elif type_ in (ValueType.Bool, ValueType.OnOff):
         buf[0] = 1 if n else 0
-    elif type_ == ValueType.Color:
-        s = str(value)
-        if s.startswith("#"):
-            s = s[1:]
-        if len(s) == 6:
-            rgb = int(s, 16)
-            buf[0] = (rgb >> 16) & 0xFF
-            buf[1] = (rgb >> 8) & 0xFF
-            buf[2] = rgb & 0xFF
     return bytes(buf)
 
 # ---------- 组帧 ----------
@@ -441,7 +457,14 @@ class FrameParser:
                     # 目录帧要收完名字长度、单位长度才能算；调参回显收 1 字节 index 查类型表；
                     # 监控值帧自带 1B 长度前缀，收 1 字节就能定长（不依赖先拿到目录）。
                     if self.cmd == CmdPost.MonitorValue:
-                        if self.payload[0] > 0:
+                        # payloadlen==0 对监控值帧非法：固件 monitor_tick 只在 pack_num>0
+                        # 时 flush 且每帧必含 2B 时间戳（communication.cpp），真实帧
+                        # payloadlen>=2。收到 0 只可能是流错位把数据字节当成了长度字节
+                        # ——直接回找帧头，不猜长度（猜 expect=1 会多吞 2 字节；
+                        # 旧代码留着 expect=-1 更是一路吞到 MAX_PAYLOAD 还误记 overflow）
+                        if self.payload[0] == 0:
+                            self.state = _RxState.WaitHead
+                        else:
                             self.expect = 1 + self.payload[0] # len 只算它后面那些字节，加上 len 自身才是总长
                     elif self.cmd == CmdPost.TunableEcho:
                         self.expect = 1 + value_size(self.tunable_type[self.payload[0]])

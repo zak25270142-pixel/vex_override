@@ -18,39 +18,24 @@ motor_share_test.py —— 闭环载荷分流标定 volt_factor（车轮悬空�
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from app.script_api import BackendLink  # noqa: E402
-
-
-def plot_share(path, results):
-    """两栏：每档三台电流并排——factor 标对了就三根等高。"""
-    from plot_util import subplots, save, legend
-
-    targets = sorted(results.keys())
-    fig, axes = subplots(2)
-    for ax, sd in zip(axes[0], "LR"):
-        cn = "左" if sd == "L" else "右"
-        w = 0.8 / 3.0
-        for k, tgt in enumerate(targets):
-            for i, v in enumerate(results[tgt][sd][0]):   # (电流三台, 电压三台)
-                ax.bar(k + i * w, v, width=w,
-                       label="%s%d" % (cn, i) if k == 0 else None)
-        ax.set_xticks([k + 0.4 for k in range(len(targets))],
-                      ["%gpct" % t for t in targets])
-        ax.set_ylabel("电流 / A")
-        ax.set_title("%s侧 各台电流（等流则三根等高）" % cn)
-        ax.grid(True, alpha=0.3, axis="y")
-        legend(ax, fontsize=8)
-    save(fig, path)
-
 
 CUR = [f"{s}{i}电流" for s in "左右" for i in range(3)]
 VACT = [f"{s}{i}实际电压" for s in "左右" for i in range(3)]
 RPM = {"L": "左0转速", "R": "右0转速"}
+
+# 出图分组：左右各一张。每张内部由后端按单位再拆子图（V / A / pct 各自 y 轴）
+PNG_GROUPS = [
+    ("左", [f"左{i}实际电压" for i in range(3)] + [f"左{i}电流" for i in range(3)]
+     + [RPM["L"], "左指令转速"]),
+    ("右", [f"右{i}实际电压" for i in range(3)] + [f"右{i}电流" for i in range(3)]
+     + [RPM["R"], "右指令转速"]),
+]
 
 
 def main() -> None:
@@ -59,20 +44,16 @@ def main() -> None:
     ap.add_argument("--targets", default="15,30", help="目标速度档 pct，逗号分隔")
     ap.add_argument("--hold", type=float, default=4.0, help="每档稳态窗时长 s")
     ap.add_argument("--settle", type=float, default=1.0, help="每档起稳等待 s")
-    ap.add_argument("--cur", default="", help="当前已烧的 factor，如 L0=1,L1=0.95；缺省全按 1")
-    ap.add_argument("--png", default="motor_share.png",
-                    help="结果图文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
+    ap.add_argument("--tag", default="run1",
+                    help="原始段目录后缀；落 backend/pytest/probe_data/<层>/motor_share_<tag>/")
     args = ap.parse_args()
 
     targets = [float(t) for t in args.targets.split(",") if t.strip()]
-    cur_f = {}
-    for kv in args.cur.split(","):
-        if kv.strip():
-            k, v = kv.split("=")
-            cur_f[k.strip().upper()] = float(v)
 
     want = CUR + VACT + [RPM["L"], RPM["R"], "左指令转速", "右指令转速"]
     with BackendLink(args.base) as bl:
+        out_dir = bl.out_path("motor_share_%s" % args.tag)   # 每档一段原始 CSV
+        os.makedirs(out_dir, exist_ok=True)
         bl.stop_move()   # 交出底盘：is_busy 期间 0x85 被固件拒绝（boot 默认手柄控车）
         bl.sleep(0.3)
         bl.clear_subs()
@@ -87,6 +68,10 @@ def main() -> None:
             bl.start_log()
             bl.sleep(args.hold)
             bl.end_log()
+            seg = os.path.join(out_dir, "t%g" % tgt)
+            bl.print_log(seg + ".csv")
+            for tag, names in PNG_GROUPS:
+                bl.v.print_log("%s_%s.png" % (seg, tag), names)
             bl.spin_target(0.0, 0.0)
             bl.sleep(0.3)
             st = bl.stats(want)
@@ -109,23 +94,8 @@ def main() -> None:
         bl.stop_move()
         bl.sleep(0.2)
 
-    # ---------- 汇总：各档建议 factor（相对当前已烧值叠加）----------
-    print("\n================ factor 建议 ================")
-    print("口径：factor_i 新 = factor_i 旧 × I_锚/I_i（锚=0 号机）；两档差异大说明 k_e 主导，取中速档")
-    for side, cn in (("L", "左"), ("R", "右")):
-        print("\n%s侧（当前值：%s）：" % (cn, {f"{side}{i}": cur_f.get(f"{side}{i}", 1.0) for i in range(3)}))
-        for tgt, row in results.items():
-            ia, _ = row[side]
-            if ia[0] <= 0.05:
-                print("  %5gpct: 锚机电流 %.2fA 太小，跳过" % (tgt, ia[0]))
-                continue
-            sug = {i: cur_f.get(f"{side}{i}", 1.0) * ia[0] / ia[i] for i in range(3)}
-            print("  %5gpct: factor = [%.4f, %.4f, %.4f]  （I=[%.2f %.2f %.2f]A）"
-                  % (tgt, sug[0], sug[1], sug[2], ia[0], ia[1], ia[2]))
-    print("\n填 src/robot_and_control.cpp 的 MyMotor 第 2 字段后烧录；烧录后重跑本脚本复核分流是否均匀。")
-
-    if args.png and results:
-        plot_share(bl.out_path(args.png), results)
+    print("\n原始段目录：%s" % out_dir)
+    print("（factor 的解算交给日抛分析脚本读这些 CSV）")
 
 
 if __name__ == "__main__":

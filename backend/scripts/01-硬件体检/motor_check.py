@@ -9,38 +9,12 @@
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from app.script_api import BackendLink  # noqa: E402
-
-
-def plot_check(path, rows):
-    """两栏：各台平均转速 / 平均电流，异常台标红——一眼看出哪台空转或断线。"""
-    from plot_util import subplots, save
-
-    fig, axes = subplots(2)
-    names = [r["motor"] for r in rows]
-    colors = ["tab:red" if r["state"] != "stall(ok)" else "tab:blue" for r in rows]
-
-    ax = axes[0][0]
-    ax.bar(names, [r["rpm"] for r in rows], color=colors)
-    ax.axhline(20, color="gray", ls=":", lw=1)
-    ax.text(0, 21, "空转判据 20pct", fontsize=8, color="gray")
-    ax.set_title("平均转速（|均值|>20pct 记 FREE-SPIN?）")
-    ax.set_ylabel("rpm / pct")
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[0][1]
-    ax.bar(names, [r["cur"] for r in rows], color=colors)
-    ax.axhline(0.05, color="gray", ls=":", lw=1)
-    ax.text(0, 0.06, "断线判据 0.05A", fontsize=8, color="gray")
-    ax.set_title("平均电流（<0.05A 记 DISCONNECT?）")
-    ax.set_ylabel("I / A")
-    ax.grid(True, alpha=0.3)
-    save(fig, path)
 
 
 def main() -> None:
@@ -48,10 +22,8 @@ def main() -> None:
     ap.add_argument("--base", default="http://127.0.0.1:8000")
     ap.add_argument("--volt", type=float, default=3.0, help="单台加电电压（V）")
     ap.add_argument("--hold", type=float, default=0.5, help="每台保持时间（秒）")
-    ap.add_argument("--csv", default="motor_check.csv",
-                    help="结果 CSV 文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
-    ap.add_argument("--png", default="motor_check.png",
-                    help="结果图文件名，空字符串跳过；落 backend/pytest/probe_data/<层>/")
+    ap.add_argument("--tag", default="run1",
+                    help="原始段目录后缀；落 backend/pytest/probe_data/<层>/motor_check_<tag>/")
     args = ap.parse_args()
 
     rpm_names = ["%s%d转速" % (s, n) for s in "左右" for n in range(3)]
@@ -60,6 +32,8 @@ def main() -> None:
 
     # with 退出时 __exit__ 自动收车收尾（6电机0V / 刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
+        out_dir = bl.out_path("motor_check_%s" % args.tag)   # 每台一段原始 CSV
+        os.makedirs(out_dir, exist_ok=True)
         # 开环直设电压要求速度环空闲：环活着会每 10ms 覆盖 0x84，读到的是被扶住的假数据
         st_l, st_r = bl.latest("左环状态"), bl.latest("右环状态")
         if st_l != 0 or st_r != 0:
@@ -75,6 +49,9 @@ def main() -> None:
             bl.set_volt(mid, args.volt)
             bl.sleep(args.hold)
             bl.end_log()
+            seg = os.path.join(out_dir, name)
+            bl.print_log(seg + ".csv")
+            bl.print_log(seg + ".png")
 
             st_r = bl.stats([rpm_names[mid]])[rpm_names[mid]]
             st_i = bl.stats([cur_names[mid]])[cur_names[mid]]
@@ -117,13 +94,8 @@ def main() -> None:
                 % (mid, name, rpm_abs, rpm, cur_abs, state,
                    rows[-1]["x"], rows[-1]["y"], rows[-1]["yaw"], n_rpm)
             )
-        if args.csv and rows:
-            bl.save_csv(args.csv, rows)
-        if args.png and rows:
-            plot_check(bl.out_path(args.png), rows)
-
-    bad = [r["motor"] for r in rows if r["state"] != "stall(ok)"]
-    print("\n判定口径（都用幅值均值，不用有符号均值——抖动会正负抵消成 0）：")
+    print("\n原始段目录：%s" % out_dir)
+    print("判定口径（都用幅值均值，不用有符号均值——抖动会正负抵消成 0）：")
     print("  无数据=样本<5；空转=平均|转速|>20pct；断线=平均|电流|<0.05A；其余记 stall(ok)")
     print("异常电机：%s" % (bad if bad else "无"))
 

@@ -24,7 +24,8 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware # CORS 中间件（允许跨域）
 from pydantic import BaseModel, Field 
 
-from .hub import ConnectResult, Hub, OkResult, ValueSnapshot
+from .dataclass import CalcResult, ConnectResult, OkResult, ValueSnapshot
+from .hub import Hub
 
 logging.basicConfig(
     level=logging.INFO,
@@ -147,7 +148,7 @@ def api_connect():
     """前端连接/重连按钮入口：标记想连并异步触发探测，立即返回当前快照。
 
     返回: ConnectResult(ok, snapshot)
-    探测本身有阻塞（逐口开/关，每口 ≤100ms），不等结果——进度靠 WS 状态消息感知；置意愿后掉线会自动重连。
+    探测本身有阻塞（逐口开/关，每口 ≤120ms），不等结果——进度靠 WS 状态消息感知；置意愿后掉线会自动重连。
     """
     # 前端连接/重连按钮入口：标记想连并立即尝试。
     # 串口探测本身有阻塞，不等它出结果，交给重连线程反复试；
@@ -283,6 +284,27 @@ def api_log_print(body: PrintLogBody = PrintLogBody()):
     return hub.print_log(body.path, body.names)
 
 
+class CalcBody(BaseModel):
+    """/api/log/calc 请求体：对已记录的项做表达式计算。
+
+    expr 只含监控项名 + 算术运算符；agg 为空则回逐点序列。
+    """
+    expr: str
+    agg: str = ""
+    window: list[float] | None = None
+
+
+@app.post("/api/log/calc")
+def api_log_calc(body: CalcBody) -> CalcResult:
+    """对本段记录做表达式计算并聚合，如 "左0电流 - 左1电流" + agg="mean"。"""
+    try:
+        return hub.calc(body.expr, body.agg, body.window)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/log/stats")
 def api_log_stats(
     index_or_name: list[Any] = Query(default=[]),
@@ -291,7 +313,8 @@ def api_log_stats(
     """整段统计，不传 index_or_name 就统计全部已记录的项。
 
     统计的是"本段（start_log → end_log）的全部样本"，后端不切窗口；
-    要只看某一段子区间，脚本自己从 /api/log/window 拿原始点筛。
+    要只看某一段子区间，用 /api/log/calc 传 window=[t0_ms, t1_ms]（服务端切）；
+    要原始点就 /api/log/print 导 csv/json。
 
     thresholds 里每个值额外给出 ratio_ge（|值| >= 该阈值的样本占比）。
     """
@@ -303,24 +326,14 @@ def api_log_stats(
         raise HTTPException(400, str(e))
 
 
-@app.get("/api/log/window")
-def api_log_window(
-    index_or_name: list[Any] = Query(default=[]),
-):
-    """整段原始样本长表（t_ms/index/name/value），供脚本自己画图、落盘或自行统计。"""
-    try:
-        return hub.log_rows(index_or_name or None)
-    except KeyError as e:
-        raise HTTPException(404, str(e))
-
-
 @app.get("/api/value")
 def api_value(
     index_or_name: list[Any] = Query(default=[]),
     missing_ok: bool = False,
 ):
     """读当前值（看门狗用）：?index_or_name=x 单项；多个就重复传参一次取多项。
-    每项返回 index/name/value/unit/age_s（age_s=距上次推送秒数）。
+    每项返回 index/name/value/unit/age_s/lag_ms。看门狗主判 lag_ms（落后最新
+    监控帧 >300ms 或 None 即旧，对传输延迟免疫）；age_s 是到达新近度，仅诊断。
     missing_ok=true 时跳过还没有数据的项，不整批 404（批量轮询用）。"""
     if not index_or_name:
         raise HTTPException(400, "用法：/api/value?index_or_name=x&index_or_name=y")
@@ -335,7 +348,7 @@ def api_values():
     """当前监控值快照（未订阅的项停推后保持最后收到的值）。
 
     ⚠️ 这里给的是"缓存里的最新值"，不保证新鲜——已经停推的项会一直留着旧值。
-    要判新鲜度请用 /api/value，它带 age_s。
+    要判新鲜度请用 /api/value，它带 lag_ms（主判据）/age_s（诊断）。
     """
     out = []
     for idx, s in hub.monitor_latest.items():

@@ -2,7 +2,8 @@
 数据类集中地：协议解析产物 + 接口返回体 + 串口设备描述符。
 
 本文件只放被动数据结构（dataclass / NamedTuple）与紧绑它们的枚举、类型别名，
-不含任何逻辑；protocol / serial_bridge / hub / main 共同引用。
+不含任何逻辑；protocol / serial_bridge 现在就从这里 import，hub / main 的接口
+返回体也以这里为真源（hub 里的同名副本将删除，见 REVIEW 文档 P1-1）。
 字段名即对外 JSON 键名（FastAPI 自动转），改动等于改接口契约。
 """
 
@@ -11,8 +12,9 @@ from enum import Enum
 from typing import Any, ClassVar, NamedTuple
 
 # 监控/调参项能取的值形态。注意这是"Python 侧解出来的类型"，
-# 与 protocol.ValueType 不是一一对应（多个 ValueType 都解成 int）。
-CellValue = int | float | bool
+# 与 protocol.ValueType 不是一一对应（多个 ValueType 都解成 int）；
+# str 只出现在 Color（解成 "#RRGGBB" 供前端直接显示）。
+CellValue = int | float | bool | str
 
 
 # ---------- 目录数据结构（dataclass；/api/column 直接返回，FastAPI 自动转 JSON）----------
@@ -169,13 +171,32 @@ class AggregateStats:
 # ---------- 最新样本快照 ----------
 class MonitorSample(NamedTuple):
     """
-    某监控项的最新一个样本：值 + 何时收到，一对不可分的量放一起。
+    某监控项的最新一个样本：值 + 两个时刻，一对不可分的量放一起。
     value : 最新值
     t_recv: 收到该值的 time.monotonic() 秒（单调时钟，不受改时间影响）；
             None = 只有目录帧带来的初值、还没收到过推送。
+            → age_s（距上次收到推送）：到达新近度，诊断量。
+    t_fw  : 该值所在监控帧的下位机原始 16bit 时间戳（帧头那 2B，未展开）；
+            None = 只有目录帧初值、还没收到过推送。
+            → lag_ms（落后最新监控帧多少）：新鲜度主判据。
+            存 raw 不存展开值：lag 只需要差值，mod 65536 相减对任意间隔都精确；
+            _expand_stamp 的展开假设相邻帧 <32.7s，长掉线会解错（日志会话那条
+            时间轴另用，两者互不依赖）。
+
+    ⚠ age_s 的语义边界：它量的是"到达新近度"，不是"样本年龄"。恒定传输延迟下
+    每个值都会看起来新鲜（age_s≈0）实则旧了一整个延迟——那种传输方式下它是
+    主动误导而非不完整，故只配当诊断量。新鲜度主判 lag_ms：固件是全量推送，
+    正常项最多 80ms（低速相位数×拍）必出现一次，落后前沿 >300ms 即旧；恒定
+    传输延迟下全体同时延、相对差值不变，故免疫。USB 直连两者都可忽略；
+    若换成桥接/WiFi/中转上位机，age_s 降级为纯诊断、lag_ms 顶上——
+    但链路整体冻结（掉线/固件卡死）时没有新帧、lag 前沿也跟着冻，两者一起
+    失效，那种情况以连接状态为准（心跳 1s 判掉线；固件 300ms 无 Ping 停推）。
+    接收侧观测不到单向传输延迟——任何方案要么带不可验证的假设（NTP 对称性）
+    要么只给无假设下界（样本锚点），评估见解析文档。
     """
     value: Any
     t_recv: float | None
+    t_fw: int | None = None
 
 
 # ---------- 接口返回体（dataclass；FastAPI 自动转 JSON，字段名即 JSON 键名）----------
@@ -194,7 +215,10 @@ class MonitorReading:
     name: str
     value: Any
     unit: str
-    age_s: float  # 距上次收到推送的秒数
+    age_s: float  # 距上次收到推送的秒数（到达新近度；恒定传输延迟下会骗人，诊断量）
+    lag_ms: float | None  # 落后最新监控帧多少 ms（固件时间轴，wrap-aware 相减）；
+    # None=无推送史（目录初值）。看门狗主判据：None 或 >FW_LAG_STALE_MS(300) 即旧。
+    # 对传输延迟/PC 抖动免疫；链路整体冻结时以连接状态为准（见 MonitorSample）。
 
 
 @dataclass
@@ -279,7 +303,8 @@ class LogRow:
 
 @dataclass
 class LogRowsResult:
-    """/api/log/window 返回。"""
+    """整段原始样本长表（log_rows() 与 print_log 内部使用；对外取原始点请用
+    /api/log/print 导出，或 /api/log/calc 传 window 做子区间计算）。"""
     rows: list[LogRow]
 
 
@@ -336,6 +361,23 @@ class Snapshot:
     abort: bool
     stop_cmd: int | None
     ports: list[PortInfo]
+
+
+@dataclass
+class CalcResult:
+    """/api/log/calc 返回：对本段记录做表达式计算的结果。
+
+    agg="none" 时 series 是逐点结果 [[t_ms, value], ...]，value 为 None；
+    否则 value 是聚合后的单值，series 为空。
+    missing 说明哪些项没有历史序列、退回了当前值（或完全没取值）。
+    """
+    ok: bool
+    expr: str
+    agg: str
+    value: float | None
+    n: int
+    series: list
+    missing: dict[str, str]
 
 
 @dataclass

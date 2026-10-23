@@ -21,6 +21,7 @@ Thumbs.db
 *.rar
 AGENTS.md
 .trae/
+.workbuddy
 docs/
 
 # Python backend

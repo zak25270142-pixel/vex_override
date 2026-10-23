@@ -61,16 +61,6 @@ PROBE_TIMEOUT_S = 0.12
 '''单个候选口等 Pong 的时长'''
 
 
-@dataclass
-class PortInfo:
-    """一个串口设备的信息（pyserial 原始描述符的裁剪版，/api/ports 直接返回）。"""
-    device: str
-    description: str
-    vid: int | None
-    pid: int | None
-    serial_number: str
-
-
 class SerialBridge:
     """线程安全的串口读写；读走独立线程 + FrameParser，写由 Hub 队列统一调度。
 
@@ -134,10 +124,9 @@ class SerialBridge:
         
         self._last_pong = 0.0  
         '''上次收到 Pong 的 monotonic 时刻，心跳超时判定用'''
-        '''心跳单例：重连叠调 start_heartbeat 时先停旧线程，避免多路 Ping 打架'''
 
         self._hb_thread: threading.Thread | None = None
-        '''心跳线程'''
+        '''心跳线程；单例：重连叠调 start_heartbeat 时先停旧线程，避免多路 Ping 打架'''
 
         self._hb_stop = threading.Event()  
         '''心跳线程停止标志'''
@@ -396,10 +385,13 @@ class SerialBridge:
 
     # ---------- 心跳 ----------
 
-    # 心跳 80ms 一发，超过 1s 没收到 Pong 判定下位机程序已死（USB 还连着但链路没意义）。
-    # 1s 容忍约 12 个 Pong 丢失，防 rx 线程被慢 WS 客户端反压时的误判；
-    # 判定失败也只是走一遍重连，可恢复。
-    PONG_TIMEOUT_S = 1.0
+    # 心跳 80ms 一发，超过 300ms 没收到 Pong 判定下位机程序已死（USB 还连着但链路没意义）。
+    # 300ms = 固件断链巡视周期（communication.h LINK_PATROL_TICKS=30，300ms 无 Ping 停推），
+    # 与 FW_LAG_STALE_MS 同尺：链路冻结时 lag 前沿也冻，掉线判定就是那道兜底。
+    # 容忍约 3 个 Pong 丢失；USB CDC 往返亚毫秒级，rx 线程无同步阻塞
+    # （WS 广播是 run_coroutine_threadsafe 异步投递，网页慢拖不到这里），
+    # 300ms 仍有约 300 倍余量；误判代价也只是走一遍重连，可恢复。
+    PONG_TIMEOUT_S = 0.3
 
     def stop_heartbeat(self) -> None:
         """停心跳线程并等它退出；从心跳线程自己调 _lost 进来时不 join（等自己无意义）。"""

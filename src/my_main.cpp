@@ -57,6 +57,7 @@ void my_Init()
     Brain.Screen.setPenWidth(1);
     key_init1();
     pre_menu_init();
+    robot_init();
     comm.init();
     comm.on_link_lost = comm_link_lost_handler; // 装配掉线收车回调（comm 本身不认机器人组件）
 

@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-cal_motor_intrinsic.py —— 电机组固有属性标定（volt_min / volt_factor），纯开环、车轮悬空。
+cal_motor_intrinsic.py —— 电机组固有属性采集（volt_min / volt_factor 的原始数据来源），
+纯开环、车轮悬空。
 
 【定位】
-最底层标定：只测电机自身固有属性，目标是把组内三台的"出力"拉齐。同型号电机 k_t
+只负责采集：把每个稳态工作点的原始波形整段录下来落盘。不拟合、不给建议值——
+volt_min / volt_factor 的解算交给日抛分析脚本（读本脚本落的 CSV）。
+测的是电机自身固有属性，目标是把组内三台的"出力"拉齐。同型号电机 k_t
 相同，等流即等力矩分担。摩擦垫与前馈表不属于本脚本——那是整车属性，须在着地、
 闭环下另标。
 
@@ -23,19 +26,8 @@ output·controllable·f_i 统一决定），于是直接迭代——电流大的
     在每个基准水平上迭代调各台电压使三台电流一致（比值 < tol），记录收敛电压。
     迭代中始终把三台均值拉回 level，否则总力矩变了、转速会漂，等于追移动靶。
 
-  Phase C  直线拟合 + 物理锚定
-    V_i = a_i + b_i · level（level=三台均值电压）
-    启动电压不是原始截距 a_i，而是流形在起步档的值 a_i + b_i·Vmin——
-    Vmin 即 Phase A 先实测的**该侧**起步电压（"齿轮组稳定低速旋转的最低电压"），
-    这正是要填的 volt_min；左右两侧各用各的 L0。
-    （为什么不能直接填 a_i：每轮把三台均值拉回 level，拟合的均值线被钉成 y=x，
-      mean(a_i)=0 是恒等式，三台截距和为零必有一负——参数化副产品，非物理量。）
-    锚定到起步档：
-      base_i     = a_i + b_i·L0（L0=Vmin） （o=0 时三台坐在起步等流点，流形精确复现）
-      volt_min_i = base_i − (L0 − 0.5)      （均值恒 0.5；0.5=电机零负载自转的固有起步）
-      b_i 斜率即 volt_factor（电压增益；mean(b)=1 恒等，最慢台自动得 1），按 max=1 归一
-    拟合残差直接回答"是不是直线"：残差小 → 全速度段一套参数就够；
-    残差大 → 非线性，volt_min 管低速、volt_factor 管高速，中间段留残差。
+  解算（不在本脚本）：V_i = a_i + b_i·level 拟合 + 起步档锚定出 volt_min / volt_factor，
+  由日抛分析脚本读本脚本落的原始段来做。
 
 【与摩擦垫的关系：无关】
 开环走 0x84 直设电机电压（固件 cmd_set_volt → motor->spin(volt)），完全绕过
@@ -58,30 +50,29 @@ base/friction/volt_min/volt_factor 映射——测量是纯物理量，摩擦垫
     python scripts/02-电机组固有属性/cal_motor_intrinsic.py --start 0.9         # 跳过 Phase A，直接给启动电压
 
 【输出】
-  CSV 落 backend/pytest/probe_data/cal_motor_<tag>.csv（每轮迭代的各台指令/实际电压、
-  电流、转速；未达标水平拟合时剔除并打印）
-  控制台打印：各水平的等流电压与电流比、原始截距/斜率、锚定后的 base/volt_min/
-  factor、残差（线性性），以及② 的摩擦垫基准（着地起转电压 − 0.5）
+  每段（每档 / 每轮迭代）一个原始 CSV，落
+  backend/pytest/probe_data/02-电机组固有属性/cal_motor_<tag>/：
+      A_<电压>V.csv            Phase A 同压档
+      B_lv<水平>_r<轮次>.csv   Phase B 等流迭代轮
+  全部走 print_log：六台指令电压 / 实际电压 / 电流 / 转速 + 左右环状态，原样导出不聚合。
+  后端缓冲在下一段 start_log 时清空，所以每段结束立刻导出。
+  控制台只打印进度（各轮电压 / 电流 / 转速）与收尾的各水平等流电压，不做解算。
 
 【注意】
-  * 开环不经过 volt_factor，测到的是纯固有特性 → factor 建议是**绝对值**，
-    直接覆盖 robot_and_control.cpp 的现值，不是叠加。
-  * 反过来：factor 是否真把电流拉齐，开环验证不了（开环它不生效），必须烧录后
-    跑闭环等流脚本复核。
+  * 开环不经过 volt_factor，测到的是纯固有特性。
+  * factor 是否真把电流拉齐，开环验证不了（开环它不生效），必须烧录后跑闭环等流脚本复核。
   * MyMotor 字段顺序：{&motor, volt_factor, volt_max, volt_min} —— 第 2 字段是
-    factor，第 4 字段是 volt_min。
-  * volt_min 均值恒 0.5（0.5=电机零负载自转的固有起步，组内差异体现在截距/斜率里）；
-    着地标完摩擦垫后低速等流由 friction 与 volt_min 共同决定，需闭环复核。
+    factor，第 4 字段是 volt_min（解算脚本填这两个）。
 """
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from app.script_api import BackendLink  # noqa: E402
 
 SIDE_CN = {"L": "左", "R": "右"}
@@ -108,6 +99,14 @@ WANT = ([mon(s, i, k) for s in "LR" for i in range(3)
          for k in ("指令电压", "实际电压", "电流", "转速")]
         + ["左环状态", "右环状态"])
 
+# 出图分组：左右各一张（左右混画分不清是谁在摆）。
+# 每张内部由后端按单位再拆成上下子图（V / A / pct 各自独立 y 轴）。
+KINDS = ("指令电压", "实际电压", "电流", "转速")
+PNG_GROUPS = [
+    ("左", [mon("L", i, k) for i in range(3) for k in KINDS]),
+    ("右", [mon("R", i, k) for i in range(3) for k in KINDS]),
+]
+
 
 @dataclass
 class Sample:
@@ -119,12 +118,39 @@ class Sample:
     rpm: list           # 六台转速 pct（组内耦合，同侧三台读数应一致）
 
 
-def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float) -> Sample:
-    """等稳态 → 记一段 → 取各台均值"""
+# 稳态转速上叠着"轮子每转一次"的周期起伏，实测 周期(s) × 转速(pct) ≈ 10.1
+# （7.5~60pct 各档实测，误差 ±2%）。所以记录窗必须按转速给：10pct 档一个周期就 1s，
+# 写死 1.5s 只够一个半周期，均值会被摆动带着跑——这正是低速档等流判据达不了标的原因。
+RIPPLE_CYCLE_PCT_S = 10.1
+MIN_CYCLES = 3.0      # 一段至少覆盖几个起伏周期
+HOLD_CAP_S = 10.0     # 上限，免得近停转档算出几十秒
+RPM_REF = mon("L", 0, "转速")   # 估窗长用的转速读数
+
+
+def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float,
+            raw_path: str = "") -> Sample:
+    """等稳态 → 按转速定窗长 → 记一段 → 取各台均值；raw_path 非空就落原始段。
+
+    后端缓冲在下一段 start_log 时清空，原始段必须在本段内立刻导出，否则被覆盖。
+    """
     bl.sleep(settle)
+
+    v = abs(bl.latest(RPM_REF) or 0.0)
+    if v >= 1.0:
+        need = MIN_CYCLES * RIPPLE_CYCLE_PCT_S / v
+        if need > hold:
+            hold = min(need, HOLD_CAP_S)
+            print("  [窗长] %.1fpct → 周期%.2fs，窗放 %.1fs（%.1f 个周期）"
+                  % (v, RIPPLE_CYCLE_PCT_S / v, hold, hold * v / RIPPLE_CYCLE_PCT_S))
+
     bl.start_log()
     bl.sleep(hold)
     bl.end_log()
+    if raw_path:
+        base = raw_path[:-4]
+        bl.print_log(raw_path)                                     # 全量原始点 CSV
+        for tag, names in PNG_GROUPS:
+            bl.v.print_log("%s_%s.png" % (base, tag), names)       # 分组出图
     st = bl.stats(WANT)
 
     def m(name: str) -> float:
@@ -147,13 +173,13 @@ def apply_volts(bl: BackendLink, volts: dict) -> None:
 
 
 def run_same_voltage(bl: BackendLink, drive_ids: list, volts: list,
-                     settle: float, hold: float, i_max: float,
+                     settle: float, hold: float, i_max: float, raw_dir: str,
                      on_row: Callable[[Sample], None]) -> list:
     """Phase A：三台（两侧共六台）同压扫低压，找起转点"""
     out = []
     for v in volts:
         apply_volts(bl, {i: v for i in drive_ids})
-        s = measure(bl, v, settle, hold)
+        s = measure(bl, v, settle, hold, os.path.join(raw_dir, "A_%.2fV.csv" % v))
         out.append(s)
         on_row(s)
         peak = max(abs(s.cur[i]) for i in drive_ids)
@@ -167,7 +193,7 @@ def run_same_voltage(bl: BackendLink, drive_ids: list, volts: list,
 
 def search_balance(bl: BackendLink, sides: list, level: float, alpha: float,
                    tol: float, max_rounds: int, settle: float, hold: float,
-                   i_min_valid: float, v_cap: float,
+                   i_min_valid: float, v_cap: float, raw_dir: str,
                    on_row: Callable[[Sample, int], None]) -> tuple:
     """Phase B：在给定基准水平上迭代调各台电压，使组内三台电流一致。
 
@@ -180,7 +206,8 @@ def search_balance(bl: BackendLink, sides: list, level: float, alpha: float,
     ok = False
     for rnd in range(max_rounds):
         apply_volts(bl, v)
-        s = measure(bl, level, settle, hold)
+        s = measure(bl, level, settle, hold,
+                    os.path.join(raw_dir, "B_lv%.2f_r%d.csv" % (level, rnd)))
         last = s
         on_row(s, rnd)
 
@@ -213,48 +240,6 @@ def search_balance(bl: BackendLink, sides: list, level: float, alpha: float,
     return v, last, ok
 
 
-def fit_line(pts: list) -> tuple:
-    """最小二乘拟合 y = a + b·x，返回 (a, b, 最大残差)"""
-    n = len(pts)
-    if n < 2:
-        return 0.0, 0.0, 0.0
-    sx = sum(p[0] for p in pts)
-    sy = sum(p[1] for p in pts)
-    sxx = sum(p[0] * p[0] for p in pts)
-    sxy = sum(p[0] * p[1] for p in pts)
-    den = n * sxx - sx * sx
-    if abs(den) < 1e-9:
-        return 0.0, 0.0, 0.0
-    b = (n * sxy - sx * sy) / den
-    a = (sy - b * sx) / n
-    resid = max(abs(y - (a + b * x)) for x, y in pts)
-    return a, b, resid
-
-
-def plot_balance(path: Path, fits: dict) -> None:
-    """每侧一栏：三台的 (level, 等流电压) 散点 + 拟合直线——看截距与线性性"""
-    from plot_util import subplots, save
-
-    sides = list(fits.keys()) or ["L"]
-    fig, axes = subplots(len(sides))
-    for ax, sd in zip(axes[0], sides):
-        for i, item in sorted(fits.get(sd, {}).items()):
-            pts, a, b, resid = item
-            if not pts:
-                continue
-            xs = [p[0] for p in pts]
-            ax.plot(xs, [p[1] for p in pts], "o", label=f"{tag_of(mid(sd, i))} 实测")
-            x0, x1 = min(xs), max(xs)
-            ax.plot([x0, x1], [a + b * x0, a + b * x1], "-", alpha=0.8,
-                    label=f"{tag_of(mid(sd, i))} 拟合(截距{a:.2f} 残差{resid:.2f})")
-        ax.set_title(f"{SIDE_CN[sd]}侧 等流电压 vs 基准水平")
-        ax.set_xlabel("基准水平 level / V")
-        ax.set_ylabel("等流时该台电压 / V")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=7)
-    save(fig, path)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description="电机组固有属性标定（悬空，纯开环）")
     ap.add_argument("--base", default="http://127.0.0.1:8000")
@@ -282,18 +267,6 @@ def main() -> None:
     sides = [c for c in "LR" if c in args.only.upper()]
     volt_max = 12.0   # 与固件 volt_max 一致：等流搜索的单台电压上限（v_cap）
 
-    rows = []
-
-    def collect(s: Sample, phase: str, rnd: int = -1) -> None:
-        row = {"phase": phase, "level": s.volt_cmd, "round": rnd}
-        for i in ALL_IDS:
-            t = tag_of(i)
-            row[f"{t}_vcmd"] = s.vcmd[i]
-            row[f"{t}_vact"] = s.vact[i]
-            row[f"{t}_I"] = s.cur[i]
-            row[f"{t}_rpm"] = s.rpm[i]
-        rows.append(row)
-
     def line(s: Sample, drive_ids: list) -> str:
         parts = []
         for i in ALL_IDS:
@@ -303,6 +276,8 @@ def main() -> None:
         return "  " + " | ".join(parts)
 
     with BackendLink(args.base) as bl:
+        out_dir = bl.out_path("cal_motor_%s" % args.tag)   # 每段一个原始 CSV 的目录
+        os.makedirs(out_dir, exist_ok=True)
         bl.stop_move()          # 交出底盘：is_busy 期间 0x84 会被固件丢弃
         bl.sleep(0.4)
         bl.clear_subs()
@@ -325,8 +300,8 @@ def main() -> None:
             if any(x <= 0 for x in v_start.values()):
                 print("===== Phase A 三台同压扫低压（分侧找起转点）=====")
                 a_samples = run_same_voltage(
-                    bl, drive_all, volts_low, args.settle, args.hold, args.i_max,
-                    lambda s: (collect(s, "A_start"), print(line(s, drive_all))))
+                    bl, drive_all, volts_low, args.settle, args.hold, args.i_max, out_dir,
+                    lambda s: print(line(s, drive_all)))
                 for sd in sides:
                     for s in a_samples:
                         if abs(s.rpm[mid(sd, 0)]) >= args.omega_thr:
@@ -349,12 +324,10 @@ def main() -> None:
 
             for lv in levels:
                 print(f"===== Phase B 等流搜索 level={lv:.2f}V =====")
-                row0 = len(rows)   # 本 level 在 rows 里的起点，收敛后回填标记
                 v_fin, s_fin, ok = search_balance(
                     bl, sides, lv, args.alpha, args.tol, args.max_rounds,
-                    args.settle, args.hold, args.i_min_valid, volt_max,
-                    lambda s, rnd: (collect(s, f"B_lv{lv:.2f}", rnd),
-                                    print("  r%d %s" % (rnd, line(s, drive_all).strip()))))
+                    args.settle, args.hold, args.i_min_valid, volt_max, out_dir,
+                    lambda s, rnd: print("  r%d %s" % (rnd, line(s, drive_all).strip())))
                 for sd in sides:
                     trio = [mid(sd, i) for i in range(3)]
                     cur = [s_fin.cur[i] for i in trio]
@@ -367,84 +340,27 @@ def main() -> None:
                              "达标" if ok else "未收敛"))
                 bal[lv] = v_fin
                 converged[lv] = ok
-                # 未达标水平拟合时会剔除——必须在本行留标记，
-                # 否则 CSV 里这些行看不出被排除了，口径与拟合结果对不上
-                for r in rows[row0:]:
-                    r["converged"] = int(ok)
                 print()
             bl.stop_move()
         finally:
             apply_volts(bl, {})  # 异常退出也要把六台归零，别让轮子空转
 
-    # ---------- Phase C：拟合 + 物理锚定 ----------
-    print("\n================ 标定建议 ================")
-    print("拟合式：V_i = a_i + b_i·level（level=三台均值电压）")
-    print("启动电压 = a_i + b_i·Vmin（Vmin=Phase A 实测起步电压=齿轮组稳定低速旋转的最低电压），")
-    print("不是原始截距 a_i：均值参数化下 mean(a)=0 是恒等式（每轮把三台均值拉回 level），")
-    print("三台截距和为零必有一负，是参数化副产品；填锚定后的 volt_min。")
-    print("锚定：L0=" + "  ".join(f"{SIDE_CN[sd]}={v_start[sd]:.2f}V" for sd in sides)
-          + "；base_i = a_i + b_i·L0（o=0 时三台坐在起步等流点，流形精确复现）")
-    print(f"      volt_min_i = base_i − (L0−0.5) → 均值恒 0.5（0.5=电机零负载自转固有起步）")
-    bad = [lv for lv in bal if not converged.get(lv, False)]
-    if bad:
-        print(f"[fit] 剔除未达标水平：{', '.join(f'{lv:.2f}V' for lv in bad)}"
-              f"（电流太小/未收敛，不在等流流形上）")
-    all_fits = {}
-    for sd in sides:
-        cn = SIDE_CN[sd]
-        print(f"\n{cn}侧：")
-        resids = []
-        all_fits[sd] = {}
-        mins, gains = {}, {}
-        for i in range(3):
-            idx = mid(sd, i)
-            pts = [(lv, v[idx]) for lv, v in bal.items() if converged.get(lv, False)]
-            if len(pts) < 2:  # 全没达标才兜底用全部点，并明示
-                pts = [(lv, v[idx]) for lv, v in bal.items()]
-                if len(pts) < 2:
-                    print(f"  {cn}{i}: 数据点不足，无法拟合")
-                    continue
-                print(f"  {cn}{i}: [warn] 无达标水平，拟合用了全部点")
-            a, b, resid = fit_line(pts)
-            resids.append(resid)
-            base_i = a + b * v_start[sd]
-            volt_min_i = base_i - (v_start[sd] - 0.5)
-            mins[i] = volt_min_i
-            # b_i 天生就是 volt_factor：电压增益，mean(b)=1 恒等，下面按 max=1 归一。
-            # 不必除 (volt_max−base)：base 仅 1~2V，controllable≈10.7 三台几乎相同，
-            # 该除法是 ±1.6% 量级的修正，还会把 Phase A 的 L0 噪声耦合进 factor。
-            gains[i] = b if b > 0 else 0.0
-            all_fits[sd][i] = (pts, a, b, resid)
-            print(f"  {cn}{i}: 截距={a:+.3f}V  斜率={b:.4f}  base={base_i:.3f}V  "
-                  f"volt_min={volt_min_i:+.3f}V  残差={resid:.3f}V")
-        if not gains or max(gains.values()) <= 0:
-            print("  factor：有效水平不足 2 组（降低 --v-limit 或增大 --max-levels）")
+    # ---------- 收尾：报告原始段位置与各水平等流电压 ----------
+    print("\n================ 采集完成 ================")
+    print("原始段目录：%s" % out_dir)
+    print("启动电压 V_start：" + "  ".join(
+        f"{SIDE_CN[sd]}={v_start[sd]:.2f}V" for sd in sides))
+    print("各水平等流收敛电压（V）：")
+    for lv in levels:
+        v = bal.get(lv)
+        if not v:
             continue
-        if min(gains.values()) <= 0:
-            print(f"  [warn] 有电机斜率 ≤0（{[i for i in gains if gains[i] <= 0]}），数据异常，"
-                  f"该台 factor 会得 0，勿直接填")
-        gmax = max(gains.values())
-        print("  volt_min 建议（均值 0.5，填 MyMotor 第 4 字段）：" + "  ".join(
-            f"{cn}{i}={mins[i]:.3f}V" for i in sorted(mins)))
-        print("  volt_factor 建议（斜率归一到 max=1，恒 ≤1，填第 2 字段）："
-              + "  ".join(f"{cn}{i}={gains[i] / gmax:.4f}" for i in sorted(gains)))
-        if min(mins.values()) <= 0.1:
-            print(f"  [warn] 有 volt_min ≤ 0.1V（最小 {min(mins.values()):.3f}V）：组内差异太大，"
-                  f"均值 0.5 的记账兜不住，建议抬高 volt_min 均值重算")
-        worst = max(resids) if resids else 0.0
-        verdict = ("线性良好，全速度段一套参数即可" if worst < 0.15
-                   else "残差偏大 → 非线性，低速靠 volt_min、高速靠 factor，中间段留残差")
-        print(f"  线性性：最大残差 {worst:.3f}V —— {verdict}")
-    print("\n② 着地摩擦垫基准：静垫 = 着地起转电压 − 0.5，动垫 = 着地滚停电压 − 0.5（左右各算）；")
-    print("   base 总量 = 摩擦垫 + volt_min，垫子大了直接砍（在线调参，不用烧录）。")
-
-    out = Path(bl.out_path(f"cal_motor_{args.tag}.csv"))
-    cols = (["phase", "level", "round", "converged"]
-            + [f"{tag_of(i)}_{k}" for i in ALL_IDS for k in ("vcmd", "vact", "I", "rpm")])
-    bl.save_csv(str(out), rows, cols)  # 本地写文件，不依赖 HTTP 会话
-    plot_balance(out.with_suffix(".png"), all_fits)
-    print("\n填 src/robot_and_control.cpp 的 MyMotor 第 2（factor）、第 4（volt_min）字段后"
-          "烧录；烧录后须跑闭环等流脚本复核——开环下 factor 不生效，本脚本验证不了。")
+        seg = "  ".join(
+            "%s侧[%s]" % (SIDE_CN[sd], " ".join("%.2f" % v[mid(sd, i)] for i in range(3)))
+            for sd in sides)
+        print("  lv %5.2f  %s  %s" % (lv, seg,
+                                      "达标" if converged.get(lv) else "未收敛"))
+    print("（volt_min / volt_factor 的解算交给日抛分析脚本读这些 CSV）")
 
 
 if __name__ == "__main__":

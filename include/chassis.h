@@ -162,7 +162,7 @@ public:
 
     // 定位轮到车体旋转中心的有符号距离，单位 m。
     float forward_tracking_offset = 0.01023f; // 前向轮的横向偏移，向右为正
-    float side_tracking_offset = -0.0889f;  // 侧向轮的纵向偏移，向前为正
+    float side_tracking_offset = -0.0889f;    // 侧向轮的纵向偏移，向前为正
 
     // 左右两侧各自的可达满速，pct
     float left_max_speed = 100.0f;

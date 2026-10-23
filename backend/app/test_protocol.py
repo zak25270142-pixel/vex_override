@@ -44,6 +44,45 @@ def test_encode_float():
     assert abs(decode_value(b, 0, ValueType.Float) - 1.5) < 1e-6
 
 
+def test_encode_rejects_non_numeric():
+    """数值字段收到字符串/None/列表一律抛错，绝不静默编 0。"""
+    for bad in ("6.0", None, [1], {"a": 1}):
+        try:
+            encode_value(ValueType.Float, bad)
+            raise AssertionError(f"应拒绝 {bad!r}")
+        except TypeError:
+            pass
+    # bool 当电压/转速传也是笔误，仅开关字段放行
+    try:
+        encode_value(ValueType.Float, True)
+        raise AssertionError("bool 应被数值字段拒绝")
+    except TypeError:
+        pass
+    assert encode_value(ValueType.Bool, True)[0] == 1
+    assert encode_value(ValueType.Bool, False)[0] == 0
+
+
+def test_encode_color():
+    assert encode_value(ValueType.Color, "#ff8000")[:3] == bytes([0xFF, 0x80, 0x00])
+    assert encode_value(ValueType.Color, "ff8000")[:3] == bytes([0xFF, 0x80, 0x00])  # 不带 # 也认
+    for bad in (0xFF8000, "#ff80", "#gg8000", None):
+        try:
+            encode_value(ValueType.Color, bad)
+            raise AssertionError(f"Color 应拒绝 {bad!r}")
+        except (TypeError, ValueError):
+            pass
+
+
+def test_parser_monitor_value_zero_len_resyncs():
+    """payloadlen==0 非法（固件永不发）：应直接回找帧头，不吞后续字节、不误记 overflow。"""
+    events = []
+    p = FrameParser()
+    # 错位场景：A5 02 00 之后粘一个正常 Pong，应立即重同步并解出 Pong
+    p.feed(bytes([0xA5, CmdPost.MonitorValue, 0x00]) + ping(), events.append)
+    assert [e.kind for e in events] == [EventKind.pong]
+    assert p.stats.overflow == 0
+
+
 def test_parser_pong():
     events = []
     FrameParser().feed(bytes([0xA5, 0xFF, 0xFF]), events.append)
@@ -165,6 +204,8 @@ if __name__ == "__main__":
     test_build_ping()
     test_subscribe_frame()
     test_encode_float()
+    test_encode_rejects_non_numeric()
+    test_encode_color()
     test_parser_pong()
     test_parser_monitor_value_after_directory()
     test_parser_monitor_value_len_prefix_without_directory()
@@ -172,6 +213,7 @@ if __name__ == "__main__":
     test_parser_cmd_directory_with_ranges()
     test_parser_cmd_directory_ranges_follow_field_type()
     test_parser_bad_checksum_and_half_frame()
+    test_parser_monitor_value_zero_len_resyncs()
     test_max_payload_constant()
     test_request_monitor()
     print("all protocol tests passed")

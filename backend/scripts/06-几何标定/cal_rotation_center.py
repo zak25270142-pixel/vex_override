@@ -44,6 +44,7 @@ chassis.h 里两个 offset 的语义是"定位轮到车体**实际旋转中心**
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -65,10 +66,6 @@ SETTLE_S = 0.8      # 起转后等多久算进入稳态
 TIMEOUT_S = 25.0    # 等转到目标角度的上限
 POLL_S = 0.05       # 等转时的轮询周期
 
-# 两向结果差异超过这个值就提示重测（打滑不对称的表征）
-SPREAD_WARN_MM = 3.0
-
-
 def snapshot(bl):
     """一次批量取回，几个量来自同一拍（BackendLink 内部 20ms TTL 缓存）。"""
     return {
@@ -80,11 +77,12 @@ def snapshot(bl):
     }
 
 
-def run_one(bl, v, target_deg, label):
-    """原地转一圈量一组数。返回 (Δθ度, Δf米, Δs米, offset_f米, offset_s米)。"""
+def run_one(bl, v, target_deg, label, out_dir):
+    """原地转一圈，整段原始波形落盘。返回 (Δθ度, Δf米, Δs米)。"""
     print("  [%s] 起转 左%+.0f / 右%+.0f pct，目标 %.0f° …" % (label, v, -v, target_deg))
     bl.stop_move()
     bl.sleep(0.4)
+    bl.start_log()
     bl.spin_target(v, -v)
     bl.sleep(SETTLE_S)
 
@@ -104,6 +102,10 @@ def run_one(bl, v, target_deg, label):
     # 收车后再看终点：上面 b 已是稳态末点，这里只负责把车停下来
     bl.spin_target(0.0, 0.0)
     bl.sleep(0.3)
+    bl.end_log()
+    seg = os.path.join(out_dir, label)
+    bl.print_log(seg + ".csv")
+    bl.print_log(seg + ".png")
     bl.stop_move()
 
     d_yaw = b["yaw"] - a["yaw"]
@@ -114,8 +116,7 @@ def run_one(bl, v, target_deg, label):
 
     bl.sleep(0.6)  # 等真正停稳，避免下一方向带着余速起步
 
-    d_theta = math.radians(d_yaw)
-    return d_yaw, d_fwd, d_side, -d_fwd / d_theta, d_side / d_theta
+    return d_yaw, d_fwd, d_side
 
 
 def main():
@@ -127,6 +128,8 @@ def main():
                     help="每个方向转多少度（默认 360；转得越多 Δθ 的相对误差越小）")
     ap.add_argument("--dir", choices=["both", "cw", "ccw"], default="both",
                     help="cw=只右转，ccw=只左转，both=两向都转取平均（默认）")
+    ap.add_argument("--tag", default="run1",
+                    help="原始段目录后缀；落 backend/pytest/probe_data/<层>/cal_rotation_center_<tag>/")
     args = ap.parse_args()
 
     if args.volt_pct <= 0 or args.volt_pct > 100:
@@ -135,6 +138,8 @@ def main():
         raise ValueError("-t 至少 30°，太小 Δθ 的相对误差没意义")
 
     with BackendLink(args.base) as bl:
+        out_dir = bl.out_path("cal_rotation_center_%s" % args.tag)   # 每向一段原始 CSV
+        os.makedirs(out_dir, exist_ok=True)
         missing = [n for n in WANT if n not in bl.mon_dir]
         if missing:
             sys.exit("监控表缺项: %s\n已有: %s" % (missing, sorted(bl.mon_dir)))
@@ -150,52 +155,12 @@ def main():
         runs = []
         print("\n===== 开始标定 =====")
         if args.dir in ("both", "cw"):
-            runs.append(("右转",) + run_one(bl, args.volt_pct, args.target_deg, "右转"))
+            runs.append(("右转",) + run_one(bl, args.volt_pct, args.target_deg, "右转", out_dir))
         if args.dir in ("both", "ccw"):
-            runs.append(("左转",) + run_one(bl, -args.volt_pct, args.target_deg, "左转"))
+            runs.append(("左转",) + run_one(bl, -args.volt_pct, args.target_deg, "左转", out_dir))
 
-        # 必须落盘：整段只取首尾两个快照，中间有没有打滑零数据支撑，
-        # 不落的话"两向差 3mm"这个结论事后无从复核
-        bl.save_csv("cal_rotation_center.csv",
-                    [{"dir": r[0], "dyaw_deg": round(r[1], 2),
-                      "df_m": round(r[2], 5), "ds_m": round(r[3], 5),
-                      "offset_f_mm": round(r[4] * 1000.0, 2),
-                      "offset_s_mm": round(r[5] * 1000.0, 2)} for r in runs],
-                    ["dir", "dyaw_deg", "df_m", "ds_m", "offset_f_mm", "offset_s_mm"])
-        print("[out] 落盘 cal_rotation_center.csv（两向各自的 Δθ/Δf/Δs，供事后复核）")
-
-    print("\n===== 结果 =====")
-    print("  方向    Δθ(°)      Δf(m)      Δs(m)    offset_f(mm)  offset_s(mm)")
-    for name, dyaw, df, ds, off_f, off_s in runs:
-        print("  %-4s  %+8.1f  %+9.4f  %+9.4f   %+11.2f  %+11.2f"
-              % (name, dyaw, df, ds, off_f * 1000.0, off_s * 1000.0))
-
-    n = len(runs)
-    mean_f = sum(r[4] for r in runs) / n
-    mean_s = sum(r[5] for r in runs) / n
-    print("  %-4s  %8s  %9s  %9s   %+11.2f  %+11.2f" % ("平均", "", "", "",
-                                                        mean_f * 1000.0, mean_s * 1000.0))
-    if n == 2:
-        sp_f = abs(runs[0][4] - runs[1][4]) * 1000.0
-        sp_s = abs(runs[0][5] - runs[1][5]) * 1000.0
-        print("  %-4s  %8s  %9s  %9s   %+11.2f  %+11.2f" % ("两向差", "", "", "", sp_f, sp_s))
-        if max(sp_f, sp_s) > SPREAD_WARN_MM:
-            print("  [warn] 两向差 %.1f mm 偏大：多半是打滑不对称，降 -v 或换地面重测" % max(sp_f, sp_s))
-
-    # offset 归零时每转一圈会被凭空算进去的假平移（就是还没消掉的残差）
-    fake_f = sum(r[2] for r in runs) / n
-    fake_s = sum(r[3] for r in runs) / n
-    dth = sum(abs(math.radians(r[1])) for r in runs) / n
-    if dth > 1e-9:
-        per_turn_f = fake_f / dth * 2.0 * math.pi
-        per_turn_s = fake_s / dth * 2.0 * math.pi
-        print("\n  offset 取 0 时每转一圈里程计会凭空多算：")
-        print("      前向 %+.1f mm / 侧向 %+.1f mm" % (per_turn_f * 1000.0, per_turn_s * 1000.0))
-        print("  （填好下面的值重新烧录后再跑一次，这两行就是残余漂移，应接近 0）")
-
-    print("\n填进 include/chassis.h：")
-    print("    float forward_tracking_offset = %.5ff; // 前向轮的横向偏移，向右为正" % mean_f)
-    print("    float side_tracking_offset = %.5ff;    // 侧向轮的纵向偏移，向前为正" % mean_s)
+    print("\n原始段目录：%s" % out_dir)
+    print("（offset 解算 offset_f=-Δf/Δθ、offset_s=+Δs/Δθ 交给日抛分析脚本）")
 
 
 if __name__ == "__main__":

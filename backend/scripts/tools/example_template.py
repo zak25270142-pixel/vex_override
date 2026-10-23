@@ -3,7 +3,7 @@
 测试脚本模板：sub → start_log → 循环 cmd → end_log → print_log
 
 核心约定：脚本只决定"记哪些项 / 何时开始 / 存哪里"，记录本身由后端干；
-记录期间脚本只管发命令，事后用 stats()/wave() 按区间（相对开始记录的秒）取数据。
+记录期间脚本只管发命令，事后用 stats() 按区间取统计，原始点用 print_log() 落盘。
 
 这里示范最原始的 VexScript 接口；写实车脚本更推荐用 BackendLink（构造即就绪，
 还带 set_volt/spin_target/save_csv 等语法糖与 latest() 看门狗取值）。
@@ -84,8 +84,7 @@ def main() -> None:
             for it in v.stats(["全局X"], thresholds=[0.05])["items"]:
                 print(f"  {it['name']}: 样本{it['n']} 均值{it['mean']} "
                       f"峰值{it['abs_max']} 阈值占比{it['ratio_ge']}")
-            rows = v.wave(["全局X", "航向"])["rows"]  # 长表 [{t,index,name,value}]
-            print(f"  原始样本 {len(rows)} 条，前 3 条：{rows[:3]}")
+            v.print_log("example_raw.csv")  # 原始点落盘（分析脚本自己读）
         except Exception as e:
             print("  （取统计/波形跳过：", e, "）")
         v.print_log("example.json")  # 后缀决定格式：json/csv/png/jpg/pdf/svg，落 probe_data/

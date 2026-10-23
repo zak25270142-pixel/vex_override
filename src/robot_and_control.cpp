@@ -34,24 +34,24 @@ static const Vec2f right_kf_table[] = {
 
 // 逐台电机的个体属性：factor/max/min
 MyMotor left_motor_list[3] = {
-    {&left_chassis_1, 1.0000f, 12.0f, 0.5f},
-    {&left_chassis_2, 1.0585f, 12.0f, 0.5f},
-    {&left_chassis_3, 0.8439f, 12.0f, 0.5f},
+    {&left_chassis_1, 0.9330f, 12.0f, 0.597f},
+    {&left_chassis_2, 1.0000f, 12.0f, 0.406f},
+    {&left_chassis_3, 0.9240f, 12.0f, 0.491f},
 };
 MyMotor right_motor_list[3] = {
-    {&right_chassis_1, 1.0000f, 12.0f, 0.5f},
-    {&right_chassis_2, 0.7908f, 12.0f, 0.5f},
-    {&right_chassis_3, 0.9343f, 12.0f, 0.5f},
+    {&right_chassis_1, 1.0000f, 12.0f, 0.542f},
+    {&right_chassis_2, 0.9720f, 12.0f, 0.436f},
+    {&right_chassis_3, 0.9950f, 12.0f, 0.516f},
 };
 
 MyMotorGroup left_motors(
     left_motor_list, 3,
     left_kf_table, static_cast<uint8_t>(sizeof(left_kf_table) / sizeof(left_kf_table[0])),
-    0.006f, 0.08f, 0.0f);
+    0.0f, 0.0f, 0.0f);
 MyMotorGroup right_motors(
     right_motor_list, 3,
     right_kf_table, static_cast<uint8_t>(sizeof(right_kf_table) / sizeof(right_kf_table[0])),
-    0.006f, 0.08f, 0.0f);
+    0.0f, 0.0f, 0.0f);
 
 // 定位轮端口与转向取
 static vex::rotation forward_tracking_sensor(vex::PORT4, false);
@@ -66,6 +66,13 @@ Chassis chassis(left_motors, right_motors,
 // 整机动作实例
 RobotAction robot_action(chassis, &left_axis.now_y, &left_axis.now_x);
 
+void robot_init()
+{
+    left_motors.static_deadzone = 1.01f;
+    left_motors.dynamic_deadzone = 0.8f;
+    right_motors.static_deadzone = 1.04f;
+    right_motors.dynamic_deadzone = 0.8f;
+}
 // ---- 上位机命令 ----
 
 static void cmd_stop(const uint8_t *p)
@@ -138,9 +145,6 @@ static void cmd_set_spin(const uint8_t *p)
 
 static void cmd_reset_pos(const uint8_t *p)
 {
-    // 改软件里程计全局位姿：x/y(米)、全局 yaw(度)，并以其为新段起点
-    if (robot_action.is_busy())
-        return;
     float arg[3];
     memcpy(arg, p, sizeof(arg));
     chassis.x = arg[0];

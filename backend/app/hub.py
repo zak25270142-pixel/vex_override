@@ -12,10 +12,10 @@ import logging
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from fastapi import WebSocket
 
@@ -31,6 +31,7 @@ from .protocol import (
     MenuItem,
     RxEvent,
     ValueEvent,
+    ValueType,
     build_frame,
     cmd_spec,
     command_send,
@@ -44,9 +45,39 @@ from .protocol import (
     tag_fast,
     tag_subscribed,
 )
+from .dataclass import (
+    AggregateStats,
+    CalcResult,
+    CmdResult,
+    EndLogResult,
+    LogFileMeta,
+    LogRow,
+    LogRowsResult,
+    LogStatsItem,
+    LogStatsResult,
+    MonitorReading,
+    MonitorSample,
+    OkResult,
+    PrintLogResult,
+    PushState,
+    RegisteredItem,
+    SetTunableResult,
+    Snapshot,
+    StartLogResult,
+    StatusMessage,
+    StopResult,
+    SubResult,
+)
 from .serial_bridge import PortInfo, SerialBridge, Status
 
 logger = logging.getLogger("vex.hub")
+
+# 新鲜度判据：监控项落后最新监控帧超过这么多 ms 即算旧（看门狗用）。
+# 300ms = 固件 LINK_PATROL_TICKS(30 拍) 的掉线巡视周期——全系统同一个时间尺：
+# 固件 300ms 没见 Ping 就停推，后端就敢把 300ms 没更新的项判旧。
+# 余量：低速项 80ms 才刷新一次（SLOW_PHASES=8 × 10ms 拍），300ms 是其 3.75 倍，
+# 正常流转不会被误判；真停推/丢帧时 300ms 内必现形。阈值策略留给消费方，这里只定数。
+FW_LAG_STALE_MS = 300
 
 # ---------- 下行优先级 ----------
 PRI_STOP = 0 # 0停车帧。永远第一
@@ -54,8 +85,8 @@ PRI_UI = 10 #上位机：网页按钮、目录请求、订阅。人工操作，�
 PRI_SCRIPT = 20 #脚本下发的命令/调参
 
 # ---------- 重连节奏 ----------
-# 掉线后每 5s 试一轮：一轮里每个 VEX 候选口只开一次、最多等 100ms（见 SerialBridge），
-# 单个口每轮最多被占 100ms。再快只会频繁打扰下位机和其他用口的进程（如 VS Code 烧录）
+# 掉线后每 5s 试一轮：一轮里每个 VEX 候选口只开一次、最多等 120ms（见 SerialBridge），
+# 单个口每轮最多被占 120ms。再快只会频繁打扰下位机和其他用口的进程（如 VS Code 烧录）
 RECONNECT_INTERVAL_S = 5.0
 
 # ---------- 日志缓冲上限 ----------
@@ -65,29 +96,6 @@ MAX_LOG_SAMPLES = 500_000
 
 # 默认 pytest 输出目录（相对 backend/）
 DEFAULT_PYTEST_DIR = Path(__file__).resolve().parent.parent / "pytest"
-
-
-# ---------- 区间统计（脚本标定用）----------
-# 把一批样本压成常用统计量，脚本不用自己攒样本算。各字段的用途：
-#   mean        算术均值。看"有没有稳态偏置"用这个
-#   abs_mean    取绝对值后的均值。看"抖动/误差幅度"必须用这个——
-#               来回震荡时正负抵消，mean 会接近 0 而 abs_mean 真实反映幅度
-#   abs_max     最大绝对偏差。看最坏情况
-#   std         标准差。注意是总体标准差（除以 n），不是样本标准差（除以 n-1）
-#   rate_hz     样本数 / 区间秒数。反映下位机实际推送率，用来验证是否真按 100Hz 在推
-#   ratio_ge    |值| >= 阈值的样本占比。判断"超差时间占比"这类指标（thresholds 传入阈值列表）
-@dataclass
-class AggregateStats:
-    """一批样本压成的统计量（各字段用途见上）。"""
-    n: int
-    mean: float | None
-    abs_mean: float | None
-    min: float | None
-    max: float | None
-    abs_max: float | None
-    std: float | None
-    rate_hz: float | None
-    ratio_ge: dict[str, float]  # 阈值字符串 → |值|>=阈值的占比（阈值动态传入，故保留 dict）
 
 
 def _aggregate(vals: list[float], thresholds=(), span_ms: float = 0.0) -> AggregateStats:
@@ -110,191 +118,26 @@ def _aggregate(vals: list[float], thresholds=(), span_ms: float = 0.0) -> Aggreg
     )
 
 
-# ---------- 最新样本快照 ----------
-class MonitorSample(NamedTuple):
+def _check_field_type(what: str, ftype: int, value: Any) -> None:
+    """按目录字段声明类型校验一个要下发/写入的值；不符抛 ValueError（路由层转 400）。
+
+    为什么在边界挡而不留给 protocol 编帧：编帧是最后一站，出错时"这是哪个
+    命令的哪个参数"已经丢了；且旧实现对非数值静默编 0——笔误（如把 "6.0"
+    当电压传给车）会伪装成"指令生效且值为 0"，是最难排查的一类故障。
+    数值字段（含 Bool/OnOff）只收 int/float；Color 字段只收 '#RRGGBB' 字符串。
+    bool 是 int 的子类，但把 true 当电压/转速传几乎总是笔误，仅开关字段放行。
     """
-    某监控项的最新一个样本：值 + 何时收到，一对不可分的量放一起。
-    value : 最新值
-    t_recv: 收到该值的 time.monotonic() 秒（单调时钟，不受改时间影响）；
-            None = 只有目录帧带来的初值、还没收到过推送。
-    """
-    value: Any
-    t_recv: float | None
-
-
-# ---------- 接口返回体（dataclass；FastAPI 自动转 JSON，字段名即 JSON 键名）----------
-
-
-@dataclass
-class OkResult:
-    """只有 ok 的通用成功返回。"""
-    ok: bool = True
-
-
-@dataclass
-class MonitorReading:
-    """监控项当前值 + 新鲜度（/api/value 一项）。"""
-    index: int
-    name: str
-    value: Any
-    unit: str
-    age_s: float  # 距上次收到推送的秒数
-
-
-@dataclass
-class ValueSnapshot:
-    """监控项当前值快照（/api/values 用，不含新鲜度）。"""
-    index: int
-    name: str
-    value: Any
-    unit: str
-
-
-@dataclass
-class PushState:
-    """某项的下位机推送档位。"""
-    sub: bool
-    fast: bool
-
-
-@dataclass
-class SubResult:
-    """/api/sub 返回：push/log 为 None 表示该项未走这条分支。"""
-    index: int
-    name: str | None
-    push: PushState | None
-    log: bool | None
-
-
-@dataclass
-class CmdResult:
-    """/api/cmd 返回。"""
-    ok: bool
-    index: int
-    name: str
-    args: list
-
-
-@dataclass
-class SetTunableResult:
-    """/api/tunable 返回。"""
-    ok: bool
-    index: int
-    value: Any
-
-
-@dataclass
-class StopResult:
-    """/api/stop 返回。"""
-    ok: bool
-    cmd_index: int
-
-
-@dataclass
-class RegisteredItem:
-    """一个被登记记录的监控项（start_log / 导出元信息用）。"""
-    index: int
-    name: str
-
-
-@dataclass
-class StartLogResult:
-    """/api/log/start 返回。"""
-    ok: bool
-    registered: list[RegisteredItem]
-
-
-@dataclass
-class EndLogResult:
-    """/api/log/end 返回。"""
-    ok: bool
-    samples: int
-    dropped: int
-
-
-@dataclass
-class LogRow:
-    """一条原始样本（长表的一行）。"""
-    t: float  # 相对本段零点的毫秒
-    index: int
-    name: str
-    value: Any
-
-
-@dataclass
-class LogRowsResult:
-    """/api/log/window 返回。"""
-    rows: list[LogRow]
-
-
-@dataclass
-class LogStatsItem(AggregateStats):
-    """一项的整段统计；直接摊平成 index/name + 各统计量，保持原有 JSON 结构。"""
-    index: int
-    name: str
-
-
-@dataclass
-class LogStatsResult:
-    """/api/log/stats 返回。"""
-    items: list[LogStatsItem]
-
-
-@dataclass
-class LogFileMeta:
-    """导出 JSON 的元信息 + 原始样本长表。"""
-    created: str
-    samples: int
-    dropped: int
-    registered: list[RegisteredItem]
-    data: list[LogRow]
-
-
-@dataclass
-class PrintLogResult:
-    """/api/log/print 返回。columns/missing 只对 csv 有意义。"""
-    ok: bool
-    path: str
-    format: str
-    samples: int
-    dropped: int
-    columns: list[str] = field(default_factory=list)
-    '''csv 宽表的列名（按 index 升序）'''
-    missing: dict[str, int] = field(default_factory=dict)
-    '''csv 每列的空单元格数（丢包数）；全空的桶不出行，只计这里'''
-
-
-@dataclass
-class Snapshot:
-    """/api/status 返回：一眼看清 Backend 全貌。"""
-    status: str
-    message: str
-    connected: bool
-    monitor_count: int
-    tunable_count: int
-    cmd_count: int
-    log_reg: list[int]
-    logging: bool
-    log_samples: int
-    log_dropped: int
-    abort: bool
-    stop_cmd: int | None
-    ports: list[PortInfo]
-
-
-@dataclass
-class ConnectResult:
-    """/api/connect 返回。"""
-    ok: bool
-    snapshot: Snapshot
-
-
-@dataclass
-class StatusMessage:
-    """WS 文本通道推给前端的连接状态消息（前端按 op=="status" 处理）。"""
-    op: str
-    state: str
-    message: str
+    if ftype == ValueType.Color:
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{what} 需要颜色（'#RRGGBB' 字符串），实际给了 {type(value).__name__}: {value!r}"
+            )
+        return  # 十六进制格式由 encode_value8 校验（int(s, 16) 抛 ValueError）
+    if isinstance(value, bool):
+        if ftype not in (ValueType.Bool, ValueType.OnOff):
+            raise ValueError(f"{what} 需要数值，实际给了布尔值 {value!r}")
+    elif not isinstance(value, (int, float)):
+        raise ValueError(f"{what} 需要数值(int/float)，实际给了 {type(value).__name__}: {value!r}")
 
 
 class Hub:
@@ -355,6 +198,13 @@ class Hub:
         '''粘包尾部缓冲：目录 burst 跨 chunk 时剩下的不完整帧尾'''
 
         self.monitor_latest: dict[int, MonitorSample] = {}
+        # 最新监控帧的下位机原始戳（rx 线程维护；HTTP 线程只读单属性，GIL 原子）。
+        # None=还没收到过任何监控值帧。采纳规则：mod 65536 下"领先即采纳"；
+        # 断流 >1s 后的第一帧无条件采纳——长掉线/重启恢复时新流的戳在 mod 意义下
+        # 可能"落后"，但它是我们手里最新的东西，必须当前沿。连续流中"落后"的帧
+        # 只可能是重复帧，不采纳（保守地让各项保持自己的戳）。
+        self._fw_frontier: int | None = None
+        self._fw_frontier_at: float = 0.0
         '''最新样本快照 {index: MonSample(value, t_recv)} 只存每项最新一个'''
 
         # ---------- 订阅状态----------
@@ -464,7 +314,7 @@ class Hub:
         self._want_connected = False
         '''连接意愿开关：True=掉线自动重连（与实际连没连上是两回事）'''
 
-        # 重连后台线程（_reconnect_loop：每 2s 试一次直到连上或不再想连）。
+        # 重连后台线程（_reconnect_loop：每 5s 试一次直到连上或不再想连）。
         # 留 handle 是防重复开线程（ensure_connected 先看它还活着没）。
         self._reconnect_thread: threading.Thread | None = None
         '''重连线程 _reconnect_loop 的 handle（None=未启动；防重复开线程）'''
@@ -722,8 +572,17 @@ class Hub:
             idx = event.index
             val = event.value
             stamp_ms = self._expand_stamp(event.t_ms)  # 下位机采样时刻（回绕已展开）
+            # 前沿推进（lag_ms 的"最新帧"基准）：mod 65536 下领先即采纳；
+            # 断流 >1s 后的第一帧无条件采纳（掉线/重启恢复的新流在 mod 意义下
+            # 可能"落后"，但是手上最新）；连续流中"落后"的帧只可能是重复帧。
+            fw = event.t_ms
+            if (self._fw_frontier is None
+                    or (fw - self._fw_frontier) & 0xFFFF < 0x8000
+                    or time.monotonic() - self._fw_frontier_at > 1.0):
+                self._fw_frontier = fw
+                self._fw_frontier_at = time.monotonic()
             # 只存"最新值"不存历史：历史由 log_dir 负责（且仅登记项才记）
-            self.monitor_latest[idx] = MonitorSample(val, time.monotonic())  # 供 age_s 判新鲜度
+            self.monitor_latest[idx] = MonitorSample(val, time.monotonic(), fw)  # t_fw 供 lag_ms 判新鲜度
             # 记录中 且 该被登记过 → 才落样本。未登记的高频项不会撑爆内存
             if self.logging and idx in self.log_reg:
                 self._record(idx, val, stamp_ms)
@@ -1049,6 +908,9 @@ class Hub:
         if isinstance(index_or_name, int):
             return index_or_name
         name = str(index_or_name)
+        # HTTP 传过来的 index 是字符串数字（如 "3"），先按数字解释（与 resolve_monitor 一致）
+        if name.isdigit() and int(name) in self.tunable_dir:
+            return int(name)
         if name in self._name_to_tun:
             return self._name_to_tun[name]
         for n, i in self._name_to_tun.items():
@@ -1103,14 +965,30 @@ class Hub:
         否则 monitor_latest 里没有它，只能抛 KeyError——
         Backend 不会为了读一次值就临时去订一下（那样会打乱档位管理）。
 
-        age_s：距上次收到值的秒数。看门狗要判这个值，
-        因为"有值"和"值还新鲜"是两回事——推送断了以后旧值会一直留在缓存里。
+        新鲜度两个量，分工不同（"有值"和"值还新鲜"是两回事——推送断了以后
+        旧值会一直留在缓存里）：
+          lag_ms：落后最新监控帧多少 ms（下位机时间轴）。**看门狗主判据**——
+                  固件全量推送，正常项最多 80ms 必出现一次；lag_ms is None
+                  （只有目录初值）或 > FW_LAG_STALE_MS(300) 即旧。对恒定传输
+                  延迟和 PC 侧调度抖动免疫（相消/不进这条时间轴）。
+          age_s ：距上次收到推送的秒数（PC 时间轴）。到达新近度，恒定传输延迟
+                  下会骗人（全体看起来都新鲜）——降级为诊断量，排查"是不是
+                  PC/传输侧卡了"看它。
+        ⚠ 共同盲区：链路整体冻结（掉线/固件卡死）时没有新帧，lag 前沿也跟着冻，
+        看起来"新鲜"。那种情况以连接状态为准——心跳 80ms 一个 Ping、1s 没回
+        Pong 判掉线（固件侧 300ms 没见 Ping 就主动停推）。
         """
         idx = self.resolve_monitor(index_or_name)
         if idx not in self.monitor_latest:
             raise KeyError(f"监控项尚无数据（先 push 订阅再 read）: {index_or_name}")
         item = self.monitor_dir.get(idx)
         s = self.monitor_latest[idx]
+        # lag_ms：落后前沿多少 ms（mod 65536 相减，回绕/长间隔都精确）。
+        # 前沿只认"领先/断流后首帧"，故正常流的项 lag ∈ [0, 80]（低速项上限）；
+        # 大值只可能是真停推，或前沿刚跳过变（掉线恢复/重启）——两种都是旧。
+        lag_ms = None
+        if s.t_fw is not None and self._fw_frontier is not None:
+            lag_ms = float((self._fw_frontier - s.t_fw) & 0xFFFF)
         return MonitorReading(
             index=idx,
             name=item.name if item else str(idx),
@@ -1118,6 +996,7 @@ class Hub:
             unit=item.unit if item else "",
             # t_recv=None（只有目录初值、没推送过）按极旧处理，看门狗自然当过期
             age_s=round(time.monotonic() - (s.t_recv or 0.0), 3),
+            lag_ms=lag_ms,
         )
 
     def read_items(self, keys: list, missing_ok: bool = False) -> list[MonitorReading]:
@@ -1217,11 +1096,13 @@ class Hub:
     def cmd(self, index_or_name, *args) -> CmdResult:
         """按命令目录发一条命令（脚本主力写接口）。
 
-        两道严格校验：
+        三道严格校验：
           · 参数个数必须与目录完全一致 —— 少给不静默补 0（补 0 可能触发未预期动作），
             多给说明调用方写错了
+          · 参数类型必须符合目录字段声明 —— 数值字段只收 int/float，Color 字段只收
+            "#RRGGBB" 字符串；字符串/None/列表/布尔一律 400，不静默编 0
           · 目录里带取值范围（tag bit7）的字段做越界拦截 —— 别把车开到量程外
-        这两处报错请照着改，不要绕过去。
+        这几处报错请照着改，不要绕过去。
         """
         self.check_abort()
         item = self.resolve_cmd(index_or_name)
@@ -1234,15 +1115,16 @@ class Hub:
                 f"命令 {item.name} 需要 {len(types)} 个参数"
                 f"（{[f.name for f in fields]}），实际给了 {len(values)} 个"
             )
-        # 目录里带取值范围（tag bit7）的字段顺手校验，越界直接拦，别把车开到量程外
         for f, v in zip(fields, values):
-            lo, hi = f.min, f.max
-            if lo is None and hi is None:
-                continue
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                raise ValueError(f"命令 {item.name} 的参数 {f.name} 需要数值，实际给了 {v!r}")
-            if (lo is not None and v < lo) or (hi is not None and v > hi):
-                raise ValueError(f"命令 {item.name} 的参数 {f.name}={v} 超出范围（{lo}~{hi}）")
+            # 类型校验对每个字段生效（不止带 RANGE 的）：字符串/None/列表/布尔
+            # 一律 400 说清楚，绝不带到编帧层静默编 0
+            _check_field_type(f"命令 {item.name} 的参数 {f.name}", f.type, v)
+            # 目录里带取值范围（tag bit7）的字段查越界，别把车开到量程外。
+            # Color 的 min/max 解出来是颜色串、不比大小（本车命令表也没有 Color 字段）
+            if f.type != ValueType.Color:
+                lo, hi = f.min, f.max
+                if (lo is not None and v < lo) or (hi is not None and v > hi):
+                    raise ValueError(f"命令 {item.name} 的参数 {f.name}={v} 超出范围（{lo}~{hi}）")
         self.enqueue(command_send(item.index, types, values), PRI_SCRIPT)
         return CmdResult(ok=True, index=item.index, name=item.name, args=values)
 
@@ -1252,11 +1134,15 @@ class Hub:
         index_or_name: 调参项 index(int) 或中文名(str)
         value        : 要写入的值，最终以下位机回显(EchoEvent)为准覆盖显示值
         返回: SetTunableResult(ok, index, value)
-        抛错: abort 中抛 RuntimeError；名字不存在抛 KeyError
+        抛错: abort 中抛 RuntimeError；名字不存在抛 KeyError；值类型不符抛 ValueError
         """
         self.check_abort()
         idx = self.resolve_tunable(index_or_name)
         item = self.tunable_dir[idx]
+        # 与 hub.cmd 同一把尺子按目录声明类型校验：数值项只收 int/float、
+        # Color 项只收 "#RRGGBB" 字符串。字符串/None/列表一律 400，
+        # 不再静默编 0——静默 0 会把笔误伪装成"生效且值为 0"
+        _check_field_type(f"调参项[{item.name}]", item.type, value)
         self.enqueue(set_tunable(idx, item.type, value), PRI_SCRIPT)
         return SetTunableResult(ok=True, index=idx, value=value)
 
@@ -1362,6 +1248,186 @@ class Hub:
         rows.sort(key=lambda r: r.t)
         return LogRowsResult(rows=rows)
 
+    # 时间对齐容差 ms。登记的项都会被提升到高速推送(10ms)，同一拍发出的项时刻一致；
+    # 差 2ms 以上说明不是同一拍，不配对——所以这里只做"同拍精确配对"，不做插值/最近邻。
+    ALIGN_TOL_MS = 2.0
+
+    def calc(self, expr: str, agg: str = "", window=None) -> CalcResult:
+        """对本段记录做表达式计算：输入项名做逐点算术，再按需聚合。
+
+        expr：只含监控项名（中文）+ 算术运算符，如 "左0电流 - 左1电流"、
+              "(左0电流 + 左1电流 + 左2电流) / 3"
+        agg ：mean / sum / rms / std / max / min / abs_mean / count / median；
+              空串则返回逐点序列 [[t_ms, value], ...]
+        window：可选 [t0_ms, t1_ms]，只算这段时间内的点
+
+        项的取值来源：有历史序列的（已登记 + 本段有样本）逐点参与运算；
+        没有历史的（未登记的低速项）只有当前值，全程用这一个值，并在 missing 里标出。
+
+        解析走 ast 白名单，不做 eval 任意代码。
+        """
+        if window is not None:
+            if len(window) != 2:
+                raise ValueError("window 必须是 [t0_ms, t1_ms] 两个元素")
+            if window[0] > window[1]:
+                raise ValueError("window 区间反了：[%s, %s]" % (window[0], window[1]))
+
+        import ast
+        import math
+        import operator as op
+
+        ops = {
+            ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
+            ast.Div: op.truediv, ast.Pow: op.pow,
+            ast.USub: op.neg, ast.UAdd: op.pos,
+        }
+        aggs = {"mean", "sum", "rms", "std", "max", "min", "abs_mean", "count", "median"}
+
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except SyntaxError as e:
+            raise ValueError("表达式解析失败：%s"
+                             "（以数字开头或含空格的监控项名写不进表达式）" % e)
+
+        # 白名单校验：只允许 名称/数值常量/ops 表里的算术运算
+        # 注意 ast.walk 连运算符（Add/Sub...）和上下文（Load）节点都会吐出来，
+        # 这两类必须放行，否则任何带运算符的表达式都过不了校验。
+        # 运算符只放行 ops 里真正实现的那几个：放行 ast.operator 基类会让 % // & 等
+        # 混过校验，到 eval_node 才 KeyError —— 而这个 KeyError 会被路由当成"项不存在"
+        # 回 404，语义全错。这里挡掉才是 400。
+        names = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                names.append(node.id)
+            elif isinstance(node, ast.Constant):
+                # 常量只收数值：字符串/None/布尔放过去要到 eval_node 才炸，错误离现场太远
+                if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+                    raise ValueError("表达式里只允许数值常量，实际给了 %r" % (node.value,))
+            elif isinstance(node, (ast.BinOp, ast.UnaryOp, ast.Expression,
+                                   ast.expr_context, *ops)):
+                continue
+            else:
+                raise ValueError("表达式只允许监控项名、数字和 + - * / ** 运算")
+        if not names:
+            raise ValueError("表达式里没有监控项")
+        # agg 在这里就验：放到配点之后，一旦窗口内没点就会先报"没有可配对的有效点"，
+        # 把 agg 拼错这件事盖掉（用户看到的是个不相干的错误）。
+        if agg and agg not in aggs:
+            raise ValueError("不支持的聚合：%s（可用 %s）" % (agg, "/".join(sorted(aggs))))
+        for n in names:
+            self.resolve_monitor(n)   # 不存在会抛 KeyError
+
+        def as_real(v):
+            """运算结果收口：复数/inf/nan 就地转 400，别留到 JSON 序列化时才炸。
+
+            复数来自负数的分数次幂（(-8) ** 0.5），inf/nan 来自过大的幂。
+            除零不在这里挡——那是数据问题（某一拍分母为 0），跳点比整体报错合适。
+            """
+            if isinstance(v, complex) or not math.isfinite(v):
+                raise ValueError("运算结果不是有限实数（检查负数的分数次幂与过大的指数）")
+            return v
+
+        def eval_node(node, env):
+            if isinstance(node, ast.Constant):
+                return float(node.value)
+            if isinstance(node, ast.Name):
+                return env[node.id]
+            if isinstance(node, ast.UnaryOp):
+                return as_real(ops[type(node.op)](eval_node(node.operand, env)))
+            if isinstance(node, ast.BinOp):
+                try:
+                    v = ops[type(node.op)](eval_node(node.left, env),
+                                           eval_node(node.right, env))
+                except OverflowError:
+                    raise ValueError("运算结果溢出（幂运算底数或指数太大）")
+                return as_real(v)
+            raise ValueError("不支持的语法节点")
+
+        # 取各项：有历史的用序列，没有的用当前值
+        seq, single, missing = {}, {}, {}
+        t_index: dict[int, dict[str, float]] = {}
+        for n in set(names):
+            idx = self.resolve_monitor(n)
+            pts = self._samples(idx)
+            if pts:
+                seq[n] = pts
+            else:
+                s = self.monitor_latest.get(idx)
+                if s is None:
+                    missing[n] = "没有任何取值"
+                else:
+                    single[n] = float(s.value)
+                    missing[n] = "无历史序列，全程用当前值"
+        if missing and all(v.startswith("没有任何") for v in missing.values()):
+            # 项在目录里、但一个值都没收到过 → 400"还没取值"，不是 404"不存在"。
+            # 别抛 KeyError：路由把 KeyError 一律当 404，会让"没数据"伪装成"名字错了"。
+            raise ValueError("监控项还没有任何取值：" + "、".join(missing))
+
+        if not seq:
+            # 全是单点项：算一次即可
+            env = {n: single[n] for n in set(names) if n in single}
+            # 混进一个"完全没值"的项时 env 会缺它，别让 eval_node 漏出裸 KeyError
+            if not all(n in env for n in names):
+                raise ValueError("监控项还没有任何取值："
+                                 + "、".join(n for n in names if n not in env))
+            try:
+                v = eval_node(tree.body, env)
+            except ZeroDivisionError:
+                raise ValueError("除零")
+            return CalcResult(ok=True, expr=expr, agg=agg or "none", value=v,
+                              n=1, series=[], missing=missing)
+
+        # 以第一项的时刻为基准，其余项按 ±ALIGN_TOL_MS 同拍配对
+        base_name = sorted(seq)[0]
+        for t, v in seq[base_name]:
+            if window and not (window[0] <= t <= window[1]):
+                continue
+            t_index[int(round(t))] = {base_name: v}
+        for n in sorted(seq):
+            if n == base_name:
+                continue
+            for t, v in seq[n]:
+                k = int(round(t))
+                for cand in (k - 2, k - 1, k, k + 1, k + 2):
+                    if cand in t_index and abs(t - cand) <= self.ALIGN_TOL_MS:
+                        t_index[cand][n] = v
+                        break
+
+        out = []
+        for t in sorted(t_index):
+            env = dict(t_index[t])
+            env.update(single)
+            if not all(n in env for n in names):
+                continue    # 本拍缺项就跳过
+            try:
+                out.append((t, eval_node(tree.body, env)))
+            except ZeroDivisionError:
+                continue
+        if not out:
+            raise ValueError("没有可配对的有效点（窗口内无样本 / 各项未落在同一拍 /"
+                             " 某项完全没有取值）")
+
+        vals = [v for _, v in out]
+        if not agg:
+            return CalcResult(ok=True, expr=expr, agg="none", value=None, n=len(vals),
+                              series=out, missing=missing)
+        n = len(vals)
+        mean = sum(vals) / n
+        table = {
+            "mean": mean,
+            "sum": sum(vals),
+            "rms": math.sqrt(sum(v * v for v in vals) / n),
+            "std": math.sqrt(sum((v - mean) ** 2 for v in vals) / n) if n > 1 else 0.0,
+            "max": max(vals),
+            "min": min(vals),
+            "abs_mean": sum(abs(v) for v in vals) / n,
+            "count": float(n),
+            "median": sorted(vals)[n // 2] if n % 2 else
+                      (sorted(vals)[n // 2 - 1] + sorted(vals)[n // 2]) / 2.0,
+        }
+        return CalcResult(ok=True, expr=expr, agg=agg, value=table[agg], n=n,
+                          series=[], missing=missing)
+
     def log_stats(self, names=None, thresholds=()) -> LogStatsResult:
         """整段统计（后端算好，脚本不用自己攒样本）。
 
@@ -1452,8 +1518,9 @@ class Hub:
         重复中文名、行数与 token 都膨胀 N 倍，还得先 pivot 才能算。
 
         对齐：log 登记会把该项提升到高速推送，故按 LOG_BUCKET_MS 分桶，桶内每项取
-        最后一个样本。缺失留**空单元格**（pandas 一样读成 NaN，但省 token），
-        整桶全空不出行、只计入 missing——所以空单元格的位置就是丢包位置。
+        最后一个样本。桶只由"到达了样本"的 10ms 窗口产生，没有样本的时段不出行；
+        桶内某列缺样本就留空单元格并计入 missing——空单元格的位置就是丢包位置
+        （pandas 一样读成 NaN，但省 token）。
 
         返回 (列名, {列名: 空单元格数})。utf-8-sig 带 BOM，Excel 打开中文不乱码。
         """
@@ -1489,7 +1556,10 @@ class Hub:
         return cols, missing
 
     def _write_plot(self, target: Path, rows: list[LogRow]) -> None:
-        """按监控项作图并导出图片：每项一条曲线，横轴为相对本段零点的秒。
+        """按监控项作图并导出图片，横轴为相对本段零点的秒。
+
+        一个单位一个子图、各自独立 y 轴：电压(0~12V)和电流(0~0.5A)共用一个 y 轴时，
+        电流会被压成贴底的直线，看不出任何起伏。子图上下排列、共享 x 轴，便于对齐看相位。
 
         matplotlib 延迟导入——不画图的后端无需安装它。
         """
@@ -1502,21 +1572,34 @@ class Hub:
         plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
         plt.rcParams["axes.unicode_minus"] = False
 
-        series: dict[str, list[tuple[float, float]]] = {}
+        # 按单位分桶（保序：目录里先出现的单位在上）
+        by_unit: dict[str, dict[str, list[tuple[float, float]]]] = {}
+        order: list[str] = []
         for r in rows:
-            series.setdefault(r.name, []).append((r.t / 1000.0, r.value))
+            u = self._mon_unit(r.index) or "值"
+            if u not in by_unit:
+                by_unit[u] = {}
+                order.append(u)
+            by_unit[u].setdefault(r.name, []).append((r.t / 1000.0, r.value))
 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        for name, pts in series.items():
-            ax.plot([p[0] for p in pts], [p[1] for p in pts], linewidth=1, label=name)
-        ax.set_xlabel("t / s")
-        ax.set_ylabel("value")
-        ax.grid(True, alpha=0.3)
-        if series:
-            ax.legend(loc="best", fontsize=8)
+        n = max(1, len(order))
+        fig, axes = plt.subplots(n, 1, figsize=(12, 3.0 * n), sharex=True, squeeze=False)
+        for i, u in enumerate(order):
+            ax = axes[i][0]
+            for name, pts in by_unit[u].items():
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], linewidth=1, label=name)
+            ax.set_ylabel(u)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right", fontsize=7, ncol=3)
+        axes[-1][0].set_xlabel("t / s（相对本段零点）")
         fig.tight_layout()
         fig.savefig(target, dpi=120)
         plt.close(fig)
+
+    def _mon_unit(self, idx: int) -> str:
+        """监控项单位（目录里带的，如 V / A / pct）；查不到返回空串。"""
+        item = self.monitor_dir.get(idx)
+        return getattr(item, "unit", "") or ""
 
     def snapshot(self) -> Snapshot:
         """/api/status 的返回体：一眼看清 Backend 全貌，调试脚本连不上的第一站。
