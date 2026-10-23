@@ -92,7 +92,7 @@ private:
         //   值宽也不单独给：同上，由该项在目录里登记的类型决定
         //   time 下位机毫秒时钟低16位，小端，65.536s自然回绕；同一帧的项采样时刻相同
         Monitor_Post, // 监控值推送：一帧可含多项，最多 MON_PACK_MAX 项
-        Tunable_Echo,           // 有内容命令 [CMD 1B][index索引1B][实际生效值?B取决于type][XOR]
+        Tunable_Echo,           // 有内容命令 [type 1B][index索引1B][实际生效值?B][XOR]，type前缀自带宽度免查表
         Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][tag 1B][名长][名][参数量][每参:类型+字段名长+字段名][bit7=1时:每参min+max，各按该参类型定宽]，一命令一帧
         Pong = 0xFF,
     };

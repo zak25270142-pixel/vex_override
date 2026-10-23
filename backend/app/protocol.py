@@ -9,26 +9,19 @@ include/communication.h 严格一一对应）
 本文件是帧编解码的唯一真源：上位机(TS)、后端(本文件)、下位机(C++)三处
 必须同步修改，任何一边改了编号或位域而另外两边没跟上，链路会静默错乱
 （表现为"值对不上"而不是"报错"），改这里要三处一起改。
+
+职责划分：本文件只做"字节 ↔ 帧"和值编解码。FrameParser 是纯解帧状态机，
+吐出 (cmd, payload) 为止；目录解析、监控值/回显解码等业务语义在 hub.py
+（那里的目录表是类型真源，parser 不存任何类型状态）。每帧长度都由帧自身
+确定：监控值帧带 1B 长度前缀、调参回显带 type 前缀、命令目录头 2B 是内容
+长度、调参/监控目录靠 _dir_len 现场试算——解帧不依赖外部状态。
 """
 
 import struct
 from collections.abc import Callable
 from enum import IntEnum
 
-from .dataclass import (
-    CellValue,
-    CmdDirItem,
-    CmdDirectoryEvent,
-    CmdField,
-    DirTable,
-    DirectoryEvent,
-    EchoEvent,
-    MenuItem,
-    PongEvent,
-    RxEvent,
-    RxStats,
-    ValueEvent,
-)
+from .dataclass import CellValue, RxStats
 
 FRAME_HEAD = 0xA5 # 帧头
 
@@ -54,7 +47,7 @@ class CmdGet(IntEnum):
     RequestMonitor = 1  # 请求监控目录
     Subscribe = 2  # 订阅/退订监控项（payload: [index][tag]）
     SetTunable = 3  # 写调参项（payload: [index][8B 定长值]）
-    RequestCommand = 4  # 请求命令目录
+    RequestCommand = 4  # 请求动作命令目录
     Ping = 0xFF 
 
 
@@ -256,7 +249,8 @@ def request_command() -> bytes:
 def subscribe(index: int, sub: bool, fast: bool) -> bytes:
     """订阅帧。只带 SUB/FAST 两个 bit，下位机会保留它自己的 GETTER/KIND。
 
-    index=0xFF 是广播语义：对全部监控项套用这个 tag（Backend 初始化时用）。
+    固件支持 index=0xFF 对全部监控项套同一 tag（communication.cpp），
+    但后端不用：订阅档位是 per-index diff 管理的，一帧广播会抹掉项间差异。
     """
     tag = (MONITOR_TAG_SUB if sub else 0) | (MONITOR_TAG_FAST if fast else 0)
     return build_frame(CmdGet.Subscribe, bytes([index & 0xFF, tag]))
@@ -266,7 +260,7 @@ def ping() -> bytes:
     return build_frame(CmdGet.Ping)
 
 def set_tunable(index: int, type_: int, value: CellValue) -> bytes:
-    """写调参项。值固定 8 字节，类型由上位机从目录里查到后传入。"""
+    """写调参项。值固定 8 字节，类型由调用方从目录里查到后传入。"""
     return build_frame(CmdGet.SetTunable, bytes([index & 0xFF]) + encode_value8(type_, value))
 
 def command_send(cmd_index: int, field_types: list[int], values: list[CellValue]) -> bytes:
@@ -312,7 +306,6 @@ def _dir_len(p: bytes, length: int) -> int:
         return -1
     return 5 + name_len + p[unit_len_at] + value_size(p[1])
 
-
 def _cmd_dir_len(p: bytes, length: int) -> int:
     """动作命令目录帧 payload 总长；不够返回 -1。
 
@@ -326,52 +319,13 @@ def _cmd_dir_len(p: bytes, length: int) -> int:
     return 2 + int.from_bytes(p[0:2], "little")
 
 
-def scan_dir_frames(chunk: bytes) -> tuple[list[tuple[int, bytes]], int]:
-    """从原始字节流里挑完整的上行目录帧。
-    返回 ([(cmd, 整帧含帧头校验)], 已安全消费的前缀长度)；
-
-    用途：Backend 用它从广播给上位机的原始字节里"旁路"摘出目录帧做缓存，
-    这样上位机要目录时可以由后端回放，不必每次都打扰下位机。
-    """
-    out: list[tuple[int, bytes]] = []
-    i = 0
-    n = len(chunk)
-    while i + 4 <= n:
-        if chunk[i] != FRAME_HEAD:
-            i += 1
-            continue
-        cmd = chunk[i + 1]
-        if cmd == CmdPost.Pong:
-            # Pong 固定 3 字节（A5 FF FF），直接跳过不进结果
-            i += 3
-            continue
-        if cmd in (CmdPost.TunableDirectory, CmdPost.MonitorDirectory):
-            total = _dir_len(chunk[i + 2 :], n - i - 2)
-        elif cmd == CmdPost.CMDDirectory:
-            total = _cmd_dir_len(chunk[i + 2 :], n - i - 2)
-        else:
-            # 非目录帧（监控值推送等）不关心，但也不能当成 A5 误判往前跳一字节了事：
-            # 这里只跳 1，靠下一轮重新找 A5，可能把 payload 里的 A5 当帧头，
-            # 但随后长度试算/校验会失败，最坏是漏掉帧，不会错位解析出脏数据。
-            i += 1
-            continue
-        if total < 0:
-            break  # 帧还没收全，等下一批字节
-        end = i + 2 + total + 1
-        if end > n:
-            break
-        frame = chunk[i:end]
-        xor = 0
-        for b in frame[1:-1]:
-            xor ^= b
-        if xor == frame[-1]:
-            out.append((cmd, bytes(frame)))
-        i = end
-    return out, i
-
-
 class FrameParser:
-    """与 TS FrameParser 同构的逐字节状态机：喂串口 chunk，吐解析事件（RxEvent）。"""
+    """与 TS FrameParser 同构的逐字节状态机：喂串口 chunk，吐 (cmd, payload)。
+
+    只做帧边界：校验通过后回调 on_frame(cmd, payload)，payload 不含帧头/
+    命令字/校验字节。目录解析、监控值/回显解码等业务语义在 hub.py——那里的
+    目录表是类型真源，本类不存任何类型状态，也不认识任何业务结构。
+    """
 
     def __init__(self) -> None:
         self.state = _RxState.WaitHead
@@ -391,28 +345,15 @@ class FrameParser:
 
         self.payload = bytearray(MAX_PAYLOAD)
         '''当前 payload 缓冲区'''
-        
-        # monitor/tunable 每项 value 类型靠各自目录帧登记，收推送时按 index 查。
-        # 这是关键：监控值推送帧里只有一串 [index][值]，既没有类型字节也没有项数，
-        # 必须先收到目录帧才知道每项该按几个字节、什么类型解（靠宽度推进偏移到 payloadlen 末尾）。
-        # 所以目录没拉到之前收到的监控值帧会被解成 0（value_size(0)=1 → UInt8）。
-        # 两张表不能合并：index 是各自目录数组的下标（固件里 tunable_items 与
-        # monitor_items 是两个独立数组），同号 index 在两张表里是毫不相干的两项、
-        # 类型可能不同，合并会让两者互相覆盖。
-        self.monitor_type = bytearray(256)
-        '''监控值类型缓存'''
-        
-        self.tunable_type = bytearray(256)
-        '''调参值类型缓存'''
-        
+
         self.stats = RxStats()
         '''链路诊断计数'''
 
-    def feed(self, chunk: bytes, on_event: Callable[[RxEvent], None]) -> None:
+    def feed(self, chunk: bytes, on_frame: Callable[[int, bytes], None]) -> None:
         """
-        喂一批串口字节，逐字节走状态机，解出完整帧就调 on_event。
+        喂一批串口字节，逐字节走状态机，解出完整帧就调 on_frame(cmd, payload)。
         chunk   : 本次从串口读到的原始字节（可含半帧/多帧，状态机自己处理粘包拆包）
-        on_event: 解析完整帧回调函数
+        on_frame: 完整帧出口 (cmd, payload)，payload 已剥掉帧头/命令字/校验
         """
         self.stats.bytes += len(chunk)
         for b in chunk:
@@ -454,8 +395,9 @@ class FrameParser:
 
                 if self.expect < 0:
                     # 边收边试算长度：收到足够字节能确定总长就定下来。
-                    # 目录帧要收完名字长度、单位长度才能算；调参回显收 1 字节 index 查类型表；
-                    # 监控值帧自带 1B 长度前缀，收 1 字节就能定长（不依赖先拿到目录）。
+                    # 监控值帧自带 1B 长度前缀，收 1 字节就能定长；
+                    # 调参回显 [type][index][value] 的 type 前缀自带宽度；
+                    # 目录帧要收完名字长度、单位长度才能算（_dir_len/_cmd_dir_len）。
                     if self.cmd == CmdPost.MonitorValue:
                         # payloadlen==0 对监控值帧非法：固件 monitor_tick 只在 pack_num>0
                         # 时 flush 且每帧必含 2B 时间戳（communication.cpp），真实帧
@@ -467,7 +409,12 @@ class FrameParser:
                         else:
                             self.expect = 1 + self.payload[0] # len 只算它后面那些字节，加上 len 自身才是总长
                     elif self.cmd == CmdPost.TunableEcho:
-                        self.expect = 1 + value_size(self.tunable_type[self.payload[0]])
+                        # [type][index][value]：type 前缀即宽度，解帧不查目录
+                        sz = value_size(self.payload[0])
+                        if sz == 0:
+                            self.state = _RxState.WaitHead  # 不认识的值类型：当错误帧重找 A5
+                        else:
+                            self.expect = 2 + sz
                     elif self.cmd == CmdPost.CMDDirectory:
                         total = _cmd_dir_len(bytes(self.payload[: self.len]), self.len)
                         if total >= 0:
@@ -482,137 +429,6 @@ class FrameParser:
                 self.state = _RxState.WaitHead
                 if (self.xor ^ b) == 0:
                     self.stats.frames += 1
-                    self._dispatch(on_event)
+                    on_frame(self.cmd, bytes(self.payload[: self.len]))
                 else:
                     self.stats.badChecksum += 1
-
-    def _dispatch(self, on_event: Callable[[RxEvent], None]) -> None:
-        """
-        一帧校验通过后调用：按命令字把 payload 解成对应 RxEvent 并回调 on_event。
-        on_event: 事件出口（SerialBridge 注入 Hub._on_serial_event）
-        按 self.cmd 分五种：
-            Tunable/MonitorDirectory → DirectoryEvent（顺带登记该项类型到类型表）
-            MonitorValue             → ValueEvent
-            TunableEcho              → EchoEvent
-            CMDDirectory             → CmdDirectoryEvent
-            Pong                     → PongEvent
-        """
-        p = bytes(self.payload[: self.len])
-        cmd = self.cmd
-
-        if cmd in (CmdPost.TunableDirectory, CmdPost.MonitorDirectory):
-            if self.len < 4:
-                return
-            index = p[0]
-            type_ = p[1]
-            tag = p[2]
-            name_len = p[3]
-            unit_len_at = 4 + name_len
-            if self.len < unit_len_at + 1:
-                return
-            unit_len = p[unit_len_at]
-            value_at = 5 + name_len + unit_len
-            if self.len < value_at:
-                return
-            name = p[4:unit_len_at].decode("utf-8", errors="replace")
-            unit = p[unit_len_at + 1 : value_at].decode("utf-8", errors="replace")
-            value = decode_value(p, value_at, type_) if value_size(type_) else 0
-            table = DirTable.tunable if cmd == CmdPost.TunableDirectory else DirTable.monitor
-            # 登记类型：后续监控值推送帧靠这个表才知道怎么解
-            if table is DirTable.monitor:
-                self.monitor_type[index] = type_
-            else:
-                self.tunable_type[index] = type_
-            on_event(
-                DirectoryEvent(
-                    table=table,
-                    item=MenuItem(
-                        index=index,
-                        type=type_,
-                        tag=tag,
-                        name=name,
-                        unit=unit,
-                        value=value,  # 目录帧自带一次当前值，省得再单独取
-                    ),
-                )
-            )
-            return
-
-        if cmd == CmdPost.MonitorValue:
-            # [payloadlen][time 2B]([index][值])×N：没有项数字段，靠类型表推进偏移走到payload末尾
-            if self.len < 3:
-                return
-            t_ms = p[1] | (p[2] << 8)
-            # 先走一趟核对偏移：必须正好落在末尾，对不上说明类型表与发送方不一致，整帧放弃（不产脏事件）
-            off = 3
-            ok = True
-            while off < self.len:
-                sz = value_size(self.monitor_type[p[off]])
-                if sz == 0:
-                    ok = False
-                    break
-                off += 1 + sz
-            if not (ok and off == self.len):
-                return
-            off = 3
-            while off < self.len:
-                index = p[off]
-                type_ = self.monitor_type[index]
-                value = decode_value(p, off + 1, type_)
-                on_event(ValueEvent(index=index, value=value, t_ms=t_ms))
-                off += 1 + value_size(type_)
-            return
-
-        if cmd == CmdPost.TunableEcho:
-            if self.len < 1:
-                return
-            index = p[0]
-            type_ = self.tunable_type[index]
-            value = decode_value(p, 1, type_) if value_size(type_) else 0
-            on_event(EchoEvent(index=index, value=value))
-            return
-
-        if cmd == CmdPost.CMDDirectory:
-            # payload 头 2B 是内容长度，内容从 off=2 起：[命令字][tag][名长][名][参数量][字段...]
-            if self.len < 5:
-                return
-            off = 2
-            index = p[off]
-            tag = p[off + 1]
-            name_len = p[off + 2]
-            name_at = off + 3
-            off = name_at + name_len
-            if self.len < off + 1:
-                return
-            name = p[name_at:off].decode("utf-8", errors="replace")
-            field_num = p[off]
-            off += 1
-            fields: list[CmdField] = []
-            for _ in range(field_num):
-                if self.len < off + 2:
-                    return
-                ftype = p[off]
-                fname_len = p[off + 1]
-                off += 2
-                fname = p[off : off + fname_len].decode("utf-8", errors="replace")
-                off += fname_len
-                fields.append(CmdField(type=ftype, name=fname))
-            # RANGE 置位：后面紧跟每个参数一对 (min,max)，宽度与类型与该字段一致
-            if tag & CMD_TAG_RANGE:
-                for f in fields:
-                    sz = value_size(f.type)
-                    if sz == 0 or self.len < off + 2 * sz:
-                        break  # str/other 无范围；或帧被截断
-                    f.min = decode_value(p, off, f.type)
-                    f.max = decode_value(p, off + sz, f.type)
-                    off += 2 * sz
-            on_event(
-                CmdDirectoryEvent(
-                    item=CmdDirItem(index=index, tag=tag, name=name, fields=fields),
-                )
-            )
-            return
-
-        if cmd == CmdPost.Pong:
-            on_event(PongEvent())
-            return

@@ -453,14 +453,16 @@ void USB_Comm::tx_tick()
 
     // 调参回显：从data_ptr重读内存里的真实值（而非回响收到值），
     // 这样上位机看到的是裁剪/换算后实际生效的结果。先取index再清槽。
+    // 帧格式 [type][index][value]：type 前缀让回显帧自带宽度，上位机解帧
     if (echo_index != 0xFF)
     {
         uint8_t index = echo_index;
         echo_index = 0xFF;
         const MENU_ITEM &item = tunable_items[index];
-        tx_frame[2] = index;
-        uint8_t vlen = append_value(&tx_frame[3], item);
-        send_frame(Tunable_Echo, 1 + vlen);
+        tx_frame[2] = static_cast<uint8_t>(item.data_type);
+        tx_frame[3] = index;
+        uint8_t vlen = append_value(&tx_frame[4], item);
+        send_frame(Tunable_Echo, 2 + vlen);
     }
 
     // 有待发目录时这一拍先发一批。两个倒计时同时非零（理论上几乎不会，

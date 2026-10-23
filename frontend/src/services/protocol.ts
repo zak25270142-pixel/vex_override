@@ -471,10 +471,12 @@ export class FrameParser {
   private len = 0
   private xor = 0
   private payload = new Uint8Array(MAX_PAYLOAD)
-  /** 监控项 index→类型，收到监控目录后由外部登记，解 MonitorValue 帧时要用 */
-  private monitorType = new Uint8Array(256)
-  /** 调参项 index→类型，收到调参目录后登记，解 TunableEcho 帧时用（两张表 index 独立） */
-  private tunableType = new Uint8Array(256)
+  /**
+   * 监控项 index→类型，收到监控目录后由外部登记（setMonitorType），
+   * 解 MonitorValue 帧时要用。初值 0xFF 不是合法 ValueType，即"目录里
+   * 没登记过"——解到这种 index 就丢该帧剩余，与 0(UInt8) 区分开。
+   */
+  private monitorType = new Uint8Array(256).fill(0xFF)
 
   /** 链路诊断计数（故障定位用，UI 直接读） */
   readonly stats = {
@@ -497,16 +499,8 @@ export class FrameParser {
     this.monitorType[index] = type
   }
 
-  setTunableType(index: number, type: ValueType): void {
-    this.tunableType[index] = type
-  }
-
   resetMonitorTypes(): void {
-    this.monitorType.fill(0)
-  }
-
-  resetTunableTypes(): void {
-    this.tunableType.fill(0)
+    this.monitorType.fill(0xFF)
   }
 
   /** 喂入任意长度的字节块（半包/粘包都在此消化），完整帧通过回调吐出 */
@@ -567,8 +561,14 @@ export class FrameParser {
                 this.expect = 1 + this.payload[0]!
               }
             } else if (this.cmd === CmdPost.TunableEcho) {
-              // 调参回显：[index][值]，类型查调参登记表
-              this.expect = 1 + valueSize(this.tunableType[this.payload[0]!]!)
+              // 调参回显：[type][index][value]，type 前缀自带宽度，解帧不查表
+              // （与后端 protocol.py 同步）。width=0 的 type 不合法：流错位，重找帧头
+              const sz = valueSize(this.payload[0]! as ValueType)
+              if (sz === 0) {
+                this.state = RxState.WaitHead
+              } else {
+                this.expect = 2 + sz
+              }
             } else if (this.cmd === CmdPost.CMDDirectory) {
               // 命令目录：payload 头 2B 就是内容长度，收够 2B 即定长
               const total = cmdDirLen(this.payload, this.len)
@@ -624,38 +624,28 @@ export class FrameParser {
         break
       }
       case CmdPost.MonitorValue: {
-        // [payloadlen][time 2B]([index][值])×N：没有项数字段，靠类型表推进偏移走到 payload 末尾
+        // [payloadlen][time 2B]([index][值])×N：没有项数字段，类型查目录登记表；
+        // 遇没登记过的 index（monitorType 里是 0xFF 哨兵）丢剩余，已解出的照常发
         if (this.len < 3) return
         const tMs = p[1]! | (p[2]! << 8)
-        // 先走一趟核对偏移：必须正好落在末尾，对不上说明类型表与发送方不一致，整帧放弃（不产脏事件）
         let off = 3
-        let ok = true
         while (off < this.len) {
-          const sz = valueSize(this.monitorType[p[off]!] as ValueType)
-          if (sz === 0) {
-            ok = false
-            break
-          }
-          off += 1 + sz
-        }
-        if (!ok || off !== this.len) return
-        off = 3
-        while (off < this.len) {
-          const index = p[off]!
-          const type = this.monitorType[index] as ValueType
+          const type = this.monitorType[p[off]!] as ValueType
+          const sz = valueSize(type)
+          if (sz === 0) break // 目录里没登记过这项：丢剩余
           const value = decodeValue(new DataView(p.buffer, p.byteOffset + off + 1), 0, type)
-          onEvent(new ValueEvent(index, value, tMs))
-          off += 1 + valueSize(type)
+          onEvent(new ValueEvent(p[off]!, value, tMs))
+          off += 1 + sz
         }
         break
       }
       case CmdPost.TunableEcho: {
-        // [index][实际生效值]，类型查调参表登记表
-        if (this.len < 1) return
-        const index = p[0]!
-        const type = this.tunableType[index] as ValueType
+        // [type][index][实际生效值]：type 前缀自带宽度，不查表
+        if (this.len < 2) return
+        const type = p[0]! as ValueType
         if (valueSize(type) === 0) return
-        const value = decodeValue(new DataView(p.buffer, p.byteOffset + 1), 0, type)
+        const index = p[1]!
+        const value = decodeValue(new DataView(p.buffer, p.byteOffset + 2), 0, type)
         onEvent(new EchoEvent(index, value))
         break
       }

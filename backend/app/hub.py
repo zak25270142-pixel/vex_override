@@ -20,41 +20,39 @@ from typing import Any
 from fastapi import WebSocket
 
 from .protocol import (
-    CmdDirItem,
-    CmdDirectoryEvent,
+    CMD_TAG_RANGE,
     CmdGet,
     CmdPost,
     CmdSpec,
-    DirTable,
-    DirectoryEvent,
-    EchoEvent,
-    MenuItem,
-    RxEvent,
-    ValueEvent,
     ValueType,
     build_frame,
     cmd_spec,
     command_send,
+    decode_value,
     ping,
     request_command,
     request_monitor,
     request_tunable,
-    scan_dir_frames,
     set_tunable,
     subscribe,
     tag_fast,
     tag_subscribed,
+    value_size,
 )
 from .dataclass import (
     AggregateStats,
     CalcResult,
+    CmdDirItem,
+    CmdField,
     CmdResult,
+    DirEntry,
     EndLogResult,
     LogFileMeta,
     LogRow,
     LogRowsResult,
     LogStatsItem,
     LogStatsResult,
+    MenuItem,
     MonitorReading,
     MonitorSample,
     OkResult,
@@ -78,6 +76,11 @@ logger = logging.getLogger("vex.hub")
 # 余量：低速项 80ms 才刷新一次（SLOW_PHASES=8 × 10ms 拍），300ms 是其 3.75 倍，
 # 正常流转不会被误判；真停推/丢帧时 300ms 内必现形。阈值策略留给消费方，这里只定数。
 FW_LAG_STALE_MS = 300
+
+# lag 外推量封顶（ms）。前沿 = 最后采纳帧的固件戳 + 此后流逝的 PC 时间；
+# 封顶防持续掉线 65.5s 后 mod 65536 绕圈，把"极旧"伪装成"新鲜"。
+# 60s 远大于任何合理重连周期（5s 一轮），也不会压缩正常判据（300ms）。
+FW_LAG_EXTRAPOLATE_CAP_MS = 60000
 
 # ---------- 下行优先级 ----------
 PRI_STOP = 0 # 0停车帧。永远第一
@@ -166,7 +169,7 @@ class Hub:
         self.bridge = SerialBridge(
             port=port,
             baud=baud,
-            on_event=self._on_serial_event, # 串口事件回调
+            on_frame=self._on_frame, # 完整帧回调 (cmd, payload)
             on_status=self._on_serial_status, # 串口状态回调
             on_raw=self._on_serial_raw, # 串口原始数据回调
         )
@@ -175,13 +178,13 @@ class Hub:
         '''print_log 不传 path 时的默认落盘目录；构造时确保存在'''
         self.pytest_dir.mkdir(parents=True, exist_ok=True)
 
-        # 三张目录缓存 index → item（item 是 protocol.py 里的 dataclass）
-        self.tunable_dir: dict[int, MenuItem] = {}
-        '''可调参数目录缓存 {index: MenuItem}'''
-        self.monitor_dir: dict[int, MenuItem] = {}
-        '''监控项目录缓存 {index: MenuItem}'''
-        self.cmd_dir: dict[int, CmdDirItem] = {}
-        '''命令目录缓存 {index: CmdDirItem}'''
+        # 三张目录表 index → DirEntry（item=解析结果，frame=完整原始帧供回放）
+        self.tunable_dir: dict[int, DirEntry] = {}
+        '''可调参数目录 {index: DirEntry}'''
+        self.monitor_dir: dict[int, DirEntry] = {}
+        '''监控项目目录 {index: DirEntry}'''
+        self.cmd_dir: dict[int, DirEntry] = {}
+        '''命令目录 {index: DirEntry}'''
 
         # name → index 反查（脚本可用中文名寻址）
         self._name_to_mon: dict[str, int] = {}
@@ -190,12 +193,6 @@ class Hub:
         '''可调参数中文名 → index '''
         self._name_to_cmd: dict[str, int] = {}
         '''命令中文名 → index '''
-
-        self._dir_cache: dict[int, dict[int, bytes]] = {}
-        '''目录原始帧缓存 {cmd: {index: 完整帧bytes}}，同 index 覆盖不叠加'''
-
-        self._dir_buf = bytearray()
-        '''粘包尾部缓冲：目录 burst 跨 chunk 时剩下的不完整帧尾'''
 
         self.monitor_latest: dict[int, MonitorSample] = {}
         # 最新监控帧的下位机原始戳（rx 线程维护；HTTP 线程只读单属性，GIL 原子）。
@@ -302,7 +299,7 @@ class Hub:
         self.abort_event = threading.Event()
         '''脚本协作式中止旗标：emergency_stop 置位 → cmd()/sleep() 的 check_abort 抛错；clear_abort 复位'''
 
-        # 停车命令的 index。从命令目录 tag 的 SPEC=Stop 位认出来（_on_serial_event），
+        # 停车命令的 index。从命令目录 tag 的 SPEC=Stop 位认出来（_on_frame），
         # 固件改了命令表顺序也不怕；目录没到时兜底用 0x80（见 _stop_index）。
         self._stop_cmd_index: int | None = None
         '''停车命令 index：命令目录 tag 的 SPEC=Stop 自动认出；None=目录未到（兜底 0x80）'''
@@ -437,45 +434,31 @@ class Hub:
         """连接意愿开关：True 时掉线自动重连，False 时重连线程停手。"""
         self._want_connected = bool(want)
 
-    # ---------- 目录缓存 ----------
+    # ---------- 目录请求与回放 ----------
 
-    def _cache_dir_frame(self, cmd: int, frame: bytes) -> None:
-        """目录一项一帧（payload[0]=index），同 cmd+index 覆盖不叠加。
+    def _request_dir(self, table: dict[int, DirEntry], names: dict[str, int], request_frame: bytes) -> None:
+        """主动拉某张表前先清它的目录项和名字反查，避免新旧两轮 burst 混叠。
 
-        下位机发目录是一轮 burst（每项一帧，8 项一批）。用 index 作键覆盖式缓存，
-        这样重复拉表时是"替换"而不是"追加"，不会攒出一份新旧混叠的目录。
+        比如目录从 20 项变成 18 项：不清的话新 burst 只覆盖前 18 个 index，
+        第 19、20 项会作为陈旧残留留在表里，前端就会看到两个已经不存在的项。
+        （连上/重连时三张表整体已清，这里管的是运行中主动重拉。）
         """
-        if len(frame) >= 3:
-            self._dir_cache.setdefault(cmd, {})[frame[2]] = frame
-
-    def _dir_frames_list(self, post_cmd: int) -> list[bytes]:
-        """回放用：按 index 排序输出整帧列表。"""
-        bucket = self._dir_cache.get(post_cmd) or {}
-        return [bucket[k] for k in sorted(bucket.keys())]
-
-    def _request_dir(self, post_cmd: int, request_frame: bytes) -> None:
-        """主动拉某张目录前先清该表缓存，避免新旧两轮 burst 混叠成半旧半新。
-
-        比如目录从 20 项变成 18 项：不清缓存的话新 burst 只覆盖前 18 个 index，
-        第 19、20 项会作为陈旧残留留在表里，前端就会看到两个已经不存在的监控项。
-        """
-        self._dir_cache.pop(post_cmd, None)
+        table.clear()
+        names.clear()
         self.enqueue(request_frame, PRI_UI)
 
     def _request_all_dirs(self) -> None:
         """拉三张表：调参目录、监控目录、命令目录。连上和重连后都要调。"""
-        self._request_dir(CmdPost.TunableDirectory, request_tunable())
-        self._request_dir(CmdPost.MonitorDirectory, request_monitor())
-        self._request_dir(CmdPost.CMDDirectory, request_command())
+        self._request_dir(self.tunable_dir, self._name_to_tun, request_tunable())
+        self._request_dir(self.monitor_dir, self._name_to_mon, request_monitor())
+        self._request_dir(self.cmd_dir, self._name_to_cmd, request_command())
 
     def refresh_directories(self) -> OkResult:
-        """清空三张目录缓存并重新向车请求（表结构变更或怀疑缓存过期时用）。
+        """清空三张目录表并重新向车请求（表结构变更或怀疑缓存过期时用）。
 
         与被动更新的区别：目录是下位机启动/订阅时推的，平时不会主动重推。
         改了固件里的表定义后必须调这个，否则后端一直用旧表解析，字段会对不上。
         """
-        self._dir_cache.clear()
-        self._dir_buf.clear()
         self._request_all_dirs()
         return OkResult(ok=True)
 
@@ -516,84 +499,140 @@ class Hub:
         """串口收到一批原始字节的回调（SerialBridge 注入，在 rx 线程里跑）。
 
         chunk: 本次读到的原始字节（可能含半帧/多帧）
-        两件事：原样广播给 WS 上位机；从流里旁路摘目录帧缓存（半帧尾巴留到下批）。
+        只做一件事：原样广播给 WS 上位机——前端 FrameParser 自己拆帧，
+        前端代码与"直连串口"时代完全一致。后端自己的目录/快照/日志走
+        另一条已解帧的通道（_on_frame），不在这股字节里旁路扫描。
         """
-        # 关键设计：上位机看到的串口和脚本看到的是同一股原始字节。
-        # 原样广播给 WS（前端 FrameParser 自己拆帧，因此前端代码零改动），
-        # 同一份字节再喂 Python FrameParser 做目录缓存/快照/日志（供脚本）。
         self._broadcast_bytes(chunk)
-        # 从字节流里挑目录帧缓存，供目录代理回放；未收完的半帧尾巴留到下一批
-        self._dir_buf.extend(chunk)
-        frames, consumed = scan_dir_frames(bytes(self._dir_buf))
-        for cmd, frame in frames:
-            self._cache_dir_frame(cmd, frame)
-        del self._dir_buf[:consumed]
-        # 异常兜底：正常情况半帧尾巴不超过一帧长度（几百字节）。
-        # 涨破 8KB 说明解析对不上号（比如波特率错、协议版本不匹配），
-        # 保留末尾 4KB 截掉旧数据，宁可丢一点也不能让缓冲无限膨胀。
-        if len(self._dir_buf) > 8192:
-            del self._dir_buf[:-4096]
 
-    def _on_serial_event(self, event: RxEvent) -> None:
-        """FrameParser 解出一个事件就调这里（在串口 rx 线程里执行）。
+    def _on_frame(self, cmd: int, payload: bytes) -> None:
+        """FrameParser 解出一完整帧就调这里（在串口 rx 线程里执行）。
 
-        事件是 protocol.py 里的 RxEvent 子类，用 isinstance 分派。
+        帧边界与校验已由 protocol.FrameParser 完成；这里按命令字做语义解析。
+        类型真源是三张目录表（item.type），不另存类型表；目录项同时带
+        完整原始帧，供前端请求目录时回放。
         """
-        if isinstance(event, DirectoryEvent):
-            table = event.table
-            item = event.item
-            idx = item.index
-            if table is DirTable.monitor:
-                self.monitor_dir[idx] = item
-                self._name_to_mon[item.name] = idx  # 中文名反查，脚本用名字寻址
-                self.monitor_latest[idx] = MonitorSample(item.value, None)  # 目录帧初值：还没收到过推送
-                # 目录帧里带的初值：让 /api/values 在还没收到推送时也有东西可显示
+        p = payload
+
+        if cmd in (CmdPost.TunableDirectory, CmdPost.MonitorDirectory):
+            # [index][type][tag][名长][名][单位长][单位][值]（布局见 protocol._dir_len）
+            if len(p) < 4:
+                return
+            index = p[0]
+            type_ = p[1]
+            tag = p[2]
+            name_len = p[3]
+            unit_len_at = 4 + name_len
+            if len(p) < unit_len_at + 1:
+                return
+            unit_len = p[unit_len_at]
+            value_at = 5 + name_len + unit_len
+            if len(p) < value_at:
+                return
+            name = p[4:unit_len_at].decode("utf-8", errors="replace")
+            unit = p[unit_len_at + 1 : value_at].decode("utf-8", errors="replace")
+            value = decode_value(p, value_at, type_) if value_size(type_) else 0
+            # 完整原帧随 payload 重建（字节一致），目录请求回放用
+            frame = build_frame(cmd, p)
+            item = MenuItem(index=index, type=type_, tag=tag, name=name, unit=unit, value=value)
+            if cmd == CmdPost.MonitorDirectory:
+                self.monitor_dir[index] = DirEntry(item, frame)
+                self._name_to_mon[name] = index  # 中文名反查，脚本用名字寻址
+                self.monitor_latest[index] = MonitorSample(value, None)  # 目录帧初值：还没收到过推送
                 # 目录帧的 tag 反映下位机当前订阅档位；但已有聚合意图的项以意图为准。
                 # 原因：重连后目录先到、补发的 Subscribe 后到——
                 # 若这里无条件采信目录 tag，会把"已生效的订阅"倒退成"未订阅"，
                 # 等补发到达前这段时间推送是断的。所以有意图时让意图说话。
-                if idx not in self._sub_intent:
-                    self.fw_sub[idx] = (tag_subscribed(item.tag), tag_fast(item.tag))
-            elif table is DirTable.tunable:
-                self.tunable_dir[idx] = item
-                self._name_to_tun[item.name] = idx
+                if index not in self._sub_intent:
+                    self.fw_sub[index] = (tag_subscribed(tag), tag_fast(tag))
+            else:
+                self.tunable_dir[index] = DirEntry(item, frame)
+                self._name_to_tun[name] = index
 
-        elif isinstance(event, CmdDirectoryEvent):
-            item = event.item
-            idx = item.index
-            self.cmd_dir[idx] = item
-            self._name_to_cmd[item.name] = idx
+        elif cmd == CmdPost.CMDDirectory:
+            # payload 头 2B 是内容长度，内容从 off=2 起：[命令字][tag][名长][名][参数量][字段...]
+            if len(p) < 5:
+                return
+            off = 2
+            index = p[off]
+            tag = p[off + 1]
+            name_len = p[off + 2]
+            name_at = off + 3
+            off = name_at + name_len
+            if len(p) < off + 1:
+                return
+            name = p[name_at:off].decode("utf-8", errors="replace")
+            field_num = p[off]
+            off += 1
+            fields: list[CmdField] = []
+            for _ in range(field_num):
+                if len(p) < off + 2:
+                    return
+                ftype = p[off]
+                fname_len = p[off + 1]
+                off += 2
+                fname = p[off : off + fname_len].decode("utf-8", errors="replace")
+                off += fname_len
+                fields.append(CmdField(type=ftype, name=fname))
+            # RANGE 置位：后面紧跟每个参数一对 (min,max)，宽度与类型与该字段一致
+            if tag & CMD_TAG_RANGE:
+                for f in fields:
+                    sz = value_size(f.type)
+                    if sz == 0 or len(p) < off + 2 * sz:
+                        break  # str/other 无范围；或帧被截断
+                    f.min = decode_value(p, off, f.type)
+                    f.max = decode_value(p, off + sz, f.type)
+                    off += 2 * sz
+            self.cmd_dir[index] = DirEntry(
+                CmdDirItem(index=index, tag=tag, name=name, fields=fields), build_frame(cmd, p)
+            )
+            self._name_to_cmd[name] = index
             # 停车命令的字号不固定写死，而是从命令目录的 tag SPEC 位认出来。
             # 这样固件改了命令表顺序，后端也能自动找到正确的停车命令。
-            if cmd_spec(item.tag) == CmdSpec.Stop:
-                self._stop_cmd_index = idx
+            if cmd_spec(tag) == CmdSpec.Stop:
+                self._stop_cmd_index = index
 
-        elif isinstance(event, ValueEvent):
-            idx = event.index
-            val = event.value
-            stamp_ms = self._expand_stamp(event.t_ms)  # 下位机采样时刻（回绕已展开）
+        elif cmd == CmdPost.MonitorValue:
+            # [payloadlen][time 2B]([index][值])×N：类型查监控目录；
+            # 遇目录里没有的 index 丢剩余（前缀已解出的照常发）
+            if len(p) < 3:
+                return
+            t_ms = p[1] | (p[2] << 8)
+            stamp_ms = self._expand_stamp(t_ms)  # 下位机采样时刻（回绕已展开）
             # 前沿推进（lag_ms 的"最新帧"基准）：mod 65536 下领先即采纳；
             # 断流 >1s 后的第一帧无条件采纳（掉线/重启恢复的新流在 mod 意义下
             # 可能"落后"，但是手上最新）；连续流中"落后"的帧只可能是重复帧。
-            fw = event.t_ms
+            fw = t_ms
             if (self._fw_frontier is None
                     or (fw - self._fw_frontier) & 0xFFFF < 0x8000
                     or time.monotonic() - self._fw_frontier_at > 1.0):
                 self._fw_frontier = fw
                 self._fw_frontier_at = time.monotonic()
-            # 只存"最新值"不存历史：历史由 log_dir 负责（且仅登记项才记）
-            self.monitor_latest[idx] = MonitorSample(val, time.monotonic(), fw)  # t_fw 供 lag_ms 判新鲜度
-            # 记录中 且 该被登记过 → 才落样本。未登记的高频项不会撑爆内存
-            if self.logging and idx in self.log_reg:
-                self._record(idx, val, stamp_ms)
+            # 顺序过 payload：目录里有的项按登记类型解，遇没有的 index 丢剩余
+            off = 3
+            while off < len(p):
+                idx = p[off]
+                entry = self.monitor_dir.get(idx)
+                if entry is None:
+                    break
+                type_ = entry.item.type
+                value = decode_value(p, off + 1, type_)
+                self.monitor_latest[idx] = MonitorSample(value, time.monotonic(), t_ms)  # t_fw 供 lag_ms 判新鲜度
+                # 记录中 且 该被登记过 → 才落样本。未登记的高频项不会撑爆内存
+                if self.logging and idx in self.log_reg:
+                    self._record(idx, value, stamp_ms)
+                off += 1 + value_size(type_)
 
-        elif isinstance(event, EchoEvent):
-            # 调参回显：下位机把"实际生效值"发回来。用它覆盖目录里的 value，
-            # 这样界面显示的是车里真实的值，而不是上位机以为自己设的那个
-            # （下位机可能做了限幅、取整、拒绝）。
-            idx = event.index
-            if idx in self.tunable_dir:
-                self.tunable_dir[idx].value = event.value
+        elif cmd == CmdPost.TunableEcho:
+            # [type][index][value]：type 前缀自带宽度，不查目录。
+            # 下位机把"实际生效值"发回来，用它覆盖目录里的 value——界面显示的
+            # 是车里真实的值，而不是上位机以为自己设的那个（可能被限幅/取整/拒绝）。
+            if len(p) < 2 or value_size(p[0]) == 0:
+                return
+            entry = self.tunable_dir.get(p[1])
+            if entry is not None:
+                entry.item.value = decode_value(p, 2, p[0])
+        # Pong：时间戳在 SerialBridge 里已更新，这里无事
 
     # ---------- 下行优先级队列 ----------
 
@@ -757,15 +796,15 @@ class Hub:
                 logger.debug("Ping 回复失败: %s", e)
             return
 
-        # 2) 目录请求 → 缓存回放（N 个页面要目录，下位机只答一轮 burst）
+        # 2) 目录请求 → 回放目录项里的完整帧（N 个页面要目录，下位机只答一轮 burst）
         dir_map = {
-            CmdGet.RequestTunable: (CmdPost.TunableDirectory, request_tunable),
-            CmdGet.RequestMonitor: (CmdPost.MonitorDirectory, request_monitor),
-            CmdGet.RequestCommand: (CmdPost.CMDDirectory, request_command),
+            CmdGet.RequestTunable: (self.tunable_dir, self._name_to_tun, request_tunable),
+            CmdGet.RequestMonitor: (self.monitor_dir, self._name_to_mon, request_monitor),
+            CmdGet.RequestCommand: (self.cmd_dir, self._name_to_cmd, request_command),
         }
         if cmd in dir_map:
-            post_cmd, request_fn = dir_map[cmd]
-            frames = self._dir_frames_list(post_cmd)
+            table, names, request_fn = dir_map[cmd]
+            frames = [e.frame for _, e in sorted(table.items())]
             if frames:
                 try:
                     loop = self._loop
@@ -775,9 +814,9 @@ class Hub:
                 except Exception as e:
                     logger.debug("目录回放失败: %s", e)
             else:
-                # 缓存空了（还没拉过 / 刚被 refresh 清掉）：真去拉一次。
-                # 下位机应答的 burst 会经 _on_serial_raw 广播到达该客户端，不用单独回。
-                self._request_dir(post_cmd, request_fn())
+                # 表空了（还没拉过）：真去拉一次。
+                # 下位机应答的 burst 会广播到达所有客户端，不用单独回。
+                self._request_dir(table, names, request_fn())
             return
 
         # 3) Subscribe → 聚合处理（防多页面互相退订）
@@ -928,13 +967,13 @@ class Hub:
         if isinstance(index_or_name, int):
             if index_or_name not in self.cmd_dir:
                 raise KeyError(f"命令字不存在: 0x{index_or_name:02X}")
-            return self.cmd_dir[index_or_name]
+            return self.cmd_dir[index_or_name].item
         name = str(index_or_name)
         if name in self._name_to_cmd:
-            return self.cmd_dir[self._name_to_cmd[name]]
+            return self.cmd_dir[self._name_to_cmd[name]].item
         for n, i in self._name_to_cmd.items():
             if n.lower() == name.lower():
-                return self.cmd_dir[i]
+                return self.cmd_dir[i].item
         raise KeyError(f"命令不存在: {index_or_name}")
 
     def get_column(self, type_: str) -> list[MenuItem | CmdDirItem]:
@@ -946,17 +985,17 @@ class Hub:
         """
         t = type_.lower()
         if t in ("monitor", "mon"):
-            return list(self.monitor_dir.values())
+            return [e.item for e in self.monitor_dir.values()]
         if t in ("tunable", "tun"):
-            return list(self.tunable_dir.values())
+            return [e.item for e in self.tunable_dir.values()]
         if t in ("cmd", "command", "commands"):
-            return list(self.cmd_dir.values())
+            return [e.item for e in self.cmd_dir.values()]
         raise ValueError("type 必须是 monitor | tunable | cmd")
 
     def _mon_name(self, idx: int) -> str:
         """监控项显示名：目录里有就用中文名，目录还没到就用 index 字符串兜底。"""
-        it = self.monitor_dir.get(idx)
-        return it.name if it else str(idx)
+        entry = self.monitor_dir.get(idx)
+        return entry.item.name if entry else str(idx)
 
     def read_item(self, index_or_name) -> MonitorReading:
         """单项当前值（看门狗用）：index(int) 或目录中文名均可。
@@ -974,26 +1013,36 @@ class Hub:
           age_s ：距上次收到推送的秒数（PC 时间轴）。到达新近度，恒定传输延迟
                   下会骗人（全体看起来都新鲜）——降级为诊断量，排查"是不是
                   PC/传输侧卡了"看它。
-        ⚠ 共同盲区：链路整体冻结（掉线/固件卡死）时没有新帧，lag 前沿也跟着冻，
-        看起来"新鲜"。那种情况以连接状态为准——心跳 80ms 一个 Ping、1s 没回
-        Pong 判掉线（固件侧 300ms 没见 Ping 就主动停推）。
+        ⚠ 链路整体冻结（掉线/固件卡死）时 lag 怎么办：前沿本身钉在最后帧不动，
+        但 read 时按 PC 时钟外推（前沿戳 + 距其到达时刻的时长，封顶 60s）——
+        冻结期间 lag 持续增长，300ms 后同样报旧，不存在"没人报"的窗口。
+        外推假设 PC 与固件时钟 1:1，只在相邻帧间隔内有效：每来一个领先帧就
+        重锚（_fw_frontier_at 随之刷新），晶振 ppm 级误差 × 秒级间隔 = 微秒级，
+        可忽略。心跳（300ms 无 Pong 判掉线）仍是链路活性判据，与 lag 报旧
+        互为见证，不是替代关系。
         """
         idx = self.resolve_monitor(index_or_name)
         if idx not in self.monitor_latest:
             raise KeyError(f"监控项尚无数据（先 push 订阅再 read）: {index_or_name}")
-        item = self.monitor_dir.get(idx)
+        entry = self.monitor_dir.get(idx)
         s = self.monitor_latest[idx]
         # lag_ms：落后前沿多少 ms（mod 65536 相减，回绕/长间隔都精确）。
-        # 前沿只认"领先/断流后首帧"，故正常流的项 lag ∈ [0, 80]（低速项上限）；
-        # 大值只可能是真停推，或前沿刚跳过变（掉线恢复/重启）——两种都是旧。
+        # 前沿 = 最后采纳帧的固件戳 + 此后流逝的 PC 时间（外推，封顶 60s 防绕圈）：
+        # 正常流里前沿每 10ms 就被新帧重锚，外推量 ≈0，lag 是纯相对差 ∈[0,80]
+        # （低速项上限），免疫传输延迟；链路冻结时前沿钉住不动，外推让 lag
+        # 随 PC 时间增长——300ms 后报旧，age_s 当初的唯一正确用途并进来了。
         lag_ms = None
         if s.t_fw is not None and self._fw_frontier is not None:
-            lag_ms = float((self._fw_frontier - s.t_fw) & 0xFFFF)
+            elapsed_ms = min(
+                (time.monotonic() - self._fw_frontier_at) * 1000.0,
+                FW_LAG_EXTRAPOLATE_CAP_MS,
+            )
+            lag_ms = float((self._fw_frontier + int(elapsed_ms) - s.t_fw) & 0xFFFF)
         return MonitorReading(
             index=idx,
-            name=item.name if item else str(idx),
+            name=entry.item.name if entry else str(idx),
             value=s.value,
-            unit=item.unit if item else "",
+            unit=entry.item.unit if entry else "",
             # t_recv=None（只有目录初值、没推送过）按极旧处理，看门狗自然当过期
             age_s=round(time.monotonic() - (s.t_recv or 0.0), 3),
             lag_ms=lag_ms,
@@ -1033,8 +1082,8 @@ class Hub:
         """
         idx = self.resolve_monitor(index_or_name)
         kind = kind.lower()
-        it = self.monitor_dir.get(idx)
-        result = SubResult(index=idx, name=it.name if it else None, push=None, log=None)
+        entry = self.monitor_dir.get(idx)
+        result = SubResult(index=idx, name=entry.item.name if entry else None, push=None, log=None)
 
         if kind in ("push", "both"):
             use_fast = bool(fast) if fast is not None else on
@@ -1132,13 +1181,13 @@ class Hub:
         """写一个调参项（脚本用）：类型从目录查、值按 8B 定长组帧、脚本优先级入队。
 
         index_or_name: 调参项 index(int) 或中文名(str)
-        value        : 要写入的值，最终以下位机回显(EchoEvent)为准覆盖显示值
+        value        : 要写入的值，最终以下位机回显(TunableEcho 帧)为准覆盖显示值
         返回: SetTunableResult(ok, index, value)
         抛错: abort 中抛 RuntimeError；名字不存在抛 KeyError；值类型不符抛 ValueError
         """
         self.check_abort()
         idx = self.resolve_tunable(index_or_name)
-        item = self.tunable_dir[idx]
+        item = self.tunable_dir[idx].item
         # 与 hub.cmd 同一把尺子按目录声明类型校验：数值项只收 int/float、
         # Color 项只收 "#RRGGBB" 字符串。字符串/None/列表一律 400，
         # 不再静默编 0——静默 0 会把笔误伪装成"生效且值为 0"
@@ -1598,8 +1647,8 @@ class Hub:
 
     def _mon_unit(self, idx: int) -> str:
         """监控项单位（目录里带的，如 V / A / pct）；查不到返回空串。"""
-        item = self.monitor_dir.get(idx)
-        return getattr(item, "unit", "") or ""
+        entry = self.monitor_dir.get(idx)
+        return entry.item.unit if entry else ""
 
     def snapshot(self) -> Snapshot:
         """/api/status 的返回体：一眼看清 Backend 全貌，调试脚本连不上的第一站。

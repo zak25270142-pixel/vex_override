@@ -19,6 +19,20 @@ cd d:\work\vex\test1\backend
 .\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
+自测（无需串口、不起服务；改了协议/hub 后跑一遍）：
+
+```bash
+cd d:\work\vex\test1\backend
+.\.venv\Scripts\python -m debug.test_protocol
+.\.venv\Scripts\python -m debug.test_hub_proxy
+```
+
+> **不用 pytest 框架**（直接 `python -m` 跑，原因有二）：venv 里没装；
+> 且 `backend/pytest/` 是**标定测量数据与数据处理脚本**的家（`probe_data/` 按标定项目
+> 分目录 + `_wave_capture.py` 等），从 `backend/` 运行任何 pytest 都会被这个同名目录
+> 遮蔽成 import 本地数据目录而崩。哪天真要装 pytest，必须**从仓库根目录**跑
+> （`python -m pytest backend/debug`），别在 backend/ 里跑；更别为此改名 pytest/。
+
 > **Python 基线固定 3.13**：
 
 接口文档：<http://127.0.0.1:8000/docs>
@@ -132,7 +146,6 @@ v.print_log("pytest/run.csv")                      # 导出 CSV（后缀决定�
 | | `wave_plot.py` | probe 波形/汇总画 PNG（仅开环相位） |
 | | `plot_util.py` | 画图共用件：中文字体兜底 + `subplots/save/legend` |
 | | `motor_names.py` | `L2→左2转速` 脚本侧别名约定（可抄的样例） |
-| | `example_template.py` | 最小模板：sub → start_log → cmd → end_log → print_log |
 
 各层的标定原理、判据与用法文档在 `scripts/docs/`（入口是 `00-标定总览.md`：
 标定链顺序、悬空/着地与开环/闭环分界、每步验证手段）；主仓库 `docs/` 只放以下位机

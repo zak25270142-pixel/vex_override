@@ -352,13 +352,13 @@ def api_values():
     """
     out = []
     for idx, s in hub.monitor_latest.items():
-        item = hub.monitor_dir.get(idx)
+        entry = hub.monitor_dir.get(idx)
         out.append(
             ValueSnapshot(
                 index=idx,
-                name=item.name if item else str(idx),
+                name=entry.item.name if entry else str(idx),
                 value=s.value,
-                unit=item.unit if item else "",
+                unit=entry.item.unit if entry else "",
             )
         )
     return out

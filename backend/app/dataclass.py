@@ -1,15 +1,14 @@
 """
 数据类集中地：协议解析产物 + 接口返回体 + 串口设备描述符。
 
-本文件只放被动数据结构（dataclass / NamedTuple）与紧绑它们的枚举、类型别名，
+本文件只放被动数据结构（dataclass / NamedTuple）与紧绑它们的类型别名，
 不含任何逻辑；protocol / serial_bridge 现在就从这里 import，hub / main 的接口
-返回体也以这里为真源（hub 里的同名副本将删除，见 REVIEW 文档 P1-1）。
+返回体也以这里为真源。
 字段名即对外 JSON 键名（FastAPI 自动转），改动等于改接口契约。
 """
 
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, NamedTuple
 
 # 监控/调参项能取的值形态。注意这是"Python 侧解出来的类型"，
 # 与 protocol.ValueType 不是一一对应（多个 ValueType 都解成 int）；
@@ -46,80 +45,23 @@ class CmdDirItem:
 class MenuItem:
     """监控/调参目录项，两张表结构相同共用。value 是目录帧自带的当前值。"""
     index: int
-    type: int   # 值类型码（ValueType）：FrameParser 靠它解后续 value/echo 帧
+    type: int   # 值类型码（ValueType）：hub 解后续 value/echo 帧的唯一依据
     tag: int    # 位标志（MONITOR_TAG_*：订阅档位、GETTER 等）
     name: str
     unit: str
     value: Any  # tunable 项的 value 会被 echo 回显覆盖成真实生效值
 
 
-# ---------- 解析事件类型（FrameParser 产出 / Hub 消费）----------
-
-
-class EventKind(Enum):
-    """FrameParser 解出的一个事件属于哪一类。"""
-
-    directory = "directory"        # 监控/调参目录项 → 填三张目录表
-    cmdDirectory = "cmdDirectory"  # 动作命令目录项 → 填命令表，顺带认出停车命令
-    value = "value"                # 监控值推送 → 更新最新值快照 + 按需记日志
-    echo = "echo"                  # 调参写回确认 → 回写调参项真实生效值
-    pong = "pong"                  # 心跳应答 → 时间戳在 SerialBridge 里已更新
-
-
-class DirTable(Enum):
-    """目录项属于哪张表（只对 EventKind.directory 有效）。"""
-
-    monitor = "monitor"
-    tunable = "tunable"
-
-
-# ---------- FrameParser 产出的事件（Hub 按类型消费）----------
-# 每种事件一个 dataclass；kind 是类级常量，用 isinstance 分派，语义比 dict 明确。
-
-
 @dataclass
-class RxEvent:
-    """事件基类。kind 标出具体类别（ClassVar，不进构造参数）。"""
-    kind: ClassVar[EventKind]
+class DirEntry:
+    """一张目录表的一项（index 作键）：解析结果 + 完整原始帧。
 
-
-@dataclass
-class DirectoryEvent(RxEvent):
-    """监控/调参目录项 → 填三张目录表。"""
-    kind: ClassVar[EventKind] = EventKind.directory
-    table: DirTable
-    item: MenuItem
-
-
-@dataclass
-class CmdDirectoryEvent(RxEvent):
-    """动作命令目录项 → 填命令表，顺带认出停车命令。"""
-    kind: ClassVar[EventKind] = EventKind.cmdDirectory
-    item: CmdDirItem
-
-
-@dataclass
-class ValueEvent(RxEvent):
-    """监控值推送 → 更新最新值快照 + 按需记日志。"""
-    kind: ClassVar[EventKind] = EventKind.value
-    index: int
-    value: CellValue
-    t_ms: int = 0
-    '''下位机采样时刻：毫秒时钟低16位(uint16)，65.536s回绕；消费侧按无符号差分展开'''
-
-
-@dataclass
-class EchoEvent(RxEvent):
-    """调参写回确认 → 回写调参项真实生效值。"""
-    kind: ClassVar[EventKind] = EventKind.echo
-    index: int
-    value: CellValue
-
-
-@dataclass
-class PongEvent(RxEvent):
-    """心跳应答 → 时间戳在 SerialBridge 里已更新。"""
-    kind: ClassVar[EventKind] = EventKind.pong
+    frame 是下位机发来的原帧（A5|Cmd|Payload|XOR，解帧时按 payload 重建，
+    字节一致），前端请求目录时由后端直接回放——不必重编码，也不必再打扰
+    下位机。类型只认 item.type 一份，别处不另存类型表。
+    """
+    item: MenuItem | CmdDirItem
+    frame: bytes
 
 
 @dataclass
@@ -188,9 +130,11 @@ class MonitorSample(NamedTuple):
     主动误导而非不完整，故只配当诊断量。新鲜度主判 lag_ms：固件是全量推送，
     正常项最多 80ms（低速相位数×拍）必出现一次，落后前沿 >300ms 即旧；恒定
     传输延迟下全体同时延、相对差值不变，故免疫。USB 直连两者都可忽略；
-    若换成桥接/WiFi/中转上位机，age_s 降级为纯诊断、lag_ms 顶上——
-    但链路整体冻结（掉线/固件卡死）时没有新帧、lag 前沿也跟着冻，两者一起
-    失效，那种情况以连接状态为准（心跳 1s 判掉线；固件 300ms 无 Ping 停推）。
+    若换成桥接/WiFi/中转上位机，age_s 降级为纯诊断、lag_ms 顶上。
+    链路整体冻结（掉线/固件卡死）时 lag 的前沿钉在最后帧不动，但 read 时按
+    PC 时钟外推（前沿戳 + 距其到达时长，封顶 60s 防 mod 绕圈）——冻结期间
+    lag 持续增长，300ms 后同样报旧；外推的 1:1 时钟假设每遇领先帧即重锚，
+    只在帧间隔内有效。心跳 300ms 判掉线与之互为见证，不是替代关系。
     接收侧观测不到单向传输延迟——任何方案要么带不可验证的假设（NTP 对称性）
     要么只给无假设下界（样本锚点），评估见解析文档。
     """
@@ -216,9 +160,9 @@ class MonitorReading:
     value: Any
     unit: str
     age_s: float  # 距上次收到推送的秒数（到达新近度；恒定传输延迟下会骗人，诊断量）
-    lag_ms: float | None  # 落后最新监控帧多少 ms（固件时间轴，wrap-aware 相减）；
+    lag_ms: float | None  # 落后最新监控帧多少 ms（固件时间轴，wrap-aware 相减 + 冻结外推）；
     # None=无推送史（目录初值）。看门狗主判据：None 或 >FW_LAG_STALE_MS(300) 即旧。
-    # 对传输延迟/PC 抖动免疫；链路整体冻结时以连接状态为准（见 MonitorSample）。
+    # 对传输延迟/PC 抖动免疫；链路冻结时前沿钉住但 read 外推（封顶 60s）照常报旧。
 
 
 @dataclass

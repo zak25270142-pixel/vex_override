@@ -24,8 +24,8 @@ import time
 from collections.abc import Callable
 from enum import Enum
 
-from .dataclass import PongEvent, PortInfo, RxEvent
-from .protocol import FRAME_HEAD, FrameParser, ping
+from .dataclass import PortInfo
+from .protocol import FRAME_HEAD, CmdPost, FrameParser, ping
 
 logger = logging.getLogger("vex.serial")
 
@@ -65,16 +65,16 @@ class SerialBridge:
     """线程安全的串口读写；读走独立线程 + FrameParser，写由 Hub 队列统一调度。
 
     三个回调让本类与上层解耦（Hub 在构造时注入）：
-        on_raw(chunk)      每收到一批原始字节就调，Hub 原样广播给 WebSocket
-        on_event(event)    FrameParser 解出一个事件就调，Hub 据此更新目录/快照/日志
-        on_status(state,msg) 连接状态变化，Hub 广播给前端并触发自动重连（state 是 Status 枚举）
+        on_raw(chunk)          每收到一批原始字节就调，Hub 原样广播给 WebSocket
+        on_frame(cmd, payload) FrameParser 解出一完整帧就调，Hub 据此更新目录/快照/日志
+        on_status(state,msg)   连接状态变化，Hub 广播给前端并触发自动重连（state 是 Status 枚举）
     """
 
     def __init__(
         self,
         port: str | None = None,
         baud: int = 115200,
-        on_event: Callable[[RxEvent], None] | None = None,
+        on_frame: Callable[[int, bytes], None] | None = None,
         on_status: Callable[[Status, str], None] | None = None,
         on_raw: Callable[[bytes], None] | None = None,
     ) -> None:
@@ -82,7 +82,7 @@ class SerialBridge:
 
         port     : 指定串口名（如 "COM5"）；None=connect 时自动逐口 Ping 探测
         baud     : 波特率，CDC 虚拟口仅占位（USB 全速跑，实际不影响）
-        on_event : FrameParser 解出事件的回调（Hub._on_serial_event）
+        on_frame : 完整帧回调（Hub._on_frame），参数 (cmd, payload)
         on_status: 连接状态变化回调（Hub._on_serial_status），收到 Status 枚举 + 人读说明
         on_raw   : 原始字节回调（Hub._on_serial_raw），用来原样广播给 WS 上位机
         """
@@ -92,8 +92,8 @@ class SerialBridge:
         '''波特率（CDC 虚拟口仅占位）'''
         
         # 不给回调就塞空 lambda，省得调用处到处判 None
-        self.on_event = on_event or (lambda e: None)
-        '''事件回调，解析后的事件'''
+        self.on_frame = on_frame or (lambda cmd, payload: None)
+        '''完整帧回调 (cmd, payload)：FrameParser 解出的一帧，语义归 Hub'''
 
         self.on_status = on_status or (lambda s, m: None)
         '''状态回调，连接状态变化'''
@@ -106,7 +106,7 @@ class SerialBridge:
         '''串口对象'''
 
         self._parser = FrameParser()
-        '''Python 侧帧解析器；喂收上来的字节，吐目录/值/回显事件'''
+        '''帧解析器：喂收上来的字节，吐 (cmd, payload)，业务语义归 Hub'''
 
         # 写锁：Hub 的 tx 线程和内置心跳线程都会调 send，且 send 是公共方法，
         # 锁负责把多次 write 串行化，交错会撕帧。
@@ -358,7 +358,7 @@ class SerialBridge:
                         # 再喂 Python 解析器——同一股字节服务两个消费者，
                         # 前端因此无需改动拆分逻辑。
                         self.on_raw(chunk)
-                        self._parser.feed(chunk, self._on_parsed)
+                        self._parser.feed(chunk, self._on_frame)
                 else:
                     # 没数据时短睡：2ms ≈ 500Hz 轮询，够快又不烧 CPU
                     time.sleep(0.002)
@@ -368,26 +368,27 @@ class SerialBridge:
                     self._lost(f"串口读取异常: {e}")
                 break
 
-    def _on_parsed(self, event: RxEvent) -> None:
-        """FrameParser 的每帧回调：截获 Pong 更新时间戳，再把事件转给上层 on_event。
+    def _on_frame(self, cmd: int, payload: bytes) -> None:
+        """FrameParser 解出一完整帧就调：截获 Pong 更新时间戳，再转给上层。
 
-        event: protocol.py 的 RxEvent 子类实例
+        cmd/payload: 帧的命令字与 payload（不含帧头/命令字/校验）
         上层回调抛异常只记日志、不上抛——否则会把 rx 线程带崩，整条链路静默死亡。
         """
-        # Pong 在这里被"截获"更新时间戳，同时也继续往下传给 on_event
-        if isinstance(event, PongEvent):
+        # Pong 在这里被"截获"更新时间戳，同时也继续往下传给上层
+        if cmd == CmdPost.Pong:
             self._last_pong = time.monotonic()
         try:
-            self.on_event(event)
+            self.on_frame(cmd, payload)
         except Exception as e:
             # 上层回调抛异常不能把 rx 线程带崩，否则整个链路静默死亡
-            logger.exception("on_event 异常: %s", e)
+            logger.exception("on_frame 异常: %s", e)
 
     # ---------- 心跳 ----------
 
     # 心跳 80ms 一发，超过 300ms 没收到 Pong 判定下位机程序已死（USB 还连着但链路没意义）。
     # 300ms = 固件断链巡视周期（communication.h LINK_PATROL_TICKS=30，300ms 无 Ping 停推），
-    # 与 FW_LAG_STALE_MS 同尺：链路冻结时 lag 前沿也冻，掉线判定就是那道兜底。
+    # 与 FW_LAG_STALE_MS 同尺：链路冻结时 lag 前沿也冻、但 read 侧按 PC 时钟外推照常报旧，
+    # 本判定是同一事件的第二见证（掉线事件本身）。
     # 容忍约 3 个 Pong 丢失；USB CDC 往返亚毫秒级，rx 线程无同步阻塞
     # （WS 广播是 run_coroutine_threadsafe 异步投递，网页慢拖不到这里），
     # 300ms 仍有约 300 倍余量；误判代价也只是走一遍重连，可恢复。

@@ -665,9 +665,8 @@ function handleEvent(e: RxEvent): void {
     const item = e.item
     if (e.table === 'tunable') {
       tunableMap[item.index] = item
-      // 登记类型，收 TunableEcho 解帧时按此确定 value 宽度
-      parser.setTunableType(item.index, item.type)
     } else {
+      // 登记类型，收 MonitorValue 解帧时按此确定 value 宽度
       parser.setMonitorType(item.index, item.type)
       monitorMap[item.index] = item
       monitorLatest[item.index] = item.value
@@ -868,7 +867,6 @@ export async function fetchTunable(): Promise<void> {
     return
   }
   for (const k of Object.keys(tunableMap)) delete tunableMap[Number(k)]
-  parser.resetTunableTypes()
   clearPendingTunable()
   selectedTunableIndex.value = null // 表都没了，右侧编辑卡片一并关闭
   // 先上屏"请求已发出"，再走统一发帧出口（失败也会被捕获上屏）
