@@ -65,13 +65,20 @@ class DirEntry:
 
 
 @dataclass
-class RxStats:
-    """链路诊断计数（FrameParser 累计，UI/脚本直接读）。"""
-    bytes: int = 0        # 已收字节数
-    frames: int = 0       # 已收帧数
-    badChecksum: int = 0  # 校验失败：线路干扰 / 波特率不匹配 / 帧边界错位
-    unknownCmd: int = 0   # 收到不认识的命令字
-    overflow: int = 0     # payload 超过 MAX_PAYLOAD，状态机强制回到找帧头
+class PendingAck:
+    """一条待确认的下行帧（_pending_acks 的值，按命令字作键）。
+
+    固件对需要确认的下行帧回 Response（CmdPost.Response）：OK 清除、
+    需补发立即重发、明确拒绝只记录。超时未收到响应则由 _sweep_acks 原帧重发。
+    同一命令字连续下发只保留最后一帧——同命令字 payload 长度恒定（字段表
+    固定），且设目标类命令终态一致，覆盖无害（相对量命令的重复执行风险
+    见协议注释，当前调试平台可接受）。
+    """
+    frame: bytes      # 待确认的完整原帧（重发就发它）
+    priority: int     # 入队时的优先级（重发保持原优先级）
+    timeout: float    # 单次确认超时（秒）：目录请求 1.0，其余 0.1
+    deadline: float   # 本次超时时刻（time.monotonic 基准）
+    retries: int      # 剩余重发次数（OK/拒绝结算或用尽后清零丢弃）
 
 
 # ---------- 串口设备描述 ----------
@@ -85,29 +92,6 @@ class PortInfo:
     vid: int | None
     pid: int | None
     serial_number: str
-
-
-# ---------- 区间统计（脚本标定用）----------
-# 把一批样本压成常用统计量，脚本不用自己攒样本算。各字段的用途：
-#   mean        算术均值。看"有没有稳态偏置"用这个
-#   abs_mean    取绝对值后的均值。看"抖动/误差幅度"必须用这个——
-#               来回震荡时正负抵消，mean 会接近 0 而 abs_mean 真实反映幅度
-#   abs_max     最大绝对偏差。看最坏情况
-#   std         标准差。注意是总体标准差（除以 n），不是样本标准差（除以 n-1）
-#   rate_hz     样本数 / 区间秒数。反映下位机实际推送率，用来验证是否真按 100Hz 在推
-#   ratio_ge    |值| >= 阈值的样本占比。判断"超差时间占比"这类指标（thresholds 传入阈值列表）
-@dataclass
-class AggregateStats:
-    """一批样本压成的统计量（各字段用途见上）。"""
-    n: int
-    mean: float | None
-    abs_mean: float | None
-    min: float | None
-    max: float | None
-    abs_max: float | None
-    std: float | None
-    rate_hz: float | None
-    ratio_ge: dict[str, float]  # 阈值字符串 → |值|>=阈值的占比（阈值动态传入，故保留 dict）
 
 
 # ---------- 最新样本快照 ----------
@@ -215,6 +199,21 @@ class StopResult:
 
 
 @dataclass
+class LeaseResult:
+    """/api/script/claim 返回：脚本写权租约的领取结果。
+
+    ok=False 说明写权被别的脚本占着，此时所有写路径都回 409
+    （held_age_s 告诉你对方持有了多少秒，据此判断是"还在跑"还是"留下了尸体"）。
+    evicted=True 只可能出现在 steal=True 时：意味着本次把别人踢下来了。
+    """
+    ok: bool
+    token: str
+    expires_in_s: float      # 本次领取/续租后还能撑多久（不写就到期，届时别人可接管）
+    evicted: bool = False    # 本次是否抢占了别人
+    held_age_s: float | None = None  # ok=False 时：对方已持有的秒数
+
+
+@dataclass
 class RegisteredItem:
     """一个被登记记录的监控项（start_log / 导出元信息用）。"""
     index: int
@@ -250,19 +249,6 @@ class LogRowsResult:
     """整段原始样本长表（log_rows() 与 print_log 内部使用；对外取原始点请用
     /api/log/print 导出，或 /api/log/calc 传 window 做子区间计算）。"""
     rows: list[LogRow]
-
-
-@dataclass
-class LogStatsItem(AggregateStats):
-    """一项的整段统计；直接摊平成 index/name + 各统计量，保持原有 JSON 结构。"""
-    index: int
-    name: str
-
-
-@dataclass
-class LogStatsResult:
-    """/api/log/stats 返回。"""
-    items: list[LogStatsItem]
 
 
 @dataclass
@@ -311,8 +297,8 @@ class Snapshot:
 class CalcResult:
     """/api/log/calc 返回：对本段记录做表达式计算的结果。
 
-    agg="none" 时 series 是逐点结果 [[t_ms, value], ...]，value 为 None；
-    否则 value 是聚合后的单值，series 为空。
+    agg 只支持 mean/sum，value 是聚合后的单值（刻意没有逐点序列——
+    要原始点用 print_log 导 csv/json）。
     missing 说明哪些项没有历史序列、退回了当前值（或完全没取值）。
     """
     ok: bool
@@ -320,7 +306,6 @@ class CalcResult:
     agg: str
     value: float | None
     n: int
-    series: list
     missing: dict[str, str]
 
 

@@ -18,7 +18,8 @@
 //     Cmd     1B命令字，说明这帧是干什么的（见下面两个枚举）
 //     Payload 0~445B数据，有些命令没有数据
 //     XOR     1B校验，把Cmd和Payload每个字节依次异或得到；传错一个字节就对不上
-//   监控值帧（Monitor_Post）是唯一带长度前缀的：Cmd后紧跟1B len，见下面枚举处说明。
+//   带长度前缀的帧（Cmd后紧跟1B payloadlen，收信方收1B就能定帧长=1+payloadlen）：
+//     监控值帧 Monitor_Post、通用响应帧 Response，见下面枚举处说明。
 //
 // 订阅档位存在每个监控项的 tag 字段里（见 MENU_ITEM / my_main.h 位域说明）：
 //   bit7 SUB：是否推送；bit6 FAST：高速/低速；bit5 GETTER：函数指针取数；
@@ -31,8 +32,16 @@
 
 // 动作命令处理函数：在rx线程上下文同步执行，只做快速赋值/置标志
 // 是否拒绝忙时下发等行为细节由各函数自己决定（比如先查is_busy()）。
+// 返回值：CMD_RET_OK=已处理；CMD_RET_BUSY=忙时拒绝——handle_command 据此回
+// Response(明确拒绝·忙)，让上位机看得见"命令被拒"（原来是静默return，上位机零反馈）。
 // p指向payload首字节（各输入字段紧凑排列），长度由命令表按类型累加可知。
-typedef void (*CmdFunc)(const uint8_t *p);
+typedef uint8_t (*CmdFunc)(const uint8_t *p);
+
+// CmdFunc 返回值：OK=已处理；BUSY=忙时拒绝；REJECT=其他拒绝（如参数越界）。
+// 非OK由handle_command映射为对应的Response拒绝状态，把拒绝摆给上位机
+static constexpr uint8_t CMD_RET_OK = 0;
+static constexpr uint8_t CMD_RET_BUSY = 1;
+static constexpr uint8_t CMD_RET_REJECT = 2;
 
 // 动作命令 tag：单字节位域（风格与 my_main.h 的 MENU_TAG_* 一致）
 //   bit7 (0x80) CMD_TAG_RANGE  是否带取值范围：发送目录时按ranges指针是否为空自动置位，表项里不用填
@@ -58,6 +67,35 @@ static inline uint8_t cmd_tag_argc(uint8_t tag)
 {
     return static_cast<uint8_t>((tag & CMD_TAG_ARGC_MASK) >> CMD_TAG_ARGC_SHIFT);
 }
+
+// ---------- 通用响应帧（Response）的 status 字节 ----------
+// 协议文档三端同步。位域：
+//   bit7  类别  0=需补发（重发可能成功）          1=明确拒绝（重发无意义，提示用户）
+//   bit6  模式  0=原因串（低6位=串长1~63）         1=内定err（低6位=err号0~63，不带串）
+//   bit5~0 载荷 串长或内定err号，按bit6解释
+// 分区（每个字节值都有定义，无洞无越界）：
+//   0x00      OK，一切正常
+//   0x01~0x3F 需补发+原因串（长度=低6位，UTF-8中文）
+//   0x40~0x7F 需补发+内定err（号=低6位）
+//   0x80      明确拒绝，无原因串（裸拒绝）
+//   0x81~0xBF 明确拒绝+原因串（长度=低6位）
+//   0xC0~0xFF 明确拒绝+内定err（号=低6位）
+// 内定err表按类别各自编号（协议文档定义，三端同步，小而稳；字符串是长尾兜底，
+// 可带运行时值如"下标37超出监控表"，任何版本上位机都能显示）：
+//   需补发类(0x40+n): 0=通用重试 1=校验失败 2=命令字未注册 3~63预留
+//   拒绝类(0xC0+n):   0=通用拒绝 1=下标超表 2=类型不可写 3=忙   4~63预留
+static constexpr uint8_t RESP_OK = 0x00u;
+static constexpr uint8_t RESP_CLASS_MASK = 0x80u; // bit7 类别
+static constexpr uint8_t RESP_MODE_MASK = 0x40u;  // bit6 模式
+static constexpr uint8_t RESP_PAYLOAD_MASK = 0x3Fu;
+// 常用组合值（内定err）
+static constexpr uint8_t RESP_RETRY_GENERIC = 0x40u | 0u;       // 需补发·通用
+static constexpr uint8_t RESP_RETRY_XOR = 0x40u | 1u;           // 需补发·校验失败
+static constexpr uint8_t RESP_RETRY_UNKNOWN_CMD = 0x40u | 2u;   // 需补发·命令字未注册
+static constexpr uint8_t RESP_REJECT_GENERIC = 0xC0u | 0u;      // 拒绝·通用
+static constexpr uint8_t RESP_REJECT_INDEX_RANGE = 0xC0u | 1u;  // 拒绝·下标超表
+static constexpr uint8_t RESP_REJECT_TYPE_UNWRITABLE = 0xC0u | 2u; // 拒绝·类型不可写
+static constexpr uint8_t RESP_REJECT_BUSY = 0xC0u | 3u;         // 拒绝·忙
 
 // 一条动作命令的登记表项，全部为const静态描述，各子系统在自己文件里写成
 // const数组，构造USB_Comm时整张表传入。payload长度不存：收帧时按data_type
@@ -94,6 +132,18 @@ private:
         Monitor_Post, // 监控值推送：一帧可含多项，最多 MON_PACK_MAX 项
         Tunable_Echo,           // 有内容命令 [type 1B][index索引1B][实际生效值?B][XOR]，type前缀自带宽度免查表
         Post_CMD_Directory,     // 动作命令目录帧：[命令字1B][tag 1B][名长][名][参数量][每参:类型+字段名长+字段名][bit7=1时:每参min+max，各按该参类型定宽]，一命令一帧
+        // 通用响应帧（对下行命令的回执，让上位机知道"收到没、处理对没、要不要补发"）：
+        //   Payload: [payloadlen 1B][原话cmd 1B][原话payload ?B][status 1B][原因串 ?B]
+        //     payloadlen  本字段之后到校验前的总字节数（=1+原话payload长+1+原因串长），
+        //                 收1B即定帧长，同监控值帧；最小2，取0/1为流错位
+        //     原话cmd     回显收到的命令字；校验失败时该字节本身可能已损坏，仅作线索
+        //     原话payload 回显收到的payload，截断到RESP_ECHO_MAX（下行帧实际最大56B，不可达）
+        //     status      状态字节，位域与内定err表见文件上方 Response 说明
+        //     原因串      UTF-8中文，≤63B，仅status串模式有
+        //   覆盖：三个目录请求在burst末批当拍回OK（表为空收到即回）；Subscribe；
+        //         动作命令回OK/忙。Ping有Pong、Set_Tunable成功有Tunable_Echo（显式回应），
+        //         但Set_Tunable被拒时无回显兜底，补一帧拒绝响应
+        Response,
         Pong = 0xFF,
     };
     enum Cmd_Get
@@ -173,6 +223,27 @@ private:
     // 单字节槽、人工调参节奏低，一槽足够；0xFF表示无待回显
     uint8_t echo_index = 0xFF;
 
+    // ---------- Response 待发队列 ----------
+    // rx线程只入队（禁止写串口），tx_tick末尾统一发；Pong仍最优先（看门狗不能等）。
+    // 槽位装变长内容：回显payload截断到RESP_ECHO_MAX（下行帧实际最大56B=7参×8B，
+    // 截断不可达，只为让协议完整）；原因串截断到RESP_STR_MAX。
+    // 满则丢最新：丢的只是一个ACK，上位机超时重发即自愈。
+    static constexpr uint8_t RESP_ECHO_MAX = 64;  // 回显payload截断上限
+    static constexpr uint8_t RESP_STR_MAX = 63;   // 原因串截断上限（协议上限）
+    static constexpr uint8_t RESP_QUEUE_DEPTH = 8;
+    struct RespSlot
+    {
+        uint8_t cmd;                 // 回显的命令字
+        uint8_t status;              // 状态字节
+        uint8_t echo_len;            // 回显payload实际字节数
+        uint8_t str_len;             // 原因串实际字节数
+        uint8_t echo[RESP_ECHO_MAX]; // 回显的payload
+        char str[RESP_STR_MAX];      // 原因串（UTF-8，按字节数取用，不当C串）
+    };
+    RespSlot resp_q[RESP_QUEUE_DEPTH];
+    uint8_t resp_head = 0; // 环形队列头（待发）；头=尾即空
+    uint8_t resp_tail = 0; // 环形队列尾（下一个空位）
+
     int usb_fd = -1;                   // /dev/serial1的POSIX描述符，init里打开，收发共用
     uint8_t tx_frame[3 + MAX_PAYLOAD]; // 发送帧缓冲
 
@@ -202,6 +273,14 @@ private:
     // 发动作命令目录的第batch批：扫非空槽按注册序取连续CMD_DIR_BATCH条，一条一帧
     void send_cmd_dir_batch(uint8_t batch);
 
+    // 入队一帧通用响应：echo=回显的payload（可为nullptr），str=原因串（可为nullptr，仅串模式）。
+    // echo截断到RESP_ECHO_MAX、str截断到RESP_STR_MAX；队列满丢最新（丢ACK可自愈）。rx线程安全。
+    void enqueue_response(uint8_t cmd, uint8_t status, const uint8_t *echo, uint16_t echo_len,
+                          const char *str, uint8_t str_len);
+
+    // 把队列里的Response帧全部发出（tx_tick末尾调用；Pong已在拍首发完）
+    void send_responses();
+
     void handle_command(); // 一帧接收完整且校验通过后，按命令字只置请求标志，真正的发送留给tx_tick
     void monitor_tick();   // 按 tag 位域：SUB 才发；FAST 每拍；否则低速轮转（本拍不推进tick）
 
@@ -224,8 +303,9 @@ public:
     // 收齐完整帧立即执行。函数内部死循环，必须由独立vex任务调用，不要在主周期里轮询。
     void rx_task();
 
-    // 发送节拍：每10ms调用一次。先发目录倒计时当前批（每拍≤DIR_BATCH项），
-    // 再按各项tag推送监控值（高速直发、低速轮转），最后推进tick。
+    // 发送节拍：每10ms调用一次。先回Pong，再发调参回显，然后发目录倒计时当前批
+    // （每拍≤DIR_BATCH项），再按各项tag推送监控值（高速直发、低频轮转），
+    // 最后把Response队列发完并推进tick。
     void tx_tick();
 };
 

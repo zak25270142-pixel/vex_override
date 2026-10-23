@@ -73,7 +73,9 @@ from pathlib import Path
 from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 from app.script_api import BackendLink  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 SIDE_CN = {"L": "左", "R": "右"}
 # 固件电机编号：0~2 = 左0~2，3~5 = 右0~2
@@ -129,7 +131,8 @@ RPM_REF = mon("L", 0, "转速")   # 估窗长用的转速读数
 
 def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float,
             raw_path: str = "") -> Sample:
-    """等稳态 → 按转速定窗长 → 记一段 → 取各台均值；raw_path 非空就落原始段。
+    """等稳态 → 按转速定窗长 → 记一段 → 取各台均值；raw_path 给原始段命名
+    （不给就按电压自动命名），段统计从该 csv 回读。
 
     后端缓冲在下一段 start_log 时清空，原始段必须在本段内立刻导出，否则被覆盖。
     """
@@ -146,12 +149,15 @@ def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float,
     bl.start_log()
     bl.sleep(hold)
     bl.end_log()
+    # 原始段一律落盘：它既是结论的底稿，也是段统计的数据源（stats 端点已删，
+    # 统计在脚本侧从 csv 算）。raw_path 给了就用它，没给就按电压自动命名。
+    csv_path = raw_path or bl.out_path("cal_motor_v%g.csv" % volt_cmd)
+    bl.print_log(csv_path)                                     # 全量原始点 CSV
     if raw_path:
         base = raw_path[:-4]
-        bl.print_log(raw_path)                                     # 全量原始点 CSV
         for tag, names in PNG_GROUPS:
             bl.v.print_log("%s_%s.png" % (base, tag), names)       # 分组出图
-    st = bl.stats(WANT)
+    st = seg_stats(csv_path, WANT)
 
     def m(name: str) -> float:
         d = st.get(name) or {}

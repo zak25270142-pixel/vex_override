@@ -80,6 +80,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from app.script_api import BackendLink  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 SIDE_CN = {"L": "左", "R": "右"}
 ALL_IDS = list(range(6))
@@ -125,12 +126,18 @@ def nz(x, default=float("nan")):
     return x if x is not None else default
 
 
-def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float) -> Sample:
+def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float,
+            raw_path: str = "") -> Sample:
+    """等稳态 → 记一段 → 取各台 mean/std/|峰|/n；raw_path 给原始段命名
+    （不给就按电压自动命名），段统计从该 csv 回读（stats 端点已删）。
+    """
     bl.sleep(settle)
     bl.start_log()
     bl.sleep(hold)
     bl.end_log()
-    st = bl.stats(WANT)
+    csv_path = raw_path or bl.out_path("cal_kf_raw_v%g.csv" % volt_cmd)
+    bl.print_log(csv_path)
+    st = seg_stats(csv_path, WANT)
 
     def m(name: str):
         """整段均值。该项没数据/没样本时返回 None——绝不拿 0.0 冒充实测值。"""
@@ -296,6 +303,44 @@ def main() -> None:
         if st_l != 0 or st_r != 0:
             print(f"[warn] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}）")
 
+        def coast(hold: float) -> None:
+            """6 电机撤到 0V 惰行 hold 秒。
+
+            撤压本身是瞬时的（0x84 发出、电机下一拍就是 0V），hold 只是让满电压驱动
+            的电流/机械过渡走完——几十 ms 量级，0.1s 足够。再等不减速度：惰行减速度
+            按摩擦算 ~1m/s²，0.1s 掉不到 0.05m/s。
+            所以不做"转速降到阈值就提前挂"：开环下转速读得到（监控项"左0转速"是直接
+            读 motor->velocity，恒 0 的只有"左转速(慢1拍)"= pre_v），但 100ms 尺度上
+            那个阈值只会立刻成立或永不成立，省不了几十 ms。
+            """
+            for i in ALL_IDS:
+                bl.set_volt(i, 0.0)
+            bl.sleep(hold)
+
+        def volt_stop() -> None:
+            """着地开环扫压专用收车：6 电机 0V → 惰行 0.1s → 0x80 刹车。
+
+            0x80 撤不掉直控电压：开环态速度环休眠（my_spin 在 Stopped 态直接 return），
+            stop_tick 每拍的 output(0,0) 走到 drive(0) 就停住（Stopped 态既不改状态也
+            不写电机），电机保持脚本最后给的电压一路转到 50ms 时限才被硬刹。
+            本脚本扫 3~12V，车是真跑起来的，那一刹带整车动量——全项目只有这里需要它
+            （悬空和摩擦垫上车体不动/只 1.6V 蠕行，直接 0x80 就够），所以这套补丁只
+            落在本脚本：不进固件，也不在 script_api 开 API（通用层多一个收车方法，
+            AI 写的脚本就更可能挑错那个）。
+            顺序不能颠倒：0V 排在 0x80 后面就不是撤压，是把短路制动换成 0V 驱动，
+            驻车力矩没了坡上会溜（speed_loop_probe.halt() 就是这么错的）。
+            两步各自 try：上位机按过停车时 abort 置位，0x84/0x80 都被 409 挡回，
+            收尾路径不能因为挡回就中断（那时车正由上位机的停车帧在停）。
+            """
+            try:
+                coast(0.1)         # 撤压；sleep 会被上位机停车打断（RuntimeError）
+            except Exception:
+                pass
+            try:
+                bl.stop_move()
+            except Exception:
+                pass
+
         def collect(s: Sample, phase: str) -> None:
             row = {"phase": phase, "volt_cmd": s.volt_cmd}
             for i in ALL_IDS:
@@ -327,7 +372,8 @@ def main() -> None:
             try:
                 for v in nodes:
                     bl.spin_target(v, v)
-                    s = measure(bl, v, args.settle, args.hold)
+                    s = measure(bl, v, args.settle, args.hold,
+                                raw_path=bl.out_path("cal_kf_verify_v%g.csv" % v))
                     collect(s, "verify")
                     idx = {"L": 0, "R": 1}
                     rl, rr = s.rpm[mid("L", 0)], s.rpm[mid("R", 0)]
@@ -354,34 +400,41 @@ def main() -> None:
             # ---------- 开环扫压 ----------
             print("[pre] 着地、场地足够长（每档要跑到稳态，车持续%s）\n"
                   % ("后退" if neg else "前进"))
-            for v in volts:
-                for i in ALL_IDS:
-                    bl.set_volt(i, v)
-                s = measure(bl, v, args.settle, args.hold)
-                collect(s, "sweep")
-                print("  V=%5.2f  左转速 %6.2f±%.2f  右转速 %6.2f±%.2f pct   "
-                      "Vact=[%.2f %.2f]  I=[%.2f %.2f]A  样本[%d %d]"
-                      % (v, nz(s.rpm[mid("L", 0)]), nz(s.rpm_std[mid("L", 0)]),
-                         nz(s.rpm[mid("R", 0)]), nz(s.rpm_std[mid("R", 0)]),
-                         nz(s.vact[mid("L", 0)]), nz(s.vact[mid("R", 0)]),
-                         nz(s.cur[mid("L", 0)]), nz(s.cur[mid("R", 0)]),
-                         s.rpm_n[mid("L", 0)], s.rpm_n[mid("R", 0)]))
-                for sd in sides:
-                    r0 = s.rpm[mid(sd, 0)]
-                    if r0 is None or s.rpm_n[mid(sd, 0)] == 0:
-                        print(f"  [warn] {SIDE_CN[sd]}0转速无数据，{v}V 档不进曲线")
-                        continue
-                    curve[sd].append((v, abs(r0)))
-                # 电流保护看真峰值（abs_max），不是"窗口均值的最大值"——后者会漏掉尖峰
-                peaks = [s.cur_amax[i] for i in ALL_IDS if s.cur_amax[i] is not None]
-                peak = max(peaks) if peaks else 0.0
-                if peak > args.i_max:
-                    print(f"  [保护] 电流峰值 {peak:.2f}A 超过 {args.i_max:g}A，中止后续档位")
-                    break
-                for i in ALL_IDS:
-                    bl.set_volt(i, 0.0)
-                bl.sleep(0.3)
-            bl.stop_move()
+            try:
+                for v in volts:
+                    for i in ALL_IDS:
+                        bl.set_volt(i, v)
+                    s = measure(bl, v, args.settle, args.hold,
+                                raw_path=bl.out_path("cal_kf_sweep_v%g.csv" % v))
+                    collect(s, "sweep")
+                    print("  V=%5.2f  左转速 %6.2f±%.2f  右转速 %6.2f±%.2f pct   "
+                          "Vact=[%.2f %.2f]  I=[%.2f %.2f]A  样本[%d %d]"
+                          % (v, nz(s.rpm[mid("L", 0)]), nz(s.rpm_std[mid("L", 0)]),
+                             nz(s.rpm[mid("R", 0)]), nz(s.rpm_std[mid("R", 0)]),
+                             nz(s.vact[mid("L", 0)]), nz(s.vact[mid("R", 0)]),
+                             nz(s.cur[mid("L", 0)]), nz(s.cur[mid("R", 0)]),
+                             s.rpm_n[mid("L", 0)], s.rpm_n[mid("R", 0)]))
+                    for sd in sides:
+                        r0 = s.rpm[mid(sd, 0)]
+                        if r0 is None or s.rpm_n[mid(sd, 0)] == 0:
+                            print(f"  [warn] {SIDE_CN[sd]}0转速无数据，{v}V 档不进曲线")
+                            continue
+                        curve[sd].append((v, abs(r0)))
+                    # 换档前先撤到 0V 惰行。0.3s 不是撤压需要（撤压是瞬时的），
+                    # 是让车在两档之间慢下来，别一路加速冲出场地；收车那次用 0.1s。
+                    # 位置必须排在电流保护判断之前：跳闸那档也还是满电压，撤完再
+                    # break，否则保护一响就是满电压直接撞 0x80 硬刹。
+                    coast(0.3)
+                    # 电流保护看真峰值（abs_max），不是"窗口均值的最大值"——后者会漏掉尖峰
+                    peaks = [s.cur_amax[i] for i in ALL_IDS if s.cur_amax[i] is not None]
+                    peak = max(peaks) if peaks else 0.0
+                    if peak > args.i_max:
+                        print(f"  [保护] 电流峰值 {peak:.2f}A 超过 {args.i_max:g}A，中止后续档位")
+                        break
+            finally:
+                # 收车走 volt_stop（Ctrl+C / 保护跳闸 / 任何异常都落到这）：
+                # 着地有整车动量，先撤压惰行再让 0x80 刹
+                volt_stop()
 
         # ---------- 反解 kf 表 ----------
         if not args.verify:

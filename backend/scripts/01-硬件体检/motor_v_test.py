@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from app.script_api import BackendLink  # noqa: E402
 from motor_names import motor_names  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 HIGH_VS = [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
 
@@ -103,7 +104,7 @@ def main() -> None:
                 seg = os.path.join(out_dir, "%s_%s_%.2f" % (motor, phase, v))
                 bl.print_log(seg + ".csv")
                 bl.print_log(seg + ".png")
-                st = bl.stats(list(ids.values()))
+                st = seg_stats(seg + ".csv", list(ids.values()))
                 v_act, rpm, cur = (st[ids[k]] for k in ("vact", "rpm", "cur"))
                 rows.append({
                     "motor": motor, "phase": phase, "vcmd": round(v, 4),

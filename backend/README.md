@@ -42,6 +42,22 @@ cd d:\work\vex\test1\backend
 前端顶栏勾选「后端」（连接目标变为 `ws://127.0.0.1:8000/ws`）。
 注意：同一时刻只有一方能占串口——后端跑着的时候浏览器不要再直连 Web Serial。
 
+## 连不上 / 没数据时的排查
+
+按「请求发出去了吗 → 字节回来了吗 → 帧凑出来了吗 → 目录来了吗」四段定位：
+
+1. **发请求后一个字节都没回**（最常见）：① 后端模式下确认只有一方在占串口（浏览器不要同时直连）；② 主控里跑的程序必须是带二进制通信协议的版本——旧程序不认识 A5 帧，收到也不会回；③ 确认主控屏幕上用户程序正在运行（不是停在下载/选择界面）；④ 换一根支持数据的 USB 线、直连电脑 USB 口再试。
+2. **选错口**：V5 会枚举出两个串口。后端只认带 VEX 标识的口（VID 0x2888 / 描述符含 vex·user），下载口不会误占；前端直连模式要选「User 口 / User Port」。
+3. **字节有回但帧全是坏的**：数据损坏/错位——检查是否串了其他设备的数据；或固件与前后端版本不匹配。
+4. **链路通但对方不讲这个协议**（帧头后的命令字全不认识）：固件还是旧版，重新下载。
+5. **以上都正常但表格不出来**：点「获取调参表 / 获取实参表」请求目录；个别量没数据，查该项订阅档位是否为「未订阅」。
+
+后端模式下连接状态与端口列表看 `GET /api/status`；链路活性由 300ms 心跳判定（固件 300ms 无 Ping 停推 / 后端 300ms 无 Pong 判掉线，掉线自动重连）。
+
+> 2026-10-23：后端 FrameParser 的 RxStats 诊断计数（bytes/frames/badChecksum/unknownCmd/overflow）已删除——
+> 后端模式下它零读者（脚本没连上读 `/api/status` 就够，链路活性由 300ms 心跳覆盖）。前端直连模式的
+> 「通信诊断」弹窗保留作装饰（仅浏览器直连串口时经过它）。上述排查结论即该弹窗的知识沉淀。
+
 ## 脚本
 
 ```python
@@ -65,7 +81,7 @@ v.stop()
 监控表 `中文名 → index`）。**后端不认识任何命名约定**，脚本只认实车目录里的**中文名**
 或 **index**；`L2 → 左2转速` 这类别名属脚本自己的约定，在脚本侧维护
 （`scripts/tools/motor_names.py` 是个可抄的样例）。分段记录惯例：每档一段
-`start_log → 设值 → 保持 → end_log`，一段就是一条独立曲线，段末 `stats()` 取整段统计。
+`start_log → 设值 → 保持 → end_log`，一段就是一条独立曲线，段末 `calc(..., agg=...)` 取整段标量。
 
 ```python
 import sys; sys.path.insert(0, r"backend")
@@ -80,13 +96,19 @@ with BackendLink() as bl:
         bl.set_volt(0, v)
         bl.sleep(0.4)
         bl.end_log()
-        rows.append({"v": v, "rpm": bl.stats([ids["rpm"]])[ids["rpm"]]["abs_mean"]})
+        rows.append({"v": v, "rpm": bl.calc(ids["rpm"], agg="mean")["value"]})
     bl.save_csv("pytest/l0_start.csv", rows)
 ```
 
-`stats()` 统计本段全部样本；想避开开头的阶跃过渡，用 `calc(expr, window=[t0_ms, t1_ms])`
-让后端按子区间算（聚合或逐点序列）。想提前停直接 `break`（比如"一旦转起来就停"），已 end_log 的段不受影响。
-原始曲线按段 `print_log(路径)` 落盘，格式看后缀：`.json` / `.csv` / `.png` / `.jpg`（无后缀默认 json）。
+`calc(expr, agg)` 把一段聚合成一个标量，**agg 只支持 mean / sum**；想避开开头的阶跃过渡，
+加 `window=[t0_ms, t1_ms]`（t 轴零点就是 start_log 那一刻）。想提前停直接 `break`
+（比如"一旦转起来就停"），已 end_log 的段不受影响。原始曲线按段 `print_log(路径)` 落盘，
+格式看后缀：`.json` / `.csv` / `.png` / `.jpg`（无后缀默认 json）。
+
+> **分析的正路是 pandas 回读**：abs_mean、std、分位、布尔过滤、派生指标这类统计，
+> 一律 `print_log` 落 csv 后脚本侧 `pd.read_csv` 自己算（`df["左0转速"].abs().mean()` 一行的事），
+> 不要给后端加聚合功能——API 面是棘轮，加功能十行、删功能破裂契约，
+> 每条"捷径"都会招募下一个补丁。后端刻意只保留 mean/sum + 一个表达式白名单。
 
 ### 记录会话：脚本只管发命令，记录由后端干
 
@@ -100,28 +122,57 @@ for volt in (0.5, 1.0, 1.5):
     v.cmd("设置电机电压", 0, volt)
     v.sleep(0.4)
     v.end_log()
-    st = v.stats(["左0转速"])["items"][0]             # 本段整段统计
-    print(volt, st["n"], st["mean"], st["abs_max"])
+    print(volt, v.calc("左0转速", agg="mean")["value"])   # 本段均值（mean/sum 二选一）
 
-v.stats(["左0转速"], thresholds=[5.0])             # thresholds 给"|值|>=阈值"的样本占比
 v.calc("左0转速", agg="mean", window=[100, 400])  # 子区间聚合（window 单位 ms，相对本段零点）
 v.print_log("pytest/run.csv")                      # 导出 CSV（后缀决定格式）
 ```
 
 - `print_log(路径)` 按后缀选格式：`.json`（无后缀默认）/ `.csv` / `.png`|`.jpg`（按项作图）；
   路径带子目录会自动创建；不传则落后端 `pytest/probe_data/log_<时间戳>.json`
+- `calc(expr, agg, window)`：agg 只支持 `mean` / `sum`（必填，没有逐点序列选项——
+  要原始点就 `print_log` 导 csv/json 回读）；window 相对本段零点切子区间
+- **abs_mean / std / 分位 / 布尔过滤 / 派生指标：脚本侧 pandas 算**，后端不加聚合。
+  常用的一档已在 `scripts/tools/seg_stats.py` 里（`std` 用总体口径除 n，与旧后端口径一致）：
 
-- `stats` 字段：`n / mean / abs_mean / min / max / abs_max / std / rate_hz / ratio_ge`
-  （`ratio_ge` 是 `|值| >= 阈值` 的样本占比；无样本时 `n=0`，其余为 `None`）
-- `calc()` 带 `window=[t0_ms, t1_ms]` 时间窗口参数（相对本段零点），子区间统计/逐点都走它；
-  要整段原始点就 `print_log` 导 csv/json 本地处理
+  ```python
+  from seg_stats import seg_stats
+  st = seg_stats(seg_csv, ["左0转速"], thresholds=[5.0])   # seg_csv 是本段 print_log 落的
+  st["左0转速"]["abs_mean"], st["左0转速"]["ratio_ge"]["5.0"]
+  ```
+
+  它读的是 csv **10ms 分桶后**的值（桶内取最后），而旧后端 stats 读的是原始样本列表——
+  110Hz 等高推送率下同一桶可能并进 2 个样本，`n` 会比旧口径略小。判据用比值/均值不受影响，
+  拿 `n` 当样本计数时要知道这个差。
 - **记录缓冲上限 50 万条，超了丢新样**。段化写法天然不会累积；万一一次记录跨很多样本，
   中途再调一次 `start_log()`（会清缓冲并重置零点）即可。
+
+### 一次只允许一个脚本写（2026-10-24 起）
+
+后端有把「写权租约」，`BackendLink()` 构造时自动领取，**脚本侧不用写任何新代码**。
+第二个 `BackendLink()` 会直接失败，**不会**跑去跟前一个抢串口：
+
+```
+RuntimeError: /api/script/claim -> 409: {"detail":"已有脚本持有写权（12s 前领取，..."}
+```
+
+- **想接管正在跑的脚本**：`BackendLink(steal=True)`。被踢的那个会被置 abort，
+  在它下一次 `cmd()` / `sleep()` 处抛错停下，不会继续往串口塞命令
+- **不用管收尾**：脚本正常退出或 Ctrl+C 走 `with` 的 `__exit__` 都会 release；
+  就算崩了，租约 60s 没动静自动过期，下一个脚本能直接接管
+- 这套约束只覆盖**写路径**（`/api/sub`、`/api/cmd`、`/api/tunable`、`/api/log/start|end`、
+  `/api/abort/clear`）；读路径（`status`/`column`/`value`/`print`/`calc`）随便看
+- 前端完全走 WS，只用一个 `/api/connect`，所以这套互斥误伤不到上位机
+
+为什么要这道闸：`abort` 闩锁是全局的且没有所有者，两个脚本同时在跑时，
+晚来的那个 `connect()` 会顺手 `clear_abort`，把早来脚本刚吃到的停车解掉——
+它以为自己在停车状态里待着，实际又开始发命令了。**先挡住第二个脚本，
+比给 clear_abort 打补丁更靠得住。**
 
 ### 现成脚本（`scripts/`，按标定层级分目录）
 
 均通过 `app.script_api.BackendLink` 走后端 HTTP（脚本构造即就绪；数据由后端记录，
-脚本只发命令 + 按区间取统计），不再直连串口；先启动后端再运行。
+脚本只发命令 + 按区间取标量），不再直连串口；先启动后端再运行。
 
 层级即标定依赖顺序：**01~04 走开环（0x84 直设电压，绕过速度环）**，测纯物理量，
 必须先经脑屏交出底盘（`is_busy` 期间 0x84 被静默丢弃）；**05 起进闭环（0x85）**。
@@ -146,6 +197,7 @@ v.print_log("pytest/run.csv")                      # 导出 CSV（后缀决定�
 | | `wave_plot.py` | probe 波形/汇总画 PNG（仅开环相位） |
 | | `plot_util.py` | 画图共用件：中文字体兜底 + `subplots/save/legend` |
 | | `motor_names.py` | `L2→左2转速` 脚本侧别名约定（可抄的样例） |
+| | `seg_stats.py` | **段统计共用件**：回读 `print_log` 落下的宽表 csv，返回 `{项名: {n, mean, abs_mean, abs_max, std, ratio_ge}}`（`ratio_ge` 需传 `thresholds`）。`/api/log/stats` 删除后这是取段统计的正路 |
 
 各层的标定原理、判据与用法文档在 `scripts/docs/`（入口是 `00-标定总览.md`：
 标定链顺序、悬空/着地与开环/闭环分界、每步验证手段）；主仓库 `docs/` 只放以下位机

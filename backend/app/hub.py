@@ -28,11 +28,16 @@ from .protocol import (
     build_frame,
     cmd_spec,
     command_send,
+    decode_response,
     decode_value,
+    is_ack_tracked,
     ping,
     request_command,
     request_monitor,
     request_tunable,
+    resp_is_ok,
+    resp_is_retry,
+    resp_reason_text,
     set_tunable,
     subscribe,
     tag_fast,
@@ -40,22 +45,21 @@ from .protocol import (
     value_size,
 )
 from .dataclass import (
-    AggregateStats,
     CalcResult,
     CmdDirItem,
     CmdField,
     CmdResult,
     DirEntry,
     EndLogResult,
+    LeaseResult,
     LogFileMeta,
     LogRow,
     LogRowsResult,
-    LogStatsItem,
-    LogStatsResult,
     MenuItem,
     MonitorReading,
     MonitorSample,
     OkResult,
+    PendingAck,
     PrintLogResult,
     PushState,
     RegisteredItem,
@@ -92,6 +96,23 @@ PRI_SCRIPT = 20 #脚本下发的命令/调参
 # 单个口每轮最多被占 120ms。再快只会频繁打扰下位机和其他用口的进程（如 VS Code 烧录）
 RECONNECT_INTERVAL_S = 5.0
 
+# ---------- Response 确认（下行帧 → 固件回执）----------
+# 固件对需要确认的下行帧回 CmdPost.Response：OK / 需补发 / 明确拒绝。
+# 上位机按 cmd 键维护待确认表：响应到达即结算，超时则原帧重发。
+# 超时口径：响应延迟 ≤1 拍（10ms，rx 入队→下一 tx_tick 发出），动作命令/订阅/
+# 调参取 100ms（10 倍余量）；目录请求要等整个 burst 传完才回 OK，最坏
+# 255 项 ÷ 8 项/拍 = 32 拍 ≈ 320ms，取 1000ms（3 倍余量）。
+ACK_TIMEOUT_DIR_S = 1.0
+ACK_TIMEOUT_CMD_S = 0.1
+ACK_MAX_RETRIES = 3  # 超时/需补发的重发上限；用尽后放弃并记日志（防版本不匹配无限重发）
+
+
+def _ack_timeout_s(cmd: int) -> float:
+    """目录请求等整个 burst，给 1s；其余（动作命令/订阅/调参）100ms。"""
+    if cmd in (CmdGet.RequestTunable, CmdGet.RequestMonitor, CmdGet.RequestCommand):
+        return ACK_TIMEOUT_DIR_S
+    return ACK_TIMEOUT_CMD_S
+
 # ---------- 日志缓冲上限 ----------
 # 脚本忘了 end_log 会一直攒到内存吃满。超出后"丢新不丢旧"：
 # 保留已记录的时间窗完整，事后按窗口统计仍有意义
@@ -100,25 +121,12 @@ MAX_LOG_SAMPLES = 500_000
 # 默认 pytest 输出目录（相对 backend/）
 DEFAULT_PYTEST_DIR = Path(__file__).resolve().parent.parent / "pytest"
 
-
-def _aggregate(vals: list[float], thresholds=(), span_ms: float = 0.0) -> AggregateStats:
-    """区间样本的统计量；无样本时除 n 外全为 None。"""
-    n = len(vals)
-    if n == 0:
-        return AggregateStats(0, None, None, None, None, None, None, None, {})
-    mean = sum(vals) / n
-    var = sum((v - mean) ** 2 for v in vals) / n
-    return AggregateStats(
-        n=n,
-        mean=mean,
-        abs_mean=sum(abs(v) for v in vals) / n,
-        min=min(vals),
-        max=max(vals),
-        abs_max=max(abs(v) for v in vals),
-        std=var ** 0.5,
-        rate_hz=round(n / (span_ms / 1000.0), 2) if span_ms > 0 else None,
-        ratio_ge={str(th): sum(1 for v in vals if abs(v) >= th) / n for th in thresholds},
-    )
+# ---------- 脚本写权租约 ----------
+# 一次只允许一个脚本写。租约靠"持续有动作"续期，所以脚本崩了也不会把机器锁死——
+# 超过这个时长没动静就视为放弃，别人可以接管。
+# 取值权衡：太大 = 崩掉的脚本要等很久才能重跑；太小 = 长时间不给车发命令的
+# 采数脚本会被莫名踢掉。60s 对"扫压标定一档要采样几秒"的节奏是安全的。
+SCRIPT_LEASE_TTL_S = 60.0
 
 
 def _check_field_type(what: str, ftype: int, value: Any) -> None:
@@ -279,6 +287,28 @@ class Hub:
         # seq 发号器：每入队一帧 +1，单调递增，永不回绕参与比较。
         self._tx_seq = 0
         '''帧发号器：每入队一帧 +1，同级 FIFO 依据，单调递增'''
+
+        # ---------- Response 待确认表 ----------
+        # cmd → PendingAck。_send_tracked 入队即登记，_on_frame 收到 Response 结算，
+        # _sweep_acks（_tx_loop 里每轮扫）超时重发。断线期间不烧重试预算。
+        # 写方有两个线程（rx 结算 / tx 扫描重发），照 _sub_lock 的先例加锁；
+        # 临界区只碰表，不做任何 I/O（重发的入队在锁外）。
+        self._ack_lock = threading.Lock()
+        '''护 _pending_acks 的读写锁（rx 线程结算 vs tx 线程扫描重发）'''
+        self._pending_acks: dict[int, PendingAck] = {}
+        '''待确认下行帧 {命令字: PendingAck}，重连时清空'''
+
+        # 确认过程计数（诊断用：日志/后续 UI；目前只累加不对外出口）
+        self.ack_ok = 0
+        '''Response OK 结算次数'''
+        self.ack_retry = 0
+        '''因超时/需补发而重发的次数'''
+        self.ack_reject = 0
+        '''固件明确拒绝的次数（不重发）'''
+        self.ack_timeout = 0
+        '''重试预算用尽仍无确认，放弃的次数'''
+        self.ack_unexpected = 0
+        '''收到无法结算的 Response（无待确认帧/解析失败）的次数'''
         # 身兼两职：守护 _tx_q 的锁 + tx 线程的睡眠/唤醒。
         # enqueue / emergency_stop 入队后 notify；_tx_loop 没帧时 wait 挂起不空转；
         # stop() 靠 notify_all 把它叫醒收尾。
@@ -303,6 +333,19 @@ class Hub:
         # 固件改了命令表顺序也不怕；目录没到时兜底用 0x80（见 _stop_index）。
         self._stop_cmd_index: int | None = None
         '''停车命令 index：命令目录 tag 的 SPEC=Stop 自动认出；None=目录未到（兜底 0x80）'''
+
+        # ---------- 脚本会话互斥（一次只允许一个脚本写） ----------
+
+        # 写权租约。为什么非有不可：abort 闩锁是全局的且没有所有者，
+        # 两个脚本同时在跑时，"晚来的那个调 connect → clear_abort" 会把早来脚本
+        # 刚刚吃到的停车解掉——它就在那儿以为自己被停了，实际又开始发命令了。
+        # 所以第一步是把"第二个脚本"挡在门外，而不是去修 clear_abort。
+        self._lease_lock = threading.Lock()
+        '''护租约三件套的锁（HTTP 路由可能并发进来）'''
+        self._lease_token: str | None = None
+        '''当前持有写权的脚本 token；None=没人持有'''
+        self._lease_at: float = 0.0
+        '''上次"这个人还在"的时刻（monotonic）；超过 SCRIPT_LEASE_TTL_S 视为放弃，防脚本崩了锁死机器'''
 
         # ---------- 自动重连（Backend ↔ 下位机） ----------
 
@@ -396,6 +439,8 @@ class Hub:
                 self._name_to_mon.clear()
                 self._name_to_tun.clear()
                 self._name_to_cmd.clear()
+                # 旧链路的在途帧永远等不到响应了：待确认表作废，重拉从头计时
+                self._pending_acks.clear()
                 self._request_all_dirs()
                 # 把聚合后的订阅意图补发给下位机（重连不丢订阅）
                 self._restore_subscriptions()
@@ -445,7 +490,7 @@ class Hub:
         """
         table.clear()
         names.clear()
-        self.enqueue(request_frame, PRI_UI)
+        self._send_tracked(request_frame, PRI_UI)  # 登记待确认：burst 末批的 OK 才算拉到
 
     def _request_all_dirs(self) -> None:
         """拉三张表：调参目录、监控目录、命令目录。连上和重连后都要调。"""
@@ -632,6 +677,12 @@ class Hub:
             entry = self.tunable_dir.get(p[1])
             if entry is not None:
                 entry.item.value = decode_value(p, 2, p[0])
+            # 回显即 Set_Tunable 成功路径的确认，清掉待确认表里那帧
+            # （失败路径固件补拒绝 Response，见下面的 Response 分支）
+            self._pending_acks.pop(CmdGet.SetTunable, None)
+        elif cmd == CmdPost.Response:
+            # 通用响应帧：[payloadlen][原话cmd][原话payload][status][原因串]
+            self._handle_response(p)
         # Pong：时间戳在 SerialBridge 里已更新，这里无事
 
     # ---------- 下行优先级队列 ----------
@@ -651,9 +702,165 @@ class Hub:
             self._tx_q = deque(sorted(self._tx_q, key=lambda x: (x[0], x[1])))
             self._tx_cv.notify()
 
+    def _send_tracked(self, frame: bytes, priority: int = PRI_UI) -> None:
+        """入队并登记待确认：所有固件会回 Response 的下行帧走这里。
+
+        与 enqueue 只差一件事：按 cmd 键在 _pending_acks 记一帧（原帧/优先级/
+        deadline/重试预算）。Response 到达或超时都据此结算，重发发原帧。
+        同一 cmd 连续下发只保留最后一帧——同命令字 payload 长度恒定（字段表
+        固定），且设目标类命令终态一致，覆盖无害。
+        """
+        self.enqueue(frame, priority)
+        if len(frame) >= 2 and is_ack_tracked(frame[1]):
+            cmd = frame[1]
+            timeout = _ack_timeout_s(cmd)
+            with self._ack_lock:
+                self._pending_acks[cmd] = PendingAck(
+                    frame=frame,
+                    priority=priority,
+                    timeout=timeout,
+                    deadline=time.monotonic() + timeout,
+                    retries=ACK_MAX_RETRIES,
+                )
+
+    def _expected_echo_len(self, echo_cmd: int, entry: PendingAck | None) -> int | None:
+        """Response 里回显 payload 的应有字节数。
+
+        优先用待确认表里的原帧（len-3，最可靠）；未登记的命令字按内置命令定长
+        或命令目录字段累推。同一命令字的 payload 长度恒定，是不变量。
+        """
+        if entry is not None:
+            return len(entry.frame) - 3  # A5 + cmd + XOR
+        builtin = {
+            CmdGet.RequestTunable: 0,
+            CmdGet.RequestMonitor: 0,
+            CmdGet.RequestCommand: 0,
+            CmdGet.Subscribe: 2,
+            CmdGet.SetTunable: 9,
+            CmdGet.Ping: 0,
+        }
+        if echo_cmd in builtin:
+            return builtin[echo_cmd]
+        dir_entry = self.cmd_dir.get(echo_cmd)
+        if dir_entry is not None and isinstance(dir_entry.item, CmdDirItem):
+            return sum(value_size(f.type) for f in dir_entry.item.fields)
+        return None
+
+    def _handle_response(self, p: bytes) -> None:
+        """结算一帧 Response（_on_frame 的 Response 分支，rx 线程里执行）。
+
+        三种结局：
+          OK        → 清除待确认（命令送达且处理成功）
+          需补发     → 固片说这帧没成（校验失败/命令字未注册）：立即原帧重发，
+                      计入同一份重试预算——永久性原因（如版本不匹配）不会无限重发
+          明确拒绝   → 不重发（重发无意义）：内定err号/原因串进日志。
+                      拒绝类是给机器决策的（INDEX_RANGE 该去刷目录、BUSY 该等待）
+        表操作持 _ack_lock；入队/日志在锁外（enqueue 另持 _tx_cv，不嵌套）。
+        """
+        if len(p) < 2:
+            self.ack_unexpected += 1
+            return
+        echo_cmd = p[1]
+        with self._ack_lock:
+            # 先取不 pop：坏响应（一致性校验失败）不弄丢待确认帧，留给超时重发自愈
+            entry = self._pending_acks.get(echo_cmd)
+            echo_len = self._expected_echo_len(echo_cmd, entry)
+            if echo_len is None:
+                self.ack_unexpected += 1
+                log = f"Response 无法解析：回显命令字 0x{echo_cmd:02X} 无待确认帧且长度不可知"
+                resend = None
+            else:
+                decoded = decode_response(p, echo_len)
+                if decoded is None:
+                    self.ack_unexpected += 1
+                    log = "Response 一致性校验失败（payloadlen 与回显长度不符），丢弃"
+                    resend = None
+                else:
+                    _, _, status, reason = decoded
+                    reason_text = resp_reason_text(status, reason)
+                    if resp_is_ok(status):
+                        self._pending_acks.pop(echo_cmd, None)
+                        self.ack_ok += 1
+                        log = None
+                        resend = None
+                    elif not resp_is_retry(status):  # 明确拒绝
+                        self._pending_acks.pop(echo_cmd, None)
+                        self.ack_reject += 1
+                        log = f"命令 0x{echo_cmd:02X} 被固件拒绝：{reason_text}"
+                        resend = None
+                    elif entry is None:  # 需补发但无帧可发
+                        self.ack_unexpected += 1
+                        log = f"命令 0x{echo_cmd:02X} 需补发但无待确认帧可发：{reason_text}"
+                        resend = None
+                    elif entry.retries <= 0:  # 预算耗尽
+                        self._pending_acks.pop(echo_cmd, None)
+                        self.ack_timeout += 1
+                        log = f"命令 0x{echo_cmd:02X} 补发预算已用尽：{reason_text}"
+                        resend = None
+                    else:  # 需补发：扣预算、顺延 deadline、原帧重发
+                        entry.retries -= 1
+                        entry.deadline = time.monotonic() + entry.timeout
+                        self.ack_retry += 1
+                        log = (
+                            f"命令 0x{echo_cmd:02X} 需补发（{reason_text}），"
+                            f"立即重发（剩余 {entry.retries} 次）"
+                        )
+                        resend = (entry.frame, entry.priority)
+        if log is not None:
+            if resend is None:
+                logger.warning(log)  # 解析失败/拒绝/预算耗尽：都该被看见
+            else:
+                logger.info(log)  # 补发重试：正常流转，info 就够
+        if resend is not None:
+            self.enqueue(*resend)
+
+    def _sweep_acks(self) -> None:
+        """扫待确认帧：超时未收到 Response 就原帧重发（_tx_loop 每轮调，空转时 0.1s 一拍）。
+
+        断线期间不烧重试预算：掉线/重启时所有在途帧都得不到响应，无差别重发只会
+        把预算耗在重连前；deadline 顺延，连上后重新计时（重连成功本就会清空
+        待确认表并重拉目录，见 _reconnect_loop）。
+        表操作持 _ack_lock；入队/日志在锁外。
+        """
+        with self._ack_lock:
+            if not self._pending_acks:
+                return
+            now = time.monotonic()
+            resends: list[tuple[bytes, int]] = []
+            logs: list[tuple[int, str]] = []
+            if not self.bridge.connected:
+                for e in self._pending_acks.values():
+                    e.deadline = now + e.timeout
+                return
+            for cmd, e in list(self._pending_acks.items()):
+                if now < e.deadline:
+                    continue
+                if e.retries <= 0:
+                    del self._pending_acks[cmd]
+                    self.ack_timeout += 1
+                    logs.append((
+                        logging.WARNING,
+                        f"命令 0x{cmd:02X} 重试 {ACK_MAX_RETRIES} 次均无确认，"
+                        f"放弃（帧 {e.frame.hex()}）",
+                    ))
+                    continue
+                e.retries -= 1
+                e.deadline = now + e.timeout
+                self.ack_retry += 1
+                logs.append((
+                    logging.INFO,
+                    f"命令 0x{cmd:02X} 超时无确认，重发（剩余 {e.retries} 次）",
+                ))
+                resends.append((e.frame, e.priority))
+        for level, text in logs:
+            logger.log(level, text)
+        for frame, pri in resends:
+            self.enqueue(frame, pri)
+
     def _tx_loop(self) -> None:
         """唯一的串口写线程。没事干时睡在 Condition 上，来帧就被唤醒。"""
         while self._running:
+            self._sweep_acks()  # 每轮扫一次待确认超时（空转时 0.1s 一拍，来了帧也扫）
             with self._tx_cv:
                 while self._running and not self._tx_q:
                     self._tx_cv.wait(timeout=0.1)
@@ -764,9 +971,9 @@ class Hub:
             if (new_sub, new_fast) != old:
                 self.fw_sub[idx] = (new_sub, new_fast)
                 if new_sub:
-                    self.enqueue(subscribe(idx, True, new_fast), PRI_UI)
+                    self._send_tracked(subscribe(idx, True, new_fast), PRI_UI)
                 else:
-                    self.enqueue(subscribe(idx, False, False), PRI_UI)
+                    self._send_tracked(subscribe(idx, False, False), PRI_UI)
 
     def from_ui(self, data: bytes, ws: WebSocket) -> None:
         """上位机发来的原始帧（在 asyncio 事件循环里执行，因为来自 WebSocket）。
@@ -838,8 +1045,8 @@ class Hub:
             self.emergency_stop()
             return
 
-        # 5) 其余透传
-        self.enqueue(data, PRI_UI)
+        # 5) 其余透传（动作命令/调参写入等：登记待确认，固件回 Response 结算）
+        self._send_tracked(data, PRI_UI)
 
     def _stop_index(self) -> int:
         """停车命令用的 index：有目录以目录认出的为准，没到则兜底 0x80。
@@ -1127,12 +1334,87 @@ class Hub:
             self._tx_cv.notify()
 
         idx = self._stop_index()
-        self.enqueue(build_frame(idx, b""), PRI_STOP)
+        self._send_tracked(build_frame(idx, b""), PRI_STOP)  # 停车帧也要确认：收不到必须重发
         return StopResult(ok=True, cmd_index=idx)
 
     def clear_abort(self) -> None:
-        """清掉中止旗标：脚本被停车打断后，再跑新脚本前必须先调它，否则 cmd() 直接抛错。"""
+        """复位中止闩锁，让下一次写不再抛错——**只做这一件事**。
+
+        不清发送队列、不重发也不撤回已发出的停车帧、不动电机状态、不改订阅。
+        它是「允许继续」的解锁，**不是「取消刚才那次停车」**：停过的车不会因为
+        调它就自己走起来，已经丢掉的脚本队列也回不来。
+
+        为什么必须有人显式清：旗标是**全局的、没有所有者**，后端不知道上一个脚本
+        是不是已经死了——Ctrl+C/异常退出时就那么闩着，下一个脚本第一条 cmd()
+        直接吃 409。BackendLink.connect() 里已经自动清一次（见那里注释），
+        用 with BackendLink(...) 的正常脚本不必自己调这个函数。
+        """
         self.abort_event.clear()
+
+    # ---------- 脚本写权租约（一次一个脚本） ----------
+
+    def claim_script(self, token: str, steal: bool = False,
+                     ttl_s: float = SCRIPT_LEASE_TTL_S) -> LeaseResult:
+        """领/续写权租约。同一个 token 重复调 = 续租，不冲突。
+
+        steal=True 会踢掉别人，并顺手置 abort——被踢的那个脚本下一次 cmd()/sleep()
+        立刻抛错，而不是继续往串口里塞命令。拿到写权的人自己调 clear_abort 解锁。
+
+        返回: LeaseResult；ok=False 时 held_age_s 是对方已持有的秒数
+        """
+        now = time.monotonic()
+        with self._lease_lock:
+            holder, age = self._lease_holder()
+            if holder is None or holder == token:
+                self._lease_token, self._lease_at = token, now
+                return LeaseResult(ok=True, token=token, expires_in_s=ttl_s)
+            if not steal:
+                return LeaseResult(ok=False, token=token, expires_in_s=0.0,
+                                   held_age_s=age)
+            self._lease_token, self._lease_at = token, now
+        # 出锁再置：abort 跟租约护的不是同一把锁，别在持锁时扩大临界区
+        self.abort_event.set()
+        return LeaseResult(ok=True, token=token, expires_in_s=ttl_s, evicted=True)
+
+    def release_script(self, token: str) -> None:
+        """还写权。不是自己的就什么都不做——够用了，这里不需要报错来提醒谁。"""
+        with self._lease_lock:
+            if self._lease_token == token:
+                self._lease_token, self._lease_at = None, 0.0
+
+    def require_script(self, token: str | None) -> None:
+        """写路径准入：每次被保护的请求都要过这一关。
+
+        三种结果：没人持有 → 顺手把写权给这个 token（第一个写的人就是持有者）；
+        自己就是持有者 → 续租放行；别人持有 → 抛 PermissionError（路由层转 409）。
+        """
+        now = time.monotonic()
+        with self._lease_lock:
+            if self._lease_token is None:
+                if token is None:
+                    return          # 匿名 + 无人持有：放行（curl 手测不受影响）
+                self._lease_token, self._lease_at = token, now
+                return
+            if self._lease_token == token:
+                self._lease_at = now
+                return
+            age = now - self._lease_at
+            if age > SCRIPT_LEASE_TTL_S:
+                # 租约过期 = 对方十有八九崩了。接管的不是"抢"，是收尸
+                self._lease_token, self._lease_at = token, now
+                return
+            raise PermissionError(
+                "写权被另一个脚本持有（已 %.0fs，token=%s）。"
+                "确认对方已退出后重跑，或用 steal 抢占" % (age, self._lease_token))
+
+    def _lease_holder(self) -> tuple[str | None, float]:
+        """当前持有者与已持有秒数；租约过期则当无人持有。调用方须持 _lease_lock。"""
+        if self._lease_token is None:
+            return None, 0.0
+        age = time.monotonic() - self._lease_at
+        if age > SCRIPT_LEASE_TTL_S:
+            return None, 0.0
+        return self._lease_token, age
 
     def check_abort(self) -> None:
         """中止检查点：abort 置位就抛 RuntimeError，供脚本在命令/等待处调用。
@@ -1174,7 +1456,7 @@ class Hub:
                 lo, hi = f.min, f.max
                 if (lo is not None and v < lo) or (hi is not None and v > hi):
                     raise ValueError(f"命令 {item.name} 的参数 {f.name}={v} 超出范围（{lo}~{hi}）")
-        self.enqueue(command_send(item.index, types, values), PRI_SCRIPT)
+        self._send_tracked(command_send(item.index, types, values), PRI_SCRIPT)
         return CmdResult(ok=True, index=item.index, name=item.name, args=values)
 
     def set_tunable_value(self, index_or_name, value) -> SetTunableResult:
@@ -1192,7 +1474,7 @@ class Hub:
         # Color 项只收 "#RRGGBB" 字符串。字符串/None/列表一律 400，
         # 不再静默编 0——静默 0 会把笔误伪装成"生效且值为 0"
         _check_field_type(f"调参项[{item.name}]", item.type, value)
-        self.enqueue(set_tunable(idx, item.type, value), PRI_SCRIPT)
+        self._send_tracked(set_tunable(idx, item.type, value), PRI_SCRIPT)
         return SetTunableResult(ok=True, index=idx, value=value)
 
     # ---------- 记录会话 ----------
@@ -1302,13 +1584,21 @@ class Hub:
     ALIGN_TOL_MS = 2.0
 
     def calc(self, expr: str, agg: str = "", window=None) -> CalcResult:
-        """对本段记录做表达式计算：输入项名做逐点算术，再按需聚合。
+        """对本段记录做表达式计算：输入项名做逐点算术，再聚合成一个标量。
+
+        agg 必填，只支持 mean / sum。
+
+        【 preferred path —— 写给未来的维护者（包括 AI）】
+        复杂分析（派生量之外的滤波/分位/布尔过滤/ratio_ge 类指标/画图）一律
+        print_log 落 csv 后 pandas 回读，不要给本函数加 agg、加语法、加数据出口：
+        API 面是棘轮，加功能十行、删功能破裂契约，而每条"捷径"都会招募下一个补丁。
+        本函数故意保持最小：无人也决策的一行断言（"这段均值 < 阈值吗"）用它，
+        有人看数据的世界属于 csv + pandas。
 
         expr：只含监控项名（中文）+ 算术运算符，如 "左0电流 - 左1电流"、
               "(左0电流 + 左1电流 + 左2电流) / 3"
-        agg ：mean / sum / rms / std / max / min / abs_mean / count / median；
-              空串则返回逐点序列 [[t_ms, value], ...]
-        window：可选 [t0_ms, t1_ms]，只算这段时间内的点
+        agg ：mean / sum（必填；没有"逐点序列"选项——要原始点就 print_log 导 csv）
+        window：可选 [t0_ms, t1_ms]，只算这段时间内的点（t 轴零点 = start_log 时刻）
 
         项的取值来源：有历史序列的（已登记 + 本段有样本）逐点参与运算；
         没有历史的（未登记的低速项）只有当前值，全程用这一个值，并在 missing 里标出。
@@ -1327,10 +1617,13 @@ class Hub:
 
         ops = {
             ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
-            ast.Div: op.truediv, ast.Pow: op.pow,
+            ast.Div: op.truediv,
             ast.USub: op.neg, ast.UAdd: op.pos,
         }
-        aggs = {"mean", "sum", "rms", "std", "max", "min", "abs_mean", "count", "median"}
+        # agg 只保留 mean/sum：其余统计量（rms/std/max/min/abs_mean/count/median）
+        # 在 pandas 里全是一行，堆在这里就是给 API 棘轮上挂钩。逐点序列也不给——
+        # 数据出口只有 print_log 的 csv/json。
+        aggs = {"mean", "sum"}
 
         try:
             tree = ast.parse(expr, mode="eval")
@@ -1356,24 +1649,26 @@ class Hub:
                                    ast.expr_context, *ops)):
                 continue
             else:
-                raise ValueError("表达式只允许监控项名、数字和 + - * / ** 运算")
+                raise ValueError("表达式只允许监控项名、数字和 + - * / 运算")
         if not names:
             raise ValueError("表达式里没有监控项")
         # agg 在这里就验：放到配点之后，一旦窗口内没点就会先报"没有可配对的有效点"，
         # 把 agg 拼错这件事盖掉（用户看到的是个不相干的错误）。
-        if agg and agg not in aggs:
-            raise ValueError("不支持的聚合：%s（可用 %s）" % (agg, "/".join(sorted(aggs))))
+        if agg not in aggs:
+            raise ValueError("不支持的聚合：%r（只支持 mean/sum；"
+                             "要逐点序列或更复杂的统计，print_log 导 csv 回读）" % (agg,))
         for n in names:
             self.resolve_monitor(n)   # 不存在会抛 KeyError
 
         def as_real(v):
-            """运算结果收口：复数/inf/nan 就地转 400，别留到 JSON 序列化时才炸。
+            """运算结果收口：inf/nan 就地转 400，别留到 JSON 序列化时才炸。
 
-            复数来自负数的分数次幂（(-8) ** 0.5），inf/nan 来自过大的幂。
+            inf/nan 来自加减乘除溢出（1e300 * 1e300）——复数曾来自负数的分数次幂，
+            随 ** 一起删了，这里不再需要挡。
             除零不在这里挡——那是数据问题（某一拍分母为 0），跳点比整体报错合适。
             """
-            if isinstance(v, complex) or not math.isfinite(v):
-                raise ValueError("运算结果不是有限实数（检查负数的分数次幂与过大的指数）")
+            if not math.isfinite(v):
+                raise ValueError("运算结果不是有限实数（检查过大的乘除与指数）")
             return v
 
         def eval_node(node, env):
@@ -1423,8 +1718,8 @@ class Hub:
                 v = eval_node(tree.body, env)
             except ZeroDivisionError:
                 raise ValueError("除零")
-            return CalcResult(ok=True, expr=expr, agg=agg or "none", value=v,
-                              n=1, series=[], missing=missing)
+            return CalcResult(ok=True, expr=expr, agg=agg, value=v,
+                              n=1, missing=missing)
 
         # 以第一项的时刻为基准，其余项按 ±ALIGN_TOL_MS 同拍配对
         base_name = sorted(seq)[0]
@@ -1457,44 +1752,13 @@ class Hub:
                              " 某项完全没有取值）")
 
         vals = [v for _, v in out]
-        if not agg:
-            return CalcResult(ok=True, expr=expr, agg="none", value=None, n=len(vals),
-                              series=out, missing=missing)
         n = len(vals)
-        mean = sum(vals) / n
         table = {
-            "mean": mean,
+            "mean": sum(vals) / n,
             "sum": sum(vals),
-            "rms": math.sqrt(sum(v * v for v in vals) / n),
-            "std": math.sqrt(sum((v - mean) ** 2 for v in vals) / n) if n > 1 else 0.0,
-            "max": max(vals),
-            "min": min(vals),
-            "abs_mean": sum(abs(v) for v in vals) / n,
-            "count": float(n),
-            "median": sorted(vals)[n // 2] if n % 2 else
-                      (sorted(vals)[n // 2 - 1] + sorted(vals)[n // 2]) / 2.0,
         }
         return CalcResult(ok=True, expr=expr, agg=agg, value=table[agg], n=n,
-                          series=[], missing=missing)
-
-    def log_stats(self, names=None, thresholds=()) -> LogStatsResult:
-        """整段统计（后端算好，脚本不用自己攒样本）。
-
-        thresholds 里每个 th 额外给出 ratio_ge[th] = |值| >= th 的样本占比。
-        这个指标专门为标定设计：比如"超速时间占比 30%"比"平均超了多少"
-        更能说明增益给大了。取绝对值是因为正负超调都算问题。
-        """
-        idxs = self._log_indices(names)
-        items: list[LogStatsItem] = []
-        for idx in idxs:
-            name = self._mon_name(idx)
-            samples = self._samples(idx)
-            vals = [v for _, v in samples]
-            # rate_hz 用样本自身跨度算（首个到末个时间戳），不依赖任何窗口
-            span_ms = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
-            # 统计量摊平成 {index,name,n,mean,...}：/api/log/stats 的 JSON 契约不能变
-            items.append(LogStatsItem(index=idx, name=name, **asdict(_aggregate(vals, thresholds, span_ms))))
-        return LogStatsResult(items=items)
+                          missing=missing)
 
     def print_log(self, path: str | None = None, index_or_name=None) -> PrintLogResult:
         """导出记录，格式由 path 的后缀决定（只写一种，不再一次落两份）：

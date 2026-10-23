@@ -20,12 +20,13 @@ import os
 from contextlib import asynccontextmanager # 异步上下文管理器（自动收车收尾）
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware # CORS 中间件（允许跨域）
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field 
 
-from .dataclass import CalcResult, ConnectResult, OkResult, ValueSnapshot
-from .hub import Hub
+from .dataclass import CalcResult, ConnectResult, LeaseResult, OkResult, ValueSnapshot
+from .hub import SCRIPT_LEASE_TTL_S, Hub
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +82,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- 脚本写路径互斥 ----------
+# 一次只允许一个脚本写。受保护的是"会改变车的行为或改写权本身"的接口；
+# 读取类（status/column/value/print/calc）不拦——看一眼数据不会打架。
+# 前端完全走 WS（只用一个 /api/connect），所以这套不会误伤上位机：
+# 确认这一点的成本是一次全仓 grep，改 WS 路线时记得重做。
+_GUARDED_WRITE_PATHS = frozenset({
+    "/api/sub",                # 改订阅意图 + 登记记录
+    "/api/sub/clear_script",
+    "/api/cmd",                # 下发动作命令
+    "/api/tunable",            # 写调参项
+    "/api/log/start",          # 开/收段（缓冲属于持有者）
+    "/api/log/end",
+    "/api/abort/clear",        # ← 原来的洞：谁都能解别人的停车
+})
+
+
+@app.middleware("http")
+async def script_exclusive(request: Request, call_next):
+    """写路径准入：X-Script-Token 必须是当前写权持有者，否则 409。
+
+    为什么用中间件而不是逐个路由加依赖：受保护的面要能一眼看全（就是上面那个集合），
+    而且不用给七个路由签名都塞一个参数。
+    """
+    if request.url.path in _GUARDED_WRITE_PATHS:
+        try:
+            hub.require_script(request.headers.get("x-script-token"))
+        except PermissionError as e:
+            logger.warning("写路径被拒 %s: %s", request.url.path, e)
+            return JSONResponse(status_code=409, content={"detail": str(e)})
+    return await call_next(request)
+
 
 # ---------- WebSocket（Vue3 上位机）----------
 
@@ -123,6 +155,13 @@ class TunableBody(BaseModel):
     """/api/tunable 请求体：写一个调参项的值。"""
     index_or_name: Any
     value: Any
+
+
+class ScriptClaimBody(BaseModel):
+    """/api/script/claim 与 /api/script/release 请求体：认领/归还脚本写权。"""
+    token: str            # 脚本进程唯一标识（BackendLink 自动生成 uuid）
+    steal: bool = False   # 别人占着时是否抢占（release 不看这个字段）
+    ttl_s: float = Field(default=SCRIPT_LEASE_TTL_S, gt=0)  # 租约时长，release 不看
 
 
 class PrintLogBody(BaseModel):
@@ -228,6 +267,32 @@ def api_abort_clear():
     return OkResult()
 
 
+@app.post("/api/script/claim")
+def api_script_claim(body: ScriptClaimBody):
+    """领脚本写权：一次只有一个脚本握得住，第二个在 connect 阶段就被挡回去。
+
+    abort 闩锁是全局的、没有所有者，两个脚本同时在跑时晚来的那个会把早来脚本
+    刚吃到的停车解掉（后者以为自己被停了，实际又开始发命令）。所以与其修 clear_abort，
+    不如先把第二个脚本挡在门外——这里就是那道门。
+
+    租约到期自动释放（SCRIPT_LEASE_TTL_S 秒没动静），所以脚本崩了别人也能接管。
+    返回: LeaseResult；被别人占着 → 409（held_age_s 是对方已持有的秒数）
+    """
+    r = hub.claim_script(body.token, body.steal, body.ttl_s)
+    if not r.ok:
+        raise HTTPException(
+            409, f"已有脚本持有写权（{r.held_age_s:.0f}s 前领取，token={body.token} 不是它）。"
+                 f"确认对方已退出后重跑，或 steal=true 抢占（抢占会给对方置 abort）")
+    return r
+
+
+@app.post("/api/script/release")
+def api_script_release(body: ScriptClaimBody):
+    """还写权（脚本收尾时调）。不是自己的就静默无事——这里不需要用报错提醒谁。"""
+    hub.release_script(body.token)
+    return OkResult()
+
+
 @app.post("/api/cmd")
 def api_cmd(body: CmdBody):
     """下发动作命令（脚本主力写接口）。
@@ -287,7 +352,8 @@ def api_log_print(body: PrintLogBody = PrintLogBody()):
 class CalcBody(BaseModel):
     """/api/log/calc 请求体：对已记录的项做表达式计算。
 
-    expr 只含监控项名 + 算术运算符；agg 为空则回逐点序列。
+    expr 只含监控项名 + 算术运算符；agg 必填且只支持 mean/sum。
+    复杂分析（滤波/分位/布尔过滤/派生指标）请 print_log 导 csv 后 pandas 回读。
     """
     expr: str
     agg: str = ""
@@ -296,30 +362,12 @@ class CalcBody(BaseModel):
 
 @app.post("/api/log/calc")
 def api_log_calc(body: CalcBody) -> CalcResult:
-    """对本段记录做表达式计算并聚合，如 "左0电流 - 左1电流" + agg="mean"。"""
-    try:
-        return hub.calc(body.expr, body.agg, body.window)
-    except KeyError as e:
-        raise HTTPException(404, str(e))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    """对本段记录做表达式计算并聚合成标量，如 "左0电流 - 左1电流" + agg="mean"。
 
-
-@app.get("/api/log/stats")
-def api_log_stats(
-    index_or_name: list[Any] = Query(default=[]),
-    thresholds: list[float] = Query(default=[]),
-):
-    """整段统计，不传 index_or_name 就统计全部已记录的项。
-
-    统计的是"本段（start_log → end_log）的全部样本"，后端不切窗口；
-    要只看某一段子区间，用 /api/log/calc 传 window=[t0_ms, t1_ms]（服务端切）；
-    要原始点就 /api/log/print 导 csv/json。
-
-    thresholds 里每个值额外给出 ratio_ge（|值| >= 该阈值的样本占比）。
+    agg 只支持 mean/sum；要逐点序列或更复杂的统计，用 /api/log/print 导 csv 回读。
     """
     try:
-        return hub.log_stats(index_or_name or None, thresholds)
+        return hub.calc(body.expr, body.agg, body.window)
     except KeyError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:

@@ -34,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from app.script_api import BackendLink  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 RPM = {"L": "左0转速", "R": "右0转速"}
 VACT = {"L": "左0实际电压", "R": "右0实际电压"}
@@ -101,7 +102,7 @@ def main() -> None:
             seg = os.path.join(out_dir, "v%.2f" % v)
             bl.print_log(seg + ".csv")
             bl.print_log(seg + ".png")
-            st = bl.stats(want)
+            st = seg_stats(seg + ".csv", want)
 
             def m(name):
                 d = st.get(name) or {}
@@ -118,8 +119,8 @@ def main() -> None:
                   % (v, row["L_rpm"] or 0, row["R_rpm"] or 0,
                      row["L_vact"] or 0, row["R_vact"] or 0, row["I_L_max"], row["I_R_max"]))
 
-        bl.drive_volt(0.0)
-        bl.sleep(0.3)
+        # 不撤压：悬空，车体不动，with 退出那记 0x80 直接硬刹空转的轮子就够了。
+        # 撤压惰行是着地扫压才需要的（车有整车间动量），见 cal_kf_table.py 的 volt_stop。
 
         # 12V 档的电池/母线健康与啮合内耗提示
         top = rows[-1] if rows else None

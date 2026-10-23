@@ -23,7 +23,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 from app.script_api import BackendLink  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 CUR = [f"{s}{i}电流" for s in "左右" for i in range(3)]
 VACT = [f"{s}{i}实际电压" for s in "左右" for i in range(3)]
@@ -74,7 +76,7 @@ def main() -> None:
                 bl.v.print_log("%s_%s.png" % (seg, tag), names)
             bl.spin_target(0.0, 0.0)
             bl.sleep(0.3)
-            st = bl.stats(want)
+            st = seg_stats(seg + ".csv", want)
 
             def m(name):
                 d = st.get(name) or {}

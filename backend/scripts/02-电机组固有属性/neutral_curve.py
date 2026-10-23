@@ -68,6 +68,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))   # backe
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 from app.script_api import BackendLink  # noqa: E402
 from motor_names import motor_names  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 
 # ------------------------------------------------------------
@@ -158,11 +159,14 @@ def measure_state(
     driver_voltage: float,
     test_voltage: float,
     hold: float,
+    tag: str,
 ) -> dict:
     """设置一个状态、保持 hold 秒后收段，取本段整段统计。
 
     一段就是一次独立记录：start_log → 设 3 台电机电压 → 保持 → end_log。
     rpm 用 |rpm| 的 mean；实际电压/电流用 mean。
+    原始段落盘（tag 命名）——既是结论的底稿，也是统计的数据源
+    （stats 端点已删，段统计在脚本侧从 csv 算）。
     """
     link.start_log()
     set_voltage(link, group["driver0"], driver_voltage)
@@ -171,7 +175,9 @@ def measure_state(
     link.sleep(hold)
     link.end_log()
 
-    st = link.stats(list(ids.values()))
+    seg = link.out_path("neutral_%s.csv" % tag)
+    link.print_log(seg)
+    st = seg_stats(seg, list(ids.values()))
 
     def rpm_abs(key):
         return st[ids[key]]["abs_mean"]
@@ -227,6 +233,7 @@ def paired_point(
         driver_voltage,
         0.0,
         args.hold,
+        "base",
     )
 
     result = measure_state(
@@ -236,6 +243,7 @@ def paired_point(
         driver_voltage,
         test_voltage,
         args.hold,
+        "t%g" % test_voltage,
     )
 
     b = baseline["wheel_rpm"]
@@ -498,6 +506,7 @@ def scan_driver_voltage(
         driver_voltage,
         0.0,
         args.hold,
+        "final_base",
     )
 
     print(
@@ -633,7 +642,7 @@ def main():
     raw_rows = []
     summary_rows = []
 
-    # with 退出时 __exit__ 自动收车收尾（目标归零 / 6电机0V / 刹车 / 停记录 / 退订 / 断连接）
+    # with 退出时 __exit__ 自动收车收尾（刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as link:
         directory = link.mon_dir
         try:

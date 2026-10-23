@@ -14,7 +14,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 from app.script_api import BackendLink  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 
 def main() -> None:
@@ -30,7 +32,7 @@ def main() -> None:
     cur_names = ["%s%d电流" % (s, n) for s in "左右" for n in range(3)]
     pos_names = ["全局X", "全局Y", "航向"]
 
-    # with 退出时 __exit__ 自动收车收尾（6电机0V / 刹车 / 停记录 / 退订 / 断连接）
+    # with 退出时 __exit__ 自动收车收尾（刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("motor_check_%s" % args.tag)   # 每台一段原始 CSV
         os.makedirs(out_dir, exist_ok=True)
@@ -53,9 +55,11 @@ def main() -> None:
             bl.print_log(seg + ".csv")
             bl.print_log(seg + ".png")
 
-            st_r = bl.stats([rpm_names[mid]])[rpm_names[mid]]
-            st_i = bl.stats([cur_names[mid]])[cur_names[mid]]
-            pos = bl.stats(pos_names)
+            st = seg_stats(seg + ".csv",
+                           [rpm_names[mid], cur_names[mid], *pos_names])
+            st_r = st[rpm_names[mid]]
+            st_i = st[cur_names[mid]]
+            pos = st
 
             bl.set_volt(mid, 0.0)
             bl.stop_move()

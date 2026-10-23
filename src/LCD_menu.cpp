@@ -59,6 +59,35 @@ const struct MENU_ITEM menu_item[] =
         {"L_recA", type_float, &left_motors.recover_accel, "左反常加速度", "pct/s"},
         {"R_recA", type_float, &right_motors.recover_accel, "右反常加速度", "pct/s"},
 
+        // ========== 升降杆（lift_bar，初版开环：电压直控 + 速度环）==========
+        {"lift_kp", type_float, &lift_bar.pid.kp, "升速kp", ""},
+        {"lift_ki", type_float, &lift_bar.pid.ki, "升速ki", ""},
+        {"lift_dz", type_float, &lift_bar.deadzone, "升死区补偿", "V"},
+        {"lift_speps", type_float, &lift_bar.stall_pos_eps, "升不动判据", "rev"},
+        {"lift_stme", type_uint32_t, &lift_bar.stall_time, "升卡死时长", "us"},
+        {"lift_grace", type_uint32_t, &lift_bar.stall_grace, "升起步宽容期", "us"},
+        {"lift_sout", type_float, &lift_bar.stall_output, "升顶格判据", ""},
+        {"lift_scur", type_float, &lift_bar.stall_current, "升电流判据", "A"},
+        {"lift_sspd", type_float, &lift_bar.stall_speed_min, "升要动判据", "pct"},
+        {"lift_pf", type_float, &lift_bar.pos_factor, "升杆端系数", "mm/rev"},
+        {"lift_tlim", type_float, &lift_bar.tilt_limit, "升倾斜上限", "rev"},
+        {"lift_lim0", type_float, &lift_bar.limit_min, "升行程下端", "rev"},
+        {"lift_lim1", type_float, &lift_bar.limit_max, "升行程上端", "rev"},
+
+        // 升降杆逐台属性：vf=出力均摊标定，vmax=结构限幅（别搞坏的安全闸），vmin=死区
+        {"lift_vf0", type_float, &lift_motor_list[0].volt_factor, "升0电压系数", ""},
+        {"lift_vf1", type_float, &lift_motor_list[1].volt_factor, "升1电压系数", ""},
+        {"lift_vf2", type_float, &lift_motor_list[2].volt_factor, "升2电压系数", ""},
+        {"lift_vf3", type_float, &lift_motor_list[3].volt_factor, "升3电压系数", ""},
+        {"lift_vmax0", type_float, &lift_motor_list[0].volt_max, "升0最大电压", "V"},
+        {"lift_vmax1", type_float, &lift_motor_list[1].volt_max, "升1最大电压", "V"},
+        {"lift_vmax2", type_float, &lift_motor_list[2].volt_max, "升2最大电压", "V"},
+        {"lift_vmax3", type_float, &lift_motor_list[3].volt_max, "升3最大电压", "V"},
+        {"lift_vmin0", type_float, &lift_motor_list[0].volt_min, "升0最小电压", "V"},
+        {"lift_vmin1", type_float, &lift_motor_list[1].volt_min, "升1最小电压", "V"},
+        {"lift_vmin2", type_float, &lift_motor_list[2].volt_min, "升2最小电压", "V"},
+        {"lift_vmin3", type_float, &lift_motor_list[3].volt_min, "升3最小电压", "V"}
+
         // 手柄松杆减速缓冲
         {"man_decay", type_uint32_t, &robot_action.manual_stop_delay, "松杆停车延迟", "us"},
         // 45° 倾角时的转弯半径(m)：方向定半径，与杆量无关
@@ -180,6 +209,44 @@ static struct MENU_ITEM monitor_menu_item[] =
          { return static_cast<float>(right_motors.motors[2].motor->current(vex::currentUnits::amp)); }, "右2电流", "A", monitor_tag_slow},
         {"R2_pct", []
          { return static_cast<float>(right_motors.motors[2].motor->velocity(vex::velocityUnits::pct)); }, "右2转速", "pct", monitor_tag_slow},
+
+        // 升降杆（lift_bar）：state 0=Stopped 1=Volt 2=Speed 3=Stall(锁死)
+        {"lift_state", type_uint8_t, &lift_bar.state, "升状态", "", monitor_tag_fast},
+        {"lift_tspd", type_float, &lift_bar.speed_target, "升目标速度", "pct", monitor_tag_fast},
+        {"lift_spd", type_float, &lift_bar.speed, "升速度", "pct", monitor_tag_fast},
+        {"lift_pos", type_float, &lift_bar.position, "升位置", "rev", monitor_tag_fast},
+        {"lift_out", type_float, &lift_bar.output, "升输出", "", monitor_tag_fast},
+        {"lift_I", type_float, &lift_bar.avg_current, "升平均电流", "A", monitor_tag_fast},
+        {"lift_IL", type_float, &lift_bar.cur_left, "升左电流", "A", monitor_tag_fast},
+        {"lift_IR", type_float, &lift_bar.cur_right, "升右电流", "A", monitor_tag_fast},
+        {"lift_Idf", type_float, &lift_bar.cur_diff, "升左右电流差", "A", monitor_tag_fast},
+        {"lift_L", type_float, &lift_bar.pos_left, "升左位置", "rev", monitor_tag_fast},
+        {"lift_R", type_float, &lift_bar.pos_right, "升右位置", "rev", monitor_tag_fast},
+        {"lift_tilt", type_float, &lift_bar.tilt, "升左右倾斜", "rev", monitor_tag_fast},
+        {"lift_sprd", type_float, &lift_bar.spread, "升组内偏差", "rev", monitor_tag_fast},
+        {"lift_jam", type_float, &lift_bar.jam_pos, "升卡死位置", "rev", monitor_tag_slow},
+
+        // 逐台：验转向同号、验齿轮都啮上（某台空转时它这几项会明显离群）
+        {"lift_m0_pos", []
+         { return static_cast<float>(lift_bar.motors[0].motor->position(vex::rotationUnits::rev)); }, "升0位置", "rev", monitor_tag_slow},
+        {"lift_m1_pos", []
+         { return static_cast<float>(lift_bar.motors[1].motor->position(vex::rotationUnits::rev)); }, "升1位置", "rev", monitor_tag_slow},
+        {"lift_m2_pos", []
+         { return static_cast<float>(lift_bar.motors[2].motor->position(vex::rotationUnits::rev)); }, "升2位置", "rev", monitor_tag_slow},
+        {"lift_m3_pos", []
+         { return static_cast<float>(lift_bar.motors[3].motor->position(vex::rotationUnits::rev)); }, "升3位置", "rev", monitor_tag_slow},
+        {"lift_m0_I", []
+         { return static_cast<float>(lift_bar.motors[0].motor->current(vex::currentUnits::amp)); }, "升0电流", "A", monitor_tag_slow},
+        {"lift_m1_I", []
+         { return static_cast<float>(lift_bar.motors[1].motor->current(vex::currentUnits::amp)); }, "升1电流", "A", monitor_tag_slow},
+        {"lift_m2_I", []
+         { return static_cast<float>(lift_bar.motors[2].motor->current(vex::currentUnits::amp)); }, "升2电流", "A", monitor_tag_slow},
+        {"lift_m3_I", []
+         { return static_cast<float>(lift_bar.motors[3].motor->current(vex::currentUnits::amp)); }, "升3电流", "A", monitor_tag_slow},
+        {"lift_m0_Vcmd", type_float, &lift_bar.motors[0].volt_output, "升0指令电压", "V", monitor_tag_slow},
+        {"lift_m1_Vcmd", type_float, &lift_bar.motors[1].volt_output, "升1指令电压", "V", monitor_tag_slow},
+        {"lift_m2_Vcmd", type_float, &lift_bar.motors[2].volt_output, "升2指令电压", "V", monitor_tag_slow},
+        {"lift_m3_Vcmd", type_float, &lift_bar.motors[3].volt_output, "升3指令电压", "V", monitor_tag_slow}
 
         // 手柄摇杆原始值
         {"axis_Lx", type_int32_t, &left_axis.now_x, "左杆X", nullptr, monitor_tag_slow},

@@ -308,17 +308,23 @@ void USB_Comm::handle_command()
         // 上位机要可调参数目录。不在接收任务里直接发（一次性发几百项会阻塞read），
         // 只置"还剩几批"的倒计时，真正的发送由后续tx_tick每拍一批完成。
         dir_tun = (tunable_count + DIR_BATCH - 1) / DIR_BATCH;
+        if (dir_tun == 0)
+            enqueue_response(Request_Tunable, RESP_OK, nullptr, 0, nullptr, 0); // 空表：无burst可发，立即确认
         break;
     case Request_Monitor:
         // 上位机要监控目录：同样置倒计时分批发送，随后打开推送开关。
         // 推送是按tx_tick节拍走的，下一拍自然就开始发，不用特殊触发。
         dir_mon = (monitor_count + DIR_BATCH - 1) / DIR_BATCH;
         monitor_active = true;
+        if (dir_mon == 0)
+            enqueue_response(Request_Monitor, RESP_OK, nullptr, 0, nullptr, 0); // 空表：立即确认
         break;
     case Request_Command:
         // 上位机要动作命令目录：按外部表条数分批，每拍CMD_DIR_BATCH条
         if (cmd_count > 0)
             dir_cmd = (cmd_count + CMD_DIR_BATCH - 1) / CMD_DIR_BATCH;
+        else
+            enqueue_response(Request_Command, RESP_OK, nullptr, 0, nullptr, 0); // 空表：立即确认，否则上位机永远等不到
         break;
     case Subscribe:
     {
@@ -336,9 +342,17 @@ void USB_Comm::handle_command()
                 if (t != type_str && t != type_other)
                     monitor_items[i].tag = merge_subscribe_tag(monitor_items[i].tag, tag);
             }
+            enqueue_response(Subscribe, RESP_OK, rx_payload, rx_len, nullptr, 0);
         }
         else if (index < monitor_count)
+        {
             monitor_items[index].tag = merge_subscribe_tag(monitor_items[index].tag, tag);
+            enqueue_response(Subscribe, RESP_OK, rx_payload, rx_len, nullptr, 0);
+        }
+        else
+            // 下标超表：原来是静默丢弃，上位机以为订上了却永远收不到值。
+            // 明确拒绝+内定err，重发无意义（该做的是刷目录）
+            enqueue_response(Subscribe, RESP_REJECT_INDEX_RANGE, rx_payload, rx_len, nullptr, 0);
         break;
     }
     case Set_Tunable:
@@ -347,11 +361,19 @@ void USB_Comm::handle_command()
         // 所以rx线程直接写即可，无需转交主线程。安全只靠下面三道校验保证。
         uint8_t index = rx_payload[0];
         if (index >= tunable_count)
-            break; // 下标超表，静默丢弃（上位机拿不到回显会自己超时判失败）
+        {
+            // 原来静默丢弃、只靠注释承诺"上位机自己超时判失败"（后端并无该逻辑）。
+            // 失败路径无Tunable_Echo兜底，补一帧拒绝响应把失败摆到明面上
+            enqueue_response(Set_Tunable, RESP_REJECT_INDEX_RANGE, rx_payload, rx_len, nullptr, 0);
+            break;
+        }
         const MENU_ITEM &item = tunable_items[index];
         // 类型以下位机自己的表为准：str/other不可写，也防止上位机发错宽度写穿相邻内存
         if (item.data_type == type_str || item.data_type == type_other)
+        {
+            enqueue_response(Set_Tunable, RESP_REJECT_TYPE_UNWRITABLE, rx_payload, rx_len, nullptr, 0);
             break;
+        }
         write_value(&rx_payload[1], item);
         // 不直接回帧（rx不能write），登记回显槽，tx下一拍从内存重读真实值回发
         echo_index = index;
@@ -373,9 +395,19 @@ void USB_Comm::handle_command()
 
     // 动作命令分发：内建switch处理完后，凡是命令表里有的命令字都在这里直接执行。
     // payload长度已由cmd_payload_len按表收齐，handler按自己的字段表解读即可。
+    // handler返回值决定Response状态：OK→正常确认；BUSY→明确拒绝·忙；
+    // REJECT→明确拒绝·通用（如参数越界）。原来是静默return，上位机零反馈。
     const CMD_ITEM *action = find_cmd(rx_cmd);
     if (action != nullptr)
-        action->func(rx_payload);
+    {
+        uint8_t ret = action->func(rx_payload);
+        uint8_t status = RESP_OK;
+        if (ret == CMD_RET_BUSY)
+            status = RESP_REJECT_BUSY;
+        else if (ret == CMD_RET_REJECT)
+            status = RESP_REJECT_GENERIC;
+        enqueue_response(rx_cmd, status, rx_payload, rx_len, nullptr, 0);
+    }
 }
 
 // 分区推送，每次tx_tick调用一次：
@@ -437,9 +469,9 @@ void USB_Comm::monitor_tick()
         flush_pack(); // 发最后不满一帧的尾巴
 }
 
-// 10ms发送节拍：先回心跳Pong和调参回显，再发目录倒计时的当前批，然后推送监控值，
-// tick走到255时做一次心跳巡视，最后推进tick。
-// 这是全程序唯一write串口的地方（接收任务只置标志），所以各帧天然不会互相穿插。
+// 10ms发送节拍：先回心跳Pong和调参回显，再发目录倒计数的当前批，然后推送监控值，
+// tick走到255时做一次心跳巡视，推进tick，最后把Response队列发完。
+// 这是全程序唯一write串口的地方（接收任务只置标志/入队），所以各帧天然不会互相穿插。
 void USB_Comm::tx_tick()
 {
     tx_stamp = static_cast<uint16_t>(get_time_ms()); // 本拍时间戳，同拍发出的监控帧共用同一个
@@ -473,12 +505,16 @@ void USB_Comm::tx_tick()
         uint8_t total = (tunable_count + DIR_BATCH - 1) / DIR_BATCH;
         send_dir_batch(tunable_items, tunable_count, Post_Tunable_Directory, total - dir_tun);
         dir_tun--;
+        if (dir_tun == 0)
+            enqueue_response(Request_Tunable, RESP_OK, nullptr, 0, nullptr, 0); // 末批发完=目录传完
     }
     else if (dir_mon > 0)
     {
         uint8_t total = (monitor_count + DIR_BATCH - 1) / DIR_BATCH;
         send_dir_batch(monitor_items, monitor_count, Post_Monitor_Directory, total - dir_mon);
         dir_mon--;
+        if (dir_mon == 0)
+            enqueue_response(Request_Monitor, RESP_OK, nullptr, 0, nullptr, 0);
     }
     else if (dir_cmd > 0)
     {
@@ -486,6 +522,8 @@ void USB_Comm::tx_tick()
         uint8_t total = (cmd_count + CMD_DIR_BATCH - 1) / CMD_DIR_BATCH;
         send_cmd_dir_batch(total - dir_cmd);
         dir_cmd--;
+        if (dir_cmd == 0)
+            enqueue_response(Request_Command, RESP_OK, nullptr, 0, nullptr, 0);
     }
 
     monitor_tick();
@@ -502,6 +540,51 @@ void USB_Comm::tx_tick()
         ping_seen = false; // 清零，开始统计下一个周期
     }
     tick++; // uint8自然溢出回0，掩码轮转无缝衔接，无需回绕判断
+
+    // Response队列最后发：拍内任何时刻入队的当拍必然发出，不存在"刚入队就等下一拍"。
+    // 放末尾不影响Pong——它在拍首已优先发出（看门狗不能等）。
+    send_responses();
+}
+
+// 入队一帧通用响应（rx线程调用，只碰队列不写串口）。
+// 满则丢最新：丢的只是一个ACK，上位机超时重发即自愈，不值得为它阻塞或覆盖旧账。
+void USB_Comm::enqueue_response(uint8_t cmd, uint8_t status, const uint8_t *echo,
+                                uint16_t echo_len, const char *str, uint8_t str_len)
+{
+    if (((resp_tail + 1) & (RESP_QUEUE_DEPTH - 1)) == resp_head)
+        return; // 满（depth是2的幂，用掩码代替取模）
+    RespSlot &s = resp_q[resp_tail];
+    s.cmd = cmd;
+    s.status = status;
+    uint16_t n = echo_len > RESP_ECHO_MAX ? RESP_ECHO_MAX : echo_len;
+    s.echo_len = static_cast<uint8_t>(n);
+    for (uint16_t i = 0; i < n; i++)
+        s.echo[i] = echo[i];
+    uint8_t m = str_len > RESP_STR_MAX ? RESP_STR_MAX : str_len;
+    s.str_len = m;
+    for (uint8_t i = 0; i < m; i++)
+        s.str[i] = str[i];
+    resp_tail = (resp_tail + 1) & (RESP_QUEUE_DEPTH - 1);
+}
+
+// 把队列里的Response帧全部发出（tx_tick末尾调）。
+// 帧格式: A5 | 05 | payloadlen | 原话cmd | 原话payload | status | 原因串 | XOR
+void USB_Comm::send_responses()
+{
+    while (resp_head != resp_tail)
+    {
+        const RespSlot &s = resp_q[resp_head];
+        uint16_t content = static_cast<uint16_t>(2 + s.echo_len + s.str_len); // 原话cmd+原话payload+status+原因串
+        tx_frame[2] = static_cast<uint8_t>(content); // payloadlen：本字节之后到校验前的总字节数
+        tx_frame[3] = s.cmd;
+        if (s.echo_len > 0)
+            memcpy(&tx_frame[4], s.echo, s.echo_len);
+        tx_frame[4 + s.echo_len] = s.status;
+        if (s.str_len > 0)
+            memcpy(&tx_frame[5 + s.echo_len], s.str, s.str_len);
+        send_frame(Response, static_cast<uint16_t>(1 + content)); // payload=payloadlen字节本身+content
+        resp_head = (resp_head + 1) & (RESP_QUEUE_DEPTH - 1);
+    }
 }
 
 // 接收入口：独立任务，阻塞在/dev/serial1的read()上等字节，读到一个喂一次状态机。
@@ -537,6 +620,9 @@ void USB_Comm::rx_task()
                 // 未知命令：我们连校验位在哪都不知道，没法继续收，
                 // 只能回到等帧头状态。极端情况下Payload里恰好有0xA5也没关系，
                 // 下一帧真正的帧头出现时状态机会再次同步上。
+                // 原来是静默丢弃；现在回一帧"需补发·命令字未注册"——
+                // 固件换了命令表/版本不匹配时，上位机看得见（重发一次仍败即升级报错）
+                enqueue_response(ch, RESP_RETRY_UNKNOWN_CMD, nullptr, 0, nullptr, 0);
                 rx_state = WAIT_HEAD;
                 break;
             }
@@ -566,6 +652,11 @@ void USB_Comm::rx_task()
             // 校验原理：rx_xor是Cmd和全部Payload的异或，再异或收到的校验字节，
             if ((rx_xor ^ ch) == 0 && rx_len <= MAX_PAYLOAD)
                 handle_command();
+            else
+                // 校验失败：原来是静默丢弃，上位机只能靠自己超时。现在回一帧
+                // "需补发·校验失败"并回显收到的（可疑）字节——回显cmd此时本身
+                // 可能已损坏，仅作线索；链路噪声大时这帧能让上位机看见"在丢帧"
+                enqueue_response(rx_cmd, RESP_RETRY_XOR, rx_payload, rx_len, nullptr, 0);
             break;
         }
     }

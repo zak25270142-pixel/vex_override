@@ -25,14 +25,18 @@
     v.print_log("pytest/run.json")   # 后缀决定格式：json / csv / png / jpg（无后缀默认 json）
     v.stop()
 
-取整段统计/波形（一段 = 一次 start_log → end_log，时间是"相对本段零点的秒"）：
-    v.stats(["x"])                      # 后端算好 n/mean/abs_mean/... 直接给（整段）
-    v.print_log("run.csv")              # 整段原始点落盘（后缀决定 csv/png/json）
+取整段标量（一段 = 一次 start_log → end_log，window 时间是"相对本段零点的 ms"）：
+    v.calc("x", agg="mean")              # 后端只保留 mean/sum 两个聚合，聚合成标量
+    v.print_log("run.csv")               # 整段原始点落盘（后缀决定 csv/png/json）
+
+【分析的正路】print_log 落 csv → pandas 回读。派生量、滤波、分位、布尔过滤、
+"超差时间占比"这类指标都在脚本侧算，不要指望后端加功能——后端只保证数据忠实。
 """
 
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +51,7 @@ def _as_list(v) -> list:
 
     空列表要显式转成 None 的原因：requests 对 [] 的处理是不带这个参数，
     后端就收不到 index_or_name，语义变成"查全部"而不是"什么都不查"——
-    这两者在 stats() 里差别很大。
+    这两者在 print_log() 里差别很大。
     """
     if v is None:
         return []
@@ -57,16 +61,24 @@ def _as_list(v) -> list:
 
 
 class VexScript:
-    def __init__(self, base: str = "http://127.0.0.1:8000", timeout: float = 5.0) -> None:
+    def __init__(self, base: str = "http://127.0.0.1:8000", timeout: float = 5.0,
+                 token: str | None = None) -> None:
         """base 指向 Backend（默认本机 8000）；脚本和 Backend 通常同机，延迟 <1ms。
+
+        token 是脚本会话标识，给了就随每个请求带上（X-Script-Token 头）——后端靠它
+        判断"这次写的人是不是当前持有写权的那个"。
 
         requests 是可选依赖：没装也能 import 本模块，只是所有调用会抛错。
         这样 IDE 补全和静态检查不会因为缺个库就全线飘红。
         """
         self.base = base.rstrip("/")
         self.timeout = timeout
+        self.token = token
         # 复用连接：100Hz 轮询要是每拍新建 TCP，端口很快会被 TIME_WAIT 吃光
         self._sess = requests.Session() if requests is not None else None
+        if self._sess is not None and token:
+            # 挂在 session 默认头上：后续每个请求自动带，不用每处手动传
+            self._sess.headers["X-Script-Token"] = token
 
     # ---------- 内部 ----------
 
@@ -260,6 +272,19 @@ class VexScript:
     def end_log(self) -> dict:
         return self._post("/api/log/end")
 
+    def claim_script(self, steal: bool = False, ttl_s: float = 60.0) -> dict:
+        """领脚本写权（BackendLink.connect 里自动调，一般不用自己管）。
+
+        steal=True 抢占别人：后端会给被抢的那个置 abort，让它在下一次 cmd()/sleep()
+        处停下，而不是继续往串口塞命令。
+        """
+        return self._post("/api/script/claim",
+                          {"token": self.token or "", "steal": steal, "ttl_s": ttl_s})
+
+    def release_script(self) -> dict:
+        """还写权，让下一个脚本能立刻接管（BackendLink.close 里自动调）。"""
+        return self._post("/api/script/release", {"token": self.token or ""})
+
     def print_log(self, path: str | None = None, names=None) -> dict:
         """导出记录并在本机打印摘要 JSON。格式由 path 后缀决定：
         .json（无后缀默认）/ .csv（宽表）/ .png|.jpg（位图）/ .pdf|.svg（矢量）。
@@ -282,22 +307,15 @@ class VexScript:
         print(json.dumps(info, ensure_ascii=False, indent=2))
         return info
 
-    def stats(self, names=None, thresholds=()) -> dict:
-        """整段统计（后端算好，脚本不用自己攒样本）：names 不给就统计全部已记录的项。
-        thresholds 里每个阈值 th 额外给出 ratio_ge[th]=|值|>=th 的样本占比。
-        要原始点就 print_log 导 csv，再交给分析脚本读。"""
-        return self._get(
-            "/api/log/stats",
-            index_or_name=_as_list(names),
-            thresholds=list(thresholds),
-        )
-
     def calc(self, expr: str, agg: str = "", window=None) -> dict:
-        """对本段记录做表达式计算：监控项名 + 算术运算，再按需聚合。
+        """对本段记录做表达式计算并聚合成标量（agg 只支持 mean/sum）。
 
         expr：如 "左0电流 - 左1电流"、"(左0电流 + 左1电流 + 左2电流) / 3"
-        agg ：mean / sum / rms / std / max / min / abs_mean / count / median；
-              空串返回逐点序列 [[t_ms, value], ...]
+        agg ：mean / sum（必填）
+        window：可选 [t0_ms, t1_ms]，只算这段时间内的点
+
+        复杂分析（滤波/分位/布尔过滤/派生指标/画图）不要在这里加功能——
+        用 print_log 导 csv 后 pandas 回读，那才是数据出口。
         """
         return self._post("/api/log/calc",
                           {"expr": expr, "agg": agg, "window": window})
@@ -318,14 +336,27 @@ class VexScript:
             time.sleep(min(0.05, end - time.monotonic()))
 
     def close(self) -> None:
-        """关闭复用的 HTTP 会话（脚本结束时调，释放连接）。"""
+        """关闭复用的 HTTP 会话（脚本结束时调，释放连接）。
+
+        顺手还写权：也靠 close 兜底，忘了 Release 的脚本不会把机器锁死。
+        """
+        # 还租约失败不能挡住关连接（后端可能已经重启了）
+        if self.token:
+            try:
+                self.release_script()
+            except Exception:
+                pass
         if self._sess is not None:
             self._sess.close()
 
 
-# 监控 tag 的 fast 位（bit6 = 0x40）：目录里可能有同名项（比如低速/高速两个版本），
+# 监控 tag 的 fast 位（bit6 = 0x40）
 # fetch_dirs 用它挑高速那个槽，避免订到 80ms 才更新一次的陈旧值。
 _TAG_FAST = 0x40
+
+# 写权续期间隔：必须远小于后端 SCRIPT_LEASE_TTL_S（60s）。
+# 采数脚本有大段时间只等着不动手（等稳态、等冷却），不续租就会被判成"崩了"。
+_LEASE_REFRESH_S = 15.0
 
 
 class BackendLink:
@@ -342,10 +373,13 @@ class BackendLink:
             bl.set_volt(0, v)
             bl.sleep(0.4)
             bl.end_log()
-            st = bl.stats(["左0转速"])["左0转速"]              # 本段整段统计
-            bl.print_log("seg.csv")                            # 本段原始点落盘
+            rpm = bl.calc("左0转速", agg="mean")["value"]  # 本段均值（标量捷径）
+            bl.print_log("seg.csv")              # 本段原始点落盘（结论的底稿）
         bl.print_log("pytest/motor_v.csv")       # 后缀决定格式：csv/json/png/jpg
-        bl.close()
+        bl.close()                               # 收车 + 退订 + 关连接（也可整个包进 with）
+
+    复杂分析（派生量/滤波/分位/布尔过滤/画图）不在 calc 里加功能：
+    print_log 落 csv 后 pandas 回读，那是唯一的数据出口。
 
     看门狗/围栏仍由脚本自己维护：latest() 现查现取（短 TTL 批量，一轮问多项只发一次请求）。
     """
@@ -355,8 +389,14 @@ class BackendLink:
         base: str = "http://127.0.0.1:8000",
         connect: bool = True,
         timeout: float = 5.0,
+        steal: bool = False,
     ) -> None:
-        self.v = VexScript(base, timeout=timeout)
+        # 会话标识：后端靠它认"这次写的人是不是持有写权的那个"，一次只允许一个。
+        # 自动生成是为了让脚本作者什么都不用写——想要这个保护就得让"什么都不做"就是对的。
+        self._token = uuid.uuid4().hex[:8]
+        self._steal = steal
+        self._lease_at = 0.0              # 上次续租时刻（sleep 里按 _LEASE_REFRESH_S 续）
+        self.v = VexScript(base, timeout=timeout, token=self._token)
         self.mon_dir: dict[str, int] = {}      # 中文名 -> index（重名保留 fast 槽）
         self.tun_dir: dict[str, tuple] = {}    # 中文名 -> (index, 当前值)
         self._mon_fast: dict[str, bool] = {}
@@ -377,27 +417,42 @@ class BackendLink:
         """用 with 写法就不用每个脚本再抄一遍 try/finally 收车：
             with BackendLink() as bl:
                 bl.sub(...); bl.start_log(); ...
-        退出时 __exit__ 自动收车收尾（目标归零/6电机0V/刹车/停记录/退订/断连接）。"""
+        退出时 __exit__ 自动收车收尾（刹车/停记录/退订/断连接）。"""
         return self
 
     def __exit__(self, *exc_info) -> None:
-        """with 退出时调 close_safely()（自动收车收尾），异常也照收。"""
-        self.close_safely()
+        """with 退出时调 close()（自动收车收尾），异常也照收。"""
+        self.close()
 
     # ---------- 连接 / 目录 ----------
 
     def connect(self, wait_connected: float = 10.0, wait_dirs: float = 5.0) -> None:
         """等后端连上下位机 + 目录到位 + 清 abort，一步到位。
 
-        清 abort 放在这里：上一次脚本可能是在停车状态下异常退出的，
-        不清的话新脚本第一次 cmd() 就抛错。
+        顺序有讲究：
+          1. 先抢写权——第二个脚本要在这里就被告知"有人在跑"，而不是跑到一半
+             才发现命令发不出去（也顺手挡住了"互相解停车"这个坑）
+          2. 再清 abort——上一次脚本可能是在停车状态下异常退出的，不清的话
+             第一次 cmd() 就抛错。放在 claim 之后：steal 抢占时给我们自己解锁
         """
+        self._claim()
         if not self.v.wait_connected(wait_connected):
             raise RuntimeError(f"后端没连上下位机：{self.v.status()}")
         if not self.v.wait_dirs(wait_dirs):
             print("[warn] 目录还没到位，fetch_dirs 可能拿不全项")
         self.v.clear_abort()
         self.fetch_dirs()
+
+    def _claim(self) -> None:
+        """领写权；抢不到就把后端的话原样抛出来让人看明白。
+
+        默认不抢：第二个脚本直接在这里失败，"有人在跑"多半是真的忘了关，
+        而不是想接管。要接管是显式的 BackendLink(steal=True)。
+        """
+        r = self.v.claim_script(steal=self._steal)
+        self._lease_at = time.monotonic()
+        if r.get("evicted"):
+            print("[warn] 抢占了另一个脚本的写权（对方已置 abort，会在下一次写操作处停下）")
 
     def fetch_dirs(self) -> None:
         """拉三张目录建名字反查表；同名条目保留 fast 槽，避免订到低速陈旧值。
@@ -478,16 +533,11 @@ class BackendLink:
         """
         return self.v.print_log(path)
 
-    def stats(self, names=None, thresholds=()) -> dict:
-        """整段统计，返回 {传入的名字或 index: {n, mean, abs_mean, min, max, abs_max, std, ratio_ge}}。
-        thresholds 见 VexScript.stats。"""
-        items = self.v.stats(names, thresholds)["items"]
-        if names is None:
-            return {it["name"]: it for it in items}
-        return dict(zip(_as_list(names), items))
-
     def calc(self, expr: str, agg: str = "", window=None) -> dict:
-        """对本段记录做表达式计算并聚合（转发 VexScript.calc）。"""
+        """对本段记录做表达式计算并聚合成标量（转发 VexScript.calc）。
+
+        agg 只支持 mean/sum；复杂分析走 print_log 导 csv + pandas 回读。
+        """
         return self.v.calc(expr, agg, window)
 
     # ---------- 产物落盘 ----------
@@ -605,6 +655,11 @@ class BackendLink:
         for mid in range(6):
             self.set_volt(mid, volts)
 
+    # 收车只有一个入口：close()（0x80 → end_log → clear_subs → 断连接）。
+    # 开环直控的"先撤压再刹"不在这里开 API（只有着地扫压的前馈标定需要，
+    # 那一套放在 04-前馈表/cal_kf_table.py 里自己实现）——通用层多一个
+    # 收车方法，AI 写的脚本就更可能挑错那个。
+
     def spin_target(self, left: float, right: float) -> dict:
         """下发"设置底盘目标速度"：left/right 为左、右两侧的目标速度（走速度环）。
 
@@ -632,6 +687,11 @@ class BackendLink:
             left = end - time.monotonic()
             if left <= 0:
                 return
+            # 长等待里没人给车发命令，租约会到期被当成"崩了"。这里按节奏续租。
+            # 抢不到时会直接抛——说明真有人接管了，正好趁早死而不是半路发命令失败。
+            if time.monotonic() - self._lease_at > _LEASE_REFRESH_S:
+                self.v.claim_script()
+                self._lease_at = time.monotonic()
             time.sleep(min(0.05, left))
 
     def check_abort(self) -> None:
@@ -650,38 +710,28 @@ class BackendLink:
         if self._abort_val:
             raise RuntimeError("已紧急停车 / 脚本被中止（后端 abort 置位）")
 
-    def close_safely(self) -> None:
-        """收车收尾：目标归零 → 6 电机 0V → 0x80 刹车 → 结束记录 → 退订 → 关连接。
+    def close(self) -> None:
+        """收车收尾一条龙：0x80 刹车 → 冻结记录 → 退订 → 关 HTTP 连接。
 
-        顺序有讲究：
-          1. 先把目标转速归零（让速度环平滑收，不要急刹）
-          2. 再直接把 6 个电机电压写 0（绕开速度环，确保真的不动）
-          3. 最后发 0x80 刹车（动作层状态机归位）
-        每步单独 try：上位机刚按了停车（后端 abort）时也保证把连接和订阅清干净。
+        with 退出自动走这里，不用 with 就自己调 bl.close()，没有别的收尾入口。
+
+        收车只要 0x80 一步：固件 stop_move(50000) 每拍 output(0,0)、到时 chassis.stop()
+        硬刹，动作层任务指针一并清空（顺带脱离 boot 后常驻的 manual 态）。
+        前面再补"目标归零 / 6 电机 0V"是空转——is_busy 时（manual 态、动作任务在跑）
+        固件直接 CMD_RET_BUSY 拒掉 0x84/0x85；空闲态则与 0x80 第一拍走同一路径，
+        且中间没有等待，撤压来不及产生减速。
+
+        例外：开环直控（0x84）下 0x80 撤不掉电压——速度环休眠，每拍的 output(0,0)
+        走到 drive(0) 就停住（Stopped 态既不改状态也不写电机），电机会保持脚本最后
+        给的电压一路转到时限才被硬刹。需要惰行收车的脚本自己先撤 0V 再发 0x80
+        （见 04-前馈表/cal_kf_table.py 的 volt_stop），本方法不代劳。
+
+        前三步每步单独 try：abort 置位时它们都会被 /api/cmd 挡回 409，
+        别让它们打断后面的退订和关连接。
         """
-        try:
-            self.spin_target(0.0, 0.0)
-        except Exception:
-            pass
-        for mid in range(6):
+        for step in (self.stop_move, self.end_log, self.clear_subs):
             try:
-                self.set_volt(mid, 0.0)
+                step()
             except Exception:
                 pass
-        try:
-            self.stop_move()
-        except Exception:
-            pass
-        try:
-            self.end_log()
-        except Exception:
-            pass
-        try:
-            self.clear_subs()
-        except Exception:
-            pass
-        self.close()
-
-    def close(self) -> None:
-        """关闭底层 HTTP 会话；只断连接、不做收车（收车请用 close_safely）。"""
         self.v.close()

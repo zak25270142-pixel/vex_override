@@ -3,6 +3,7 @@
 
 #include "chassis.h"
 #include "pid.h"
+#include "robot_upper.h" // LiftBar：上位机构（与底盘同级，构造时注入）
 
 class Remote_Control; // 前置声明：手动控制只借用摇杆指针，不依赖 Control_func.h
 
@@ -53,6 +54,11 @@ public:
     // 底盘实例由 .cpp 用本车硬件构造后传入。
     Chassis &chassis;
 
+    // 升降杆实例由 .cpp 用本车硬件构造后传入（与底盘平级的上位机构）。
+    // 控制核心在 LiftBar 自身（升降杆电机组：电压直控 / 速度环），
+    // 本层只负责驱动节拍与命令入口。
+    LiftBar &lift;
+
     // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
     // distance：直行/goto 的纵向推进；heading：直行段差速纠偏；turn：原地/goto 转向。
     PositionPID distance_pid;
@@ -62,14 +68,14 @@ public:
     StableJudge stable_judge;
 
     // ---- 动作判定容差 ----
-    float distance_tolerance = 0.05f;      // m
-    float linear_speed_tolerance = 0.08f;  // m/s
-    float heading_tolerance = 1.0f;        // deg，直线段航向保持
-    float angle_tolerance = 0.8f;          // deg，原地旋转/goto 最终朝向
-    float angular_speed_tolerance = 5.0f;  // deg/s
+    float distance_tolerance = 0.05f;     // m
+    float linear_speed_tolerance = 0.08f; // m/s
+    float heading_tolerance = 1.0f;       // deg，直线段航向保持
+    float angle_tolerance = 0.8f;         // deg，原地旋转/goto 最终朝向
+    float angular_speed_tolerance = 5.0f; // deg/s
 
     // 底盘与手柄摇杆数值均在构造时注入：底盘来自本车硬件，摇杆来自装配层。
-    RobotAction(Chassis &chassis, int32_t *move, int32_t *turn);
+    RobotAction(Chassis &chassis, LiftBar &lift, int32_t *move, int32_t *turn);
 
     // ---- 整机生命周期：main 在主循环前调用 ----
     void init();
@@ -117,6 +123,16 @@ public:
     // 平滑移动到局部位姿：x 向前、y 向右，heading 单位 deg、向右为正；
     // 每轮重新瞄准目标点，距离 PID 与转向 PID 同时输出；点与最终朝向均已达标按完成处理。
     void goto_local(float x, float y, float heading);
+
+    // ---- 上位机构：升降杆（薄转发，状态机与控制核心在 LiftBar）----
+    // 电压直控：逐台电压（V），顺序同 lift_motor_list。Stall 锁死中忽略。
+    void lift_volt(float v0, float v1, float v2, float v3);
+
+    // 速度环目标：pct（上升为正）。Stall 锁死中忽略。
+    void lift_speed(float pct);
+
+    // 停止：0V+brake，兼作 Stall 解锁。由命令层 cmd_stop 调用（停止一切）；
+    // 故意不进 stop_move()——那个被掉线 failsafe 复用，见 robot_and_control.cpp。
 };
 
 #endif

@@ -2,11 +2,13 @@
 #include "Control_func.h" // 遥控输入源头文件；本文件只经构造函数注入的 int32_t* 使用其数据
 
 RobotAction::RobotAction(Chassis &chassis_ref,
+                         LiftBar &lift_ref,
                          int32_t *move,
                          int32_t *turn)
     : move_axis(move),
       turn_axis(turn),
       chassis(chassis_ref),
+      lift(lift_ref),
       // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
       // ki、kd 按秒计（kp 无量纲）：(kp, ki, kd[, output_limit])
       distance_pid(130.0f, 35.0f, 18.0f),
@@ -20,6 +22,7 @@ RobotAction::RobotAction(Chassis &chassis_ref,
 void RobotAction::init()
 {
     chassis.init();
+    lift.init();
 }
 
 bool RobotAction::is_ready()
@@ -211,6 +214,7 @@ void RobotAction::refresh()
     if (chassis_task_ptr != nullptr)
         (this->*chassis_task_ptr)(now);
     chassis.speed_tick(); // 任务计算完下达完后，更新速度环
+    lift.tick();          // 升降杆（与底盘同拍；停机态也更新位置/电流读数供监控）
 }
 
 void RobotAction::turn(float angle)
@@ -306,4 +310,20 @@ void RobotAction::manual()
 {
     chassis_task_ptr = &RobotAction::update_manual;
     stop_start_us = 0;
+}
+
+// ---- 上位机构：升降杆（薄转发，判据与状态机在 LiftBar）----
+void RobotAction::lift_volt(float v0, float v1, float v2, float v3)
+{
+    lift.set_volt(v0, v1, v2, v3);
+}
+
+void RobotAction::lift_speed(float pct)
+{
+    lift.set_speed(pct);
+}
+
+void RobotAction::lift_stop()
+{
+    lift.stop();
 }

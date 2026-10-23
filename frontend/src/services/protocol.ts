@@ -17,6 +17,8 @@ export const enum CmdPost {
   TunableEcho = 3,
   /** 动作命令目录：[命令字][tag][名长][名][参数量][字段描述...]，一条命令一帧 */
   CMDDirectory = 4,
+  /** 通用响应帧：[payloadlen][原话cmd][原话payload][status][原因串]，对下行命令的回执 */
+  Response = 5,
   /** 心跳回应：收到 Ping 后下一拍回，无 payload，整帧 A5 FF FF */
   Pong = 0xff,
 }
@@ -212,6 +214,20 @@ export class CmdDirectoryEvent {
   constructor(readonly item: CmdDirItem) {}
 }
 
+export class ResponseEvent {
+  readonly kind = 'response'
+  constructor(
+    /** 回显的原话命令字（据此找到是哪条下行帧的回执） */
+    readonly echoCmd: number,
+    /** 回显的原话 payload */
+    readonly echoPayload: Uint8Array,
+    /** status 字节（位域见 respIsRetry 等 helper） */
+    readonly status: number,
+    /** 原因串（串模式才有；内定err为空串，用 respReasonText 取名） */
+    readonly reason: string,
+  )
+}
+
 export class PongEvent {
   readonly kind = 'pong'
 }
@@ -221,7 +237,100 @@ export type RxEvent =
   | ValueEvent
   | EchoEvent
   | CmdDirectoryEvent
+  | ResponseEvent
   | PongEvent
+
+/* ===== Response 帧 status 字节（与 backend protocol.py 一一对应）=====
+   bit7 类别：0=需补发（重发可能成功） 1=明确拒绝（重发无意义）
+   bit6 模式：0=原因串（低6位=串长1~63B） 1=内定err（低6位=err号，不带串）
+   分区：0x00 OK / 0x01~0x3F 补发+串 / 0x40~0x7F 补发+内定err /
+        0x80 拒绝无串 / 0x81~0xBF 拒绝+串 / 0xC0~0xFF 拒绝+内定err */
+export const RESP_OK = 0x00
+export const RESP_CLASS_MASK = 0x80
+export const RESP_MODE_MASK = 0x40
+export const RESP_PAYLOAD_MASK = 0x3f
+
+/** 内定err号（status = 0x40|n 需补发 / 0xC0|n 明确拒绝），与 firmware/backend 同名同值 */
+export const RESP_RETRY_CHECK = 0x40 | 1 // 校验失败
+export const RESP_RETRY_UNKNOWN_CMD = 0x40 | 2 // 命令字未注册
+export const RESP_REJECT_INDEX_RANGE = 0xc0 | 1 // 下标超表
+export const RESP_REJECT_TYPE_UNWRITABLE = 0xc0 | 2 // 类型不可写
+export const RESP_REJECT_BUSY = 0xc0 | 3 // 忙时拒绝
+
+export function respIsOk(status: number): boolean {
+  return status === RESP_OK
+}
+export function respIsRetry(status: number): boolean {
+  return status !== RESP_OK && (status & RESP_CLASS_MASK) === 0
+}
+export function respIsReject(status: number): boolean {
+  return (status & RESP_CLASS_MASK) !== 0
+}
+export function respStrLen(status: number): number {
+  return status & RESP_MODE_MASK ? 0 : status & RESP_PAYLOAD_MASK
+}
+
+/** 内定err中文名（串模式不用查表，reason 就是原文） */
+const RESP_ERR_RETRY_NAMES = ['通用重试', '校验失败', '命令字未注册']
+const RESP_ERR_REJECT_NAMES = ['通用拒绝', '下标超表', '类型不可写', '忙']
+
+/** status+reason → 一句人话（诊断日志用） */
+export function respReasonText(status: number, reason: string): string {
+  if (respIsOk(status)) return 'OK'
+  if (status & RESP_MODE_MASK) {
+    const code = status & RESP_PAYLOAD_MASK
+    const names = respIsRetry(status) ? RESP_ERR_RETRY_NAMES : RESP_ERR_REJECT_NAMES
+    return names[code] ?? `未知内定err#${code}`
+  }
+  return reason || '(空)'
+}
+
+/** 内置下行命令的 payload 定长（Response 回显长度兜底用；动作命令查命令目录） */
+const BUILTIN_ECHO_LEN: Record<number, number> = {
+  [CmdGet.RequestTunable]: 0,
+  [CmdGet.RequestMonitor]: 0,
+  [CmdGet.RequestCommand]: 0,
+  [CmdGet.Subscribe]: 2,
+  [CmdGet.SetTunable]: 9,
+  [CmdGet.Ping]: 0,
+}
+
+/** 解 Response 帧 payload：[payloadlen][原话cmd][原话payload][status][原因串]。
+    echoLen=回显payload应有字节数（调用方从命令目录/内置定长得知；
+    同命令字长度恒定是不变量）。一致性校验不过返回 null（流错位/截断），
+    与后端 decode_response 同构——前端只是观察者，补发逻辑在后端。 */
+export function decodeResponse(
+  p: Uint8Array,
+  echoLen: number,
+): { echoCmd: number; echoPayload: Uint8Array; status: number; reason: string } | null {
+  if (p.length < 3) return null
+  if (p[0]! < 2 || p[0]! !== p.length - 1) return null
+  const echoCmd = p[1]!
+  const statusAt = 2 + echoLen
+  if (statusAt >= p.length) return null
+  const status = p[statusAt]!
+  const strLen = respStrLen(status)
+  if (statusAt + 1 + strLen !== p.length) return null
+  const decoder = new TextDecoder('utf-8')
+  return {
+    echoCmd,
+    echoPayload: p.subarray(2, statusAt),
+    status,
+    reason: decoder.decode(p.subarray(statusAt + 1)),
+  }
+}
+
+/** 组一帧 Response（演示源/测试用；真机由固件 send_responses 直接拼帧） */
+export function buildResponse(
+  echoCmd: number,
+  echoPayload: number[] = [],
+  status: number = RESP_OK,
+  reason = '',
+): Uint8Array {
+  const body: number[] = [echoCmd & 0xff, ...echoPayload, status & 0xff]
+  if (respStrLen(status)) body.push(...new TextEncoder().encode(reason).slice(0, respStrLen(status)))
+  return buildFrame(CmdPost.Response, [body.length & 0xff, ...body])
+}
 
 /** 按类型从小端字节流解码值（协议多字节数值一律小端）；调用方保证剩余字节足够 */
 function decodeValue(d: DataView, off: number, type: ValueType): CellValue {
@@ -413,7 +522,9 @@ export function requestCommand(): Uint8Array {
 }
 /**
  * 动作命令下发帧：Cmd 就是命令字本身（0x80~0x9F，不是 CmdGet 段），
- * payload 按 fields 顺序把各字段真实宽度的小端字节紧凑拼接（无 ACK）。
+ * payload 按 fields 顺序把各字段真实宽度的小端字节紧凑拼接（无填充）。
+ * 固件回 Response 帧确认（OK/忙拒绝），补发逻辑在后端待确认表；
+ * 相对量命令（原地转向/直行/局部移动）重复执行会累计，重发窗口见协议注释。
  */
 export function commandSend(item: CmdDirItem, values: CellValue[]): Uint8Array {
   const payload: number[] = []
@@ -478,6 +589,13 @@ export class FrameParser {
    */
   private monitorType = new Uint8Array(256).fill(0xFF)
 
+  /**
+   * 动作命令字 → 回显 payload 应有字节数（命令目录字段累加），收到命令目录后
+   * 由外部登记（setCmdEchoLen），解 Response 帧时定位 status 用。
+   * 初值 0xFF = 未登记（旧固件/目录未到）：按 0 猜解，一致性校验不过就丢帧。
+   */
+  private cmdEchoLen = new Uint8Array(256).fill(0xFF)
+
   /** 链路诊断计数（故障定位用，UI 直接读） */
   readonly stats = {
     bytes: 0, // 累计收到的原始字节数
@@ -503,6 +621,22 @@ export class FrameParser {
     this.monitorType.fill(0xFF)
   }
 
+  /** 登记动作命令的回显长度（命令目录到达时调；断开/重拉目录时配 resetCmdEchoLens） */
+  setCmdEchoLen(index: number, len: number): void {
+    this.cmdEchoLen[index] = len
+  }
+
+  resetCmdEchoLens(): void {
+    this.cmdEchoLen.fill(0xFF)
+  }
+
+  /** Response 回显 payload 应有长度：命令目录登记值 → 内置命令定长 → 0（猜解） */
+  private expectedEchoLen(cmd: number): number {
+    const registered = this.cmdEchoLen[cmd]!
+    if (registered !== 0xFF) return registered
+    return BUILTIN_ECHO_LEN[cmd] ?? 0
+  }
+
   /** 喂入任意长度的字节块（半包/粘包都在此消化），完整帧通过回调吐出 */
   feed(chunk: Uint8Array, onEvent: (e: RxEvent) => void): void {
     this.stats.bytes += chunk.length
@@ -513,7 +647,7 @@ export class FrameParser {
           break
 
         case RxState.WaitCmd:
-          // 业务帧：两类目录、监控值、调参回显（均变长）；Pong 无 payload
+          // 业务帧：两类目录、监控值、调参回显、响应帧（均变长）；Pong 无 payload
           if (b === CmdPost.Pong) {
             this.cmd = b
             this.len = 0
@@ -524,7 +658,8 @@ export class FrameParser {
             b === CmdPost.MonitorDirectory ||
             b === CmdPost.MonitorValue ||
             b === CmdPost.TunableEcho ||
-            b === CmdPost.CMDDirectory
+            b === CmdPost.CMDDirectory ||
+            b === CmdPost.Response
           ) {
             this.cmd = b
             this.expect = -1
@@ -573,6 +708,14 @@ export class FrameParser {
               // 命令目录：payload 头 2B 就是内容长度，收够 2B 即定长
               const total = cmdDirLen(this.payload, this.len)
               if (total >= 0) this.expect = total
+            } else if (this.cmd === CmdPost.Response) {
+              // 响应帧 [payloadlen][原话cmd][原话payload][status][原因串]：
+              // payloadlen 最小 2（原话cmd+status），0/1 只可能是流错位，重找 A5
+              if (this.payload[0]! < 2) {
+                this.state = RxState.WaitHead
+              } else {
+                this.expect = 1 + this.payload[0]!
+              }
             } else {
               // 目录帧：沿 名长→名→单位长 走查才能算出总长
               const total = dirLen(this.payload, this.len)
@@ -687,6 +830,19 @@ export class FrameParser {
           }
         }
         onEvent(new CmdDirectoryEvent({ index, tag, name, fields }))
+        break
+      }
+      case CmdPost.Response: {
+        // [payloadlen][原话cmd][原话payload][status][原因串]。
+        // status 位置依赖回显长度：已登记命令字/内置命令可推；推不出按 0 猜解，
+        // 一致性校验不过就静默丢（前端只是观察者，补发与重试在后端做）
+        if (this.len < 3) return
+        const echoCmd = p[1]!
+        const decoded = decodeResponse(p, this.expectedEchoLen(echoCmd))
+        if (decoded === null) return
+        onEvent(
+          new ResponseEvent(decoded.echoCmd, decoded.echoPayload, decoded.status, decoded.reason),
+        )
         break
       }
       case CmdPost.Pong:

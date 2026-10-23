@@ -30,8 +30,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 
 from app.script_api import BackendLink  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 # 监控项中文名 → 逻辑键（与 LCD_menu.cpp monitor_menu_item 一致）
 MONITOR_WANT = {
@@ -62,14 +64,16 @@ def resolve_indices(mon_dir: Dict[str, int]) -> Dict[str, int]:
     return out
 
 
-def capture(bl: BackendLink, out_dir: str, tag: str) -> None:
-    """把本段（start_log → end_log）的原始样本整段落盘。
+def capture(bl: BackendLink, out_dir: str, tag: str) -> str:
+    """把本段（start_log → end_log）的原始样本整段落盘，返回段路径（不含后缀）。
 
     后端缓冲在下一段 start_log 时清空，原始段必须在本段内立刻导出。
+    段统计（stats 端点已删）从返回路径 + ".csv" 回读。
     """
     seg = os.path.join(out_dir, tag)
     bl.print_log(seg + ".csv")
     bl.print_log(seg + ".png")
+    return seg
 
 
 def run_side(
@@ -104,9 +108,9 @@ def run_side(
         bl.sleep(hold)
         bl.end_log()
 
-        capture(bl, out_dir, "%s_t%+g" % (side, target))
+        seg = capture(bl, out_dir, "%s_t%+g" % (side, target))
 
-        st = bl.stats([rpm_name, tgt_name])
+        st = seg_stats(seg + ".csv", [rpm_name, tgt_name])
         if st[rpm_name]["n"] == 0:
             print("     （本段无有效转速样本）")
         else:
@@ -140,8 +144,8 @@ def run_both(
         bl.sleep(hold)
         bl.end_log()
 
-        capture(bl, out_dir, "both_t%+g" % target)
-        st = bl.stats([MONITOR_WANT["L0_rpm"], MONITOR_WANT["R0_rpm"]])
+        seg = capture(bl, out_dir, "both_t%+g" % target)
+        st = seg_stats(seg + ".csv", [MONITOR_WANT["L0_rpm"], MONITOR_WANT["R0_rpm"]])
         print("     L转速均值=%.2f  R转速均值=%.2f"
               % (st[MONITOR_WANT["L0_rpm"]]["mean"] or 0.0,
                  st[MONITOR_WANT["R0_rpm"]]["mean"] or 0.0))
@@ -175,7 +179,7 @@ def main() -> None:
         print("阶跃序列为空")
         sys.exit(1)
 
-    # with 退出时 __exit__ 自动收车收尾（目标归零 / 8电机0V / 刹车 / 停记录 / 退订 / 断连接）
+    # with 退出时 __exit__ 自动收车收尾（刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("motor_speed_step_%s" % args.tag)   # 每段一个原始 CSV
         os.makedirs(out_dir, exist_ok=True)

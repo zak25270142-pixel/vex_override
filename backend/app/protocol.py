@@ -11,9 +11,9 @@ include/communication.h 严格一一对应）
 （表现为"值对不上"而不是"报错"），改这里要三处一起改。
 
 职责划分：本文件只做"字节 ↔ 帧"和值编解码。FrameParser 是纯解帧状态机，
-吐出 (cmd, payload) 为止；目录解析、监控值/回显解码等业务语义在 hub.py
-（那里的目录表是类型真源，parser 不存任何类型状态）。每帧长度都由帧自身
-确定：监控值帧带 1B 长度前缀、调参回显带 type 前缀、命令目录头 2B 是内容
+吐出 (cmd, payload) 为止；目录解析、监控值/回显解码、响应帧结算等业务语义在
+hub.py（那里的目录表是类型真源，parser 不存任何类型状态）。每帧长度都由帧自身
+确定：监控值帧与响应帧带 1B 长度前缀、调参回显带 type 前缀、命令目录头 2B 是内容
 长度、调参/监控目录靠 _dir_len 现场试算——解帧不依赖外部状态。
 """
 
@@ -21,7 +21,7 @@ import struct
 from collections.abc import Callable
 from enum import IntEnum
 
-from .dataclass import CellValue, RxStats
+from .dataclass import CellValue
 
 FRAME_HEAD = 0xA5 # 帧头
 
@@ -38,7 +38,8 @@ class CmdPost(IntEnum):
     MonitorValue = 2  # 监控值推送（订阅后按档位周期推）
     TunableEcho = 3  # 调参项写回确认：上位机 SetTunable 后主控回这个，带真实生效值
     CMDDirectory = 4  # 动作命令目录（一项一帧）
-    Pong = 0xFF  
+    Response = 5  # 通用响应帧：对下行命令的回执（收到没/处理对没/要不要补发）
+    Pong = 0xFF
 
 class CmdGet(IntEnum):
     """上位机 → 主控"""
@@ -111,6 +112,149 @@ class CmdSpec(IntEnum):
 def cmd_spec(tag: int) -> int:
     """从 tag 提取命令类别"""
     return tag & CMD_TAG_SPEC_MASK
+
+# ---------- 动作命令段 ----------
+# 动作命令字独占 0x80~0x9F 共 32 个（与下位机 CMD_BASE 一致）。
+# 目录帧按需动态下发，命令字不在小枚举里——协议层按段判定。
+CMD_ACTION_MIN = 0x80
+CMD_ACTION_MAX = 0x9F
+
+# ---------- 通用响应帧（CmdPost.Response）----------
+# 帧格式: A5 | 05 | payloadlen | 原话cmd | 原话payload | status | 原因串 | XOR
+#   payloadlen 覆盖 原话cmd+原话payload+status+原因串（不含自身与 XOR），收 1B 即定帧长；
+#             最小 2，取 0/1 为流错位（解帧回找帧头，同 MonitorValue 的 payloadlen==0 规则）
+#   status 位域: bit7 类别(0=需补发 1=明确拒绝) bit6 模式(0=原因串 1=内定err) bit5~0 串长或err号
+# 分区（每字节都有定义）：
+#   0x00 OK / 0x01~0x3F 需补发+串 / 0x40~0x7F 需补发+内定err /
+#   0x80 拒绝无串 / 0x81~0xBF 拒绝+串 / 0xC0~0xFF 拒绝+内定err
+# 内定err按类别各自编号（协议文档定义，三端同步，小而稳）；字符串是长尾兜底，
+# 可带运行时值，任何版本上位机都能显示——不为它建跨版本枚举表。
+
+RESP_OK = 0x00
+RESP_CLASS_MASK = 0x80  # bit7 类别
+RESP_MODE_MASK = 0x40  # bit6 模式
+RESP_PAYLOAD_MASK = 0x3F
+
+
+class RespClass(IntEnum):
+    """status bit7：类别。唯一机器可执行的信息——上位机补发策略只认它"""
+
+    Retry = 0  # 需补发：帧没成（校验失败/命令字未注册），重发可能成功
+    Reject = 1  # 明确拒绝：重发无意义（下标超表/类型不可写/忙），该提示用户或换动作
+
+
+class RespMode(IntEnum):
+    """status bit6：模式"""
+
+    Str = 0  # 原因串（低6位=串长1~63B，UTF-8中文）——给人看
+    Err = 1  # 内定err（低6位=err号）——给机器switch，不带串
+
+
+class RespErrRetry(IntEnum):
+    """需补发类内定err（status = 0x40 | n）"""
+
+    Generic = 0  # 通用重试
+    Checksum = 1  # 校验失败（回显字节可疑，仅作线索）
+    UnknownCmd = 2  # 命令字未注册（版本不匹配/固件改了表）
+
+
+class RespErrReject(IntEnum):
+    """拒绝类内定err（status = 0xC0 | n）"""
+
+    Generic = 0  # 通用拒绝
+    IndexRange = 1  # 下标超表（Subscribe/SetTunable）——该做的是刷目录
+    TypeUnwritable = 2  # SetTunable 指向 str/other 不可写项
+    Busy = 3  # 动作命令被 is_busy 拒绝——该等当前动作跑完
+
+
+def resp_is_ok(status: int) -> bool:
+    return status == RESP_OK
+
+
+def resp_is_retry(status: int) -> bool:
+    """需补发（bit7=0 且非 OK）"""
+    return status != RESP_OK and not (status & RESP_CLASS_MASK)
+
+
+def resp_is_reject(status: int) -> bool:
+    """明确拒绝（bit7=1）"""
+    return bool(status & RESP_CLASS_MASK)
+
+
+def resp_str_len(status: int) -> int:
+    """原因串字节数（串模式取低6位；内定err/OK/裸拒律为0）"""
+    if status & RESP_MODE_MASK:
+        return 0
+    return status & RESP_PAYLOAD_MASK
+
+
+def resp_reason_text(status: int, reason: str) -> str:
+    """status+原因串 → 一句人话（日志/UI用）。内定err给编号名，串模式给原文。"""
+    if resp_is_ok(status):
+        return "OK"
+    if status & RESP_MODE_MASK:
+        table = RespErrRetry if resp_is_retry(status) else RespErrReject
+        code = status & RESP_PAYLOAD_MASK
+        try:
+            return f"{table(code).name}(内定err#{code})"
+        except ValueError:
+            return f"未知内定err#{code}"
+    return reason or "(空)"
+
+
+def decode_response(p: bytes, echo_len: int) -> tuple[int, bytes, int, str] | None:
+    """解 Response 帧 payload：[payloadlen][原话cmd][原话payload][status][原因串]。
+
+    echo_len = 回显 payload 应有字节数，由调用方得知：待确认表里存着原帧
+    （len(frame)-3，最可靠），或按命令目录字段累加/内置命令定长推。
+    同一命令字的 payload 长度恒定（字段表固定），是不变量——回显长度因此可预期。
+    一致性校验 payloadlen == 2 + echo_len + 串长，对不上返回 None（流错位/
+    回显被截断等异常）：ACK 丢失由上位机超时重发自愈，这里不猜。
+    """
+    if len(p) < 3:
+        return None
+    if p[0] < 2 or p[0] != len(p) - 1:
+        return None  # payloadlen 最小2；与实际长度不符即异常帧
+    echo_cmd = p[1]
+    status_at = 2 + echo_len
+    if status_at >= len(p):
+        return None
+    status = p[status_at]
+    str_len = resp_str_len(status)
+    if status_at + 1 + str_len != len(p):
+        return None
+    return (
+        echo_cmd,
+        bytes(p[2:status_at]),
+        status,
+        p[status_at + 1 :].decode("utf-8", errors="replace"),
+    )
+
+
+def build_response(echo_cmd: int, echo_payload: bytes = b"", status: int = RESP_OK, reason: str = "") -> bytes:
+    """组一帧 Response（测试/前端模拟源用；固件侧在 send_responses 里直接拼帧）。
+
+    reason 仅在 status 为串模式时带上；传入其他模式时忽略（协议规定内定err不带串）。
+    """
+    body = bytes([echo_cmd & 0xFF]) + echo_payload + bytes([status & 0xFF])
+    if resp_str_len(status):
+        body += reason.encode("utf-8")[: resp_str_len(status)]
+    return build_frame(CmdPost.Response, bytes([len(body)]) + body)
+
+
+def is_ack_tracked(cmd: int) -> bool:
+    """哪些下行帧需要 Response 确认：目录请求/订阅/调参写入 + 整个动作命令段。
+
+    Ping 有 Pong、SetTunable 成功有 TunableEcho（显式回应）不跟踪；但调参被拒时
+    无回显兜底，固件会补拒绝帧，所以 SetTunable 也在表里（TunableEcho 兼作确认）。
+    """
+    return cmd in (
+        CmdGet.RequestTunable,
+        CmdGet.RequestMonitor,
+        CmdGet.Subscribe,
+        CmdGet.SetTunable,
+        CmdGet.RequestCommand,
+    ) or (CMD_ACTION_MIN <= cmd <= CMD_ACTION_MAX)
 
 # ---------- 值编解码 ----------
 
@@ -346,16 +490,12 @@ class FrameParser:
         self.payload = bytearray(MAX_PAYLOAD)
         '''当前 payload 缓冲区'''
 
-        self.stats = RxStats()
-        '''链路诊断计数'''
-
     def feed(self, chunk: bytes, on_frame: Callable[[int, bytes], None]) -> None:
         """
         喂一批串口字节，逐字节走状态机，解出完整帧就调 on_frame(cmd, payload)。
         chunk   : 本次从串口读到的原始字节（可含半帧/多帧，状态机自己处理粘包拆包）
         on_frame: 完整帧出口 (cmd, payload)，payload 已剥掉帧头/命令字/校验
         """
-        self.stats.bytes += len(chunk)
         for b in chunk:
             if self.state == _RxState.WaitHead:
                 if b == FRAME_HEAD:
@@ -373,6 +513,7 @@ class FrameParser:
                     CmdPost.MonitorValue,
                     CmdPost.TunableEcho,
                     CmdPost.CMDDirectory,
+                    CmdPost.Response,
                 ):
                     self.cmd = b
                     self.expect = -1
@@ -382,11 +523,9 @@ class FrameParser:
                 else:
                     # 不认识的命令字：丢弃，回找帧头。
                     # 不去"猜"长度是因为无法判定该跳多远，硬跳会造成连锁错位。
-                    self.stats.unknownCmd += 1
                     self.state = _RxState.WaitHead
             elif self.state == _RxState.WaitData:
                 if self.len >= MAX_PAYLOAD:
-                    self.stats.overflow += 1
                     self.state = _RxState.WaitHead
                     continue
                 self.payload[self.len] = b
@@ -397,13 +536,15 @@ class FrameParser:
                     # 边收边试算长度：收到足够字节能确定总长就定下来。
                     # 监控值帧自带 1B 长度前缀，收 1 字节就能定长；
                     # 调参回显 [type][index][value] 的 type 前缀自带宽度；
+                    # 响应帧 [payloadlen][原话cmd][原话payload][status][原因串] 同理，
+                    #   payloadlen 最小 2（原话cmd+status），0/1 只可能是流错位；
                     # 目录帧要收完名字长度、单位长度才能算（_dir_len/_cmd_dir_len）。
                     if self.cmd == CmdPost.MonitorValue:
                         # payloadlen==0 对监控值帧非法：固件 monitor_tick 只在 pack_num>0
                         # 时 flush 且每帧必含 2B 时间戳（communication.cpp），真实帧
                         # payloadlen>=2。收到 0 只可能是流错位把数据字节当成了长度字节
                         # ——直接回找帧头，不猜长度（猜 expect=1 会多吞 2 字节；
-                        # 旧代码留着 expect=-1 更是一路吞到 MAX_PAYLOAD 还误记 overflow）
+                        # 旧代码留着 expect=-1 更是一路吞到 MAX_PAYLOAD 才重同步）
                         if self.payload[0] == 0:
                             self.state = _RxState.WaitHead
                         else:
@@ -419,6 +560,12 @@ class FrameParser:
                         total = _cmd_dir_len(bytes(self.payload[: self.len]), self.len)
                         if total >= 0:
                             self.expect = total
+                    elif self.cmd == CmdPost.Response:
+                        # payloadlen 最小 2（原话cmd+status），0/1 = 流错位，回找帧头不猜长度
+                        if self.payload[0] < 2:
+                            self.state = _RxState.WaitHead
+                        else:
+                            self.expect = 1 + self.payload[0]
                     else:
                         total = _dir_len(bytes(self.payload[: self.len]), self.len)
                         if total >= 0:
@@ -428,7 +575,4 @@ class FrameParser:
             elif self.state == _RxState.WaitXor:
                 self.state = _RxState.WaitHead
                 if (self.xor ^ b) == 0:
-                    self.stats.frames += 1
                     on_frame(self.cmd, bytes(self.payload[: self.len]))
-                else:
-                    self.stats.badChecksum += 1

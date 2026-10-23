@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
+from types import SimpleNamespace
 
 from app.dataclass import (
     CmdDirItem,
@@ -22,14 +24,17 @@ from app.dataclass import (
     MenuItem,
     MonitorSample,
 )
-from app.hub import Hub
+from app.hub import ACK_MAX_RETRIES, PRI_SCRIPT, PRI_UI, SCRIPT_LEASE_TTL_S, Hub
 from app.protocol import (
+    CmdGet,
     CmdPost,
     ValueType,
     build_frame,
+    build_response,
     encode_value,
     ping,
     request_monitor,
+    set_tunable,
     subscribe,
 )
 
@@ -96,6 +101,13 @@ def feed_echo(hub: Hub, type_: int, index: int, value: float) -> None:
     """经 _on_frame 喂一条调参回显帧：[type][index][value]。"""
     payload = bytes([type_, index]) + struct.pack("<f", value)
     hub._on_frame(CmdPost.TunableEcho, payload)
+
+
+def feed_response(hub: Hub, echo_cmd: int, echo_payload: bytes = b"",
+                  status: int = 0x00, reason: str = "") -> None:
+    """经 _on_frame 喂一帧 Response（与真实链路同一入口）。"""
+    f = build_response(echo_cmd, echo_payload, status, reason)
+    hub._on_frame(f[1], f[2:-1])
 
 
 def mon_entry(index: int, name: str, value: float = 0.0) -> DirEntry:
@@ -272,7 +284,7 @@ def main() -> None:
         assert "没有监控项" in str(e), e
     # 名字不存在仍由 resolve_monitor 抛 KeyError（删掉的白名单死条件不背这个锅）
     try:
-        hub.calc("不存在的项 + 1")
+        hub.calc("不存在的项 + 1", agg="mean")
         raise AssertionError("不存在的项应报 KeyError")
     except KeyError:
         pass
@@ -294,8 +306,12 @@ def main() -> None:
     hub.end_log()
     r = hub.calc("x - y", agg="mean")
     assert r.value == 12.0 and r.n == 2, r            # (10-2 + 20-4)/2
-    r = hub.calc("x - y")
-    assert r.agg == "none" and r.series == [(0, 8.0), (10, 16.0)], r
+    # agg 刻意不收空串：没有"逐点序列"这个选项了，要原始点走 print_log 导 csv
+    try:
+        hub.calc("x - y")
+        raise AssertionError("agg 为空应报错")
+    except ValueError as e:
+        assert "不支持的聚合" in str(e), e
     r = hub.calc("x - y", agg="sum")
     assert r.value == 24.0, r
     r = hub.calc("x - y", agg="mean", window=[0, 5])
@@ -322,14 +338,21 @@ def main() -> None:
             assert "只允许监控项名" in str(e), e
     print("[ok] calc 未支持的运算符一律 400（% // 位运算不再伪装 404）")
 
-    # --- 4.7 calc 结果收口：复数/溢出就地 400，不留到 JSON 序列化时才炸 ---
-    for bad, why in (("(-x) ** 0.5", "复数"), ("x ** 10000", "溢出")):
+    # --- 4.7 calc：** 已从白名单删除（复数来源随之消失），溢出仍就地 400 ---
+    # ** 删了就不必再挡"负数的分数次幂产生复数"；这里断言它连校验都过不去
+    for bad in ("(-x) ** 0.5", "x ** 10000"):
         try:
-            hub.calc(bad)
-            raise AssertionError(f"{bad!r} 应报{why}")
+            hub.calc(bad, agg="mean")
+            raise AssertionError(f"{bad!r} 应被白名单拒绝")
         except ValueError as e:
-            assert "不是有限实数" in str(e) or "溢出" in str(e), e
-    print("[ok] calc 复数/溢出结果就地报错")
+            assert "只允许监控项名" in str(e), e
+    # inf 仍要就地挡：加减乘除溢出（x=10 → 10*1e308 = inf）
+    try:
+        hub.calc("x * 1e308", agg="mean")
+        raise AssertionError("溢出应报错")
+    except ValueError as e:
+        assert "不是有限实数" in str(e), e
+    print("[ok] calc ** 白名单拒绝 + 溢出就地报错")
 
     # --- 4.8 window 形状校验：长度不足不能 500，反序要明说 ---
     for bad, kw in (([100], "元素"), ([400, 100], "反")):
@@ -345,7 +368,7 @@ def main() -> None:
     hub._name_to_mon["nov"] = 3     # 故意不放 monitor_latest：从没收到过任何值
     for expr in ("nov", "nov + z"):
         try:
-            hub.calc(expr)
+            hub.calc(expr, agg="mean")
             raise AssertionError(f"{expr!r} 应报错")
         except KeyError:
             raise AssertionError(f"{expr!r} 漏出 KeyError（会被路由当 404「项不存在」）")
@@ -472,6 +495,132 @@ def main() -> None:
     hub.clear_abort()
     drain_tx(hub)
     print("[ok] 停车帧拦截")
+
+    # --- 6. Response 确认与补发（下行帧 → 固件回执 → 待确认表结算）---
+    hub._pending_acks.clear()
+
+    # 6.1 入队即登记；OK 响应清除待确认
+    hub._send_tracked(request_monitor(), PRI_UI)
+    assert CmdGet.RequestMonitor in hub._pending_acks, "入队即登记待确认"
+    assert drain_tx(hub) == [request_monitor()]
+    feed_response(hub, CmdGet.RequestMonitor)
+    assert CmdGet.RequestMonitor not in hub._pending_acks, "OK 响应应清除待确认"
+    assert hub.ack_ok == 1
+    print("[ok] Response OK 结算清除待确认")
+
+    # 6.2 需补发：立即原帧重发，计入同一份重试预算；明确拒绝：不重发
+    hub._send_tracked(subscribe(1, True, False), PRI_UI)
+    drain_tx(hub)
+    feed_response(hub, CmdGet.Subscribe, bytes([1, 0x80]), 0x41)  # 需补发·校验失败
+    assert drain_tx(hub) == [subscribe(1, True, False)], "需补发应立即原帧重发"
+    assert hub._pending_acks[CmdGet.Subscribe].retries == ACK_MAX_RETRIES - 1
+    assert hub.ack_retry == 1
+    feed_response(hub, CmdGet.Subscribe, bytes([1, 0x80]), 0xC1)  # 拒绝·下标超表
+    assert not hub._tx_q, "明确拒绝不应重发"
+    assert CmdGet.Subscribe not in hub._pending_acks
+    assert hub.ack_reject == 1
+    print("[ok] 需补发立即重发 / 明确拒绝不重发")
+
+    # 6.3 超时重发与预算耗尽（拨 deadline 模拟超时；connected 要三条件都真才放行）
+    hub.bridge._connected = True
+    hub.bridge._ser = SimpleNamespace(is_open=True)
+    mv = build_frame(0x82, struct.pack("<f", 1.0))
+    hub._send_tracked(mv, PRI_SCRIPT)
+    drain_tx(hub)
+    hub._pending_acks[0x82].deadline = time.monotonic() - 1
+    hub._sweep_acks()
+    assert drain_tx(hub) == [mv], "超时应原帧重发"
+    assert hub._pending_acks[0x82].retries == ACK_MAX_RETRIES - 1
+    for _ in range(ACK_MAX_RETRIES):
+        hub._pending_acks[0x82].deadline = time.monotonic() - 1
+        hub._sweep_acks()
+        drain_tx(hub)
+    assert 0x82 not in hub._pending_acks, "重试耗尽应放弃"
+    assert hub.ack_timeout == 1
+    print("[ok] 超时重发 + 预算耗尽放弃")
+
+    # 6.4 断线期间不烧预算（deadline 顺延、retries 不动、不发帧）
+    hub._send_tracked(build_frame(0x83), PRI_UI)
+    drain_tx(hub)
+    hub.bridge._connected = False
+    hub._pending_acks[0x83].deadline = time.monotonic() - 1
+    hub._sweep_acks()
+    assert not hub._tx_q, "断线时不应重发"
+    assert hub._pending_acks[0x83].retries == ACK_MAX_RETRIES, "断线不烧重试预算"
+    hub.bridge._connected = True
+    print("[ok] 断线期间顺延不计费")
+
+    # 6.5 TunableEcho 兼作 Set_Tunable 确认（成功路径不重复回 Response）
+    hub._send_tracked(set_tunable(7, ValueType.Float, 1.5), PRI_SCRIPT)
+    drain_tx(hub)
+    feed_echo(hub, ValueType.Float, 7, 1.5)
+    assert CmdGet.SetTunable not in hub._pending_acks, "回显即确认"
+
+    # 6.6 无待确认帧的响应/一致性失败：只记 unexpected，不崩不弄丢账
+    feed_response(hub, 0x99)  # 从未下发过的命令字
+    bad = build_response(0x82, b"\x01\x02", 0x00)  # 回显2B但目录说4B（0x82 在 4.14 登记过）
+    hub._on_frame(bad[1], bad[2:-1])
+    assert hub.ack_unexpected == 2, hub.ack_unexpected
+    # 一致性失败不弄丢待确认帧（留给超时重发自愈）：现造一帧再试
+    hub._send_tracked(build_frame(0x82, struct.pack("<f", 2.0)), PRI_SCRIPT)
+    drain_tx(hub)
+    hub._on_frame(bad[1], bad[2:-1])
+    assert 0x82 in hub._pending_acks, "坏响应不应弄丢待确认帧"
+    assert hub.ack_unexpected == 3, hub.ack_unexpected
+    print("[ok] 意外/坏响应只记录不崩溃")
+
+    # --- 7. 脚本写权租约：一次只允许一个脚本写 ---
+    hub._lease_token = None
+    hub._lease_at = 0.0
+
+    # 7.1 第一个写的人自动成为持有者，他的后续写放行
+    hub.require_script("A")
+    assert hub._lease_token == "A", "无人持有时第一个写的就是持有者"
+    hub.require_script("A")            # 自己续租，不报错
+
+    # 7.2 第二个脚本：明确拒绝，且报错里带得干活的信息
+    try:
+        hub.require_script("B")
+        raise AssertionError("B 应被拒绝")
+    except PermissionError as e:
+        assert "A" in str(e), e
+    assert hub._lease_token == "A", "被拒的请求不能抢走写权"
+
+    # 7.3 claim：别人在跑就是不给
+    r = hub.claim_script("B")
+    assert not r.ok and r.held_age_s is not None and r.held_age_s >= 0, r
+    assert hub._lease_token == "A"
+    # 自己的 claim = 续租，不算抢
+    r = hub.claim_script("A")
+    assert r.ok and not r.evicted, r
+
+    # 7.4 steal 抢占：接管成功，且给被踢的那个置 abort（它下次写就该停）
+    hub.abort_event.clear()
+    r = hub.claim_script("B", steal=True)
+    assert r.ok and r.evicted, r
+    assert hub.abort_event.is_set(), "抢占必须给被踢方置 abort"
+    hub.require_script("B")
+    try:
+        hub.require_script("A")
+        raise AssertionError("被踢的 A 应失去写权")
+    except PermissionError:
+        pass
+    hub.abort_event.clear()
+
+    # 7.5 release 只认自己人：乱指认不会把别人踢掉
+    hub.release_script("A")            # A 已经不是持有者
+    assert hub._lease_token == "B", "非持有者的 release 不能生效"
+    hub.release_script("B")
+    assert hub._lease_token is None, "持有者自己 release 应释放"
+    hub.require_script("C")            # 释放后别人立刻能接管
+    assert hub._lease_token == "C"
+
+    # 7.6 租约过期：脚本崩了（不 release、不再写）之后别人能收尸，不会锁死机器
+    hub._lease_at = time.monotonic() - (SCRIPT_LEASE_TTL_S + 1)
+    assert hub._lease_holder() == (None, 0.0), "过期的持有者应等价于无人持有"
+    hub.require_script("D")            # 接管（不再是 PermissionError）
+    assert hub._lease_token == "D"
+    print("[ok] 脚本写权租约（独占/claim/steal/release/过期收尸）")
 
     print("\nall hub proxy tests passed")
 

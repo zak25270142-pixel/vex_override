@@ -663,9 +663,9 @@ def main():
         print(f"\n[异常] {e}")
     finally:
         wd.armed = False  # 先撤防，收尾动作不再被围栏打断
-        link.close_safely()  # 目标归零 → 6电机0V → 刹车 → 停记录 → 退订 → 关连接
+        link.close()         # 刹车 → 停记录 → 退订 → 关连接
         wd.close()
-        print("[safe] 已收车（目标归零/6电机0V/刹车/退订）")
+        print("[safe] 已收车（刹车/退订）")
 
 
 if __name__ == "__main__":

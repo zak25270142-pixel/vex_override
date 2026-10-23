@@ -30,6 +30,7 @@ import {
   formatFloat32,
   typeName,
   valueSize,
+  respReasonText,
   type CellValue,
   type DirItem,
   type CmdDirItem,
@@ -641,6 +642,7 @@ function clearMonitorData(): void {
   stampRaw = -1 // 时间戳展开从头开始：重连后下位机时钟与旧基准不再连续
   stampMs = 0
   parser.resetMonitorTypes()
+  parser.resetCmdEchoLens() // 命令目录重拉，回显长度登记一并作废
   pose.valid = false
   poseIndex.x = -1
   poseIndex.y = -1
@@ -705,6 +707,22 @@ function handleEvent(e: RxEvent): void {
   if (e.kind === 'cmdDirectory') {
     // 动作命令目录：一条命令一帧，按命令字存表，右侧面板据此渲染表单
     commandMap[e.item.index] = e.item
+    // 登记回显长度（字段类型累加）：解 Response 帧时靠它定位 status 字节
+    parser.setCmdEchoLen(
+      e.item.index,
+      e.item.fields.reduce((n, f) => n + valueSize(f.type), 0),
+    )
+    return
+  }
+  if (e.kind === 'response') {
+    // 通用响应帧（固件回执）：前端只观察——补发/重试在后端待确认表里做。
+    // 拒绝与需补发都进诊断日志，排"命令发了车没动"时看这里
+    const label = `0x${e.echoCmd.toString(16).padStart(2, '0')}`
+    if (e.status === 0x00) {
+      pushDiag('ACK', `命令 ${label} 已确认`)
+    } else {
+      pushDiag('ACK', `命令 ${label}：${respReasonText(e.status, e.reason)}`)
+    }
     return
   }
 
@@ -899,7 +917,8 @@ export async function fetchCommands(): Promise<void> {
 }
 
 /**
- * 下发动作命令（无 ACK，发完即走；车是否执行可从实参表观察）。
+ * 下发动作命令。固件回 Response 确认（OK 或忙拒绝），后端有待确认表负责补发；
+ * 车是否执行可从实参表观察，相对量命令（转向/直行/局部移动）注意重发会累计。
  * values 顺序与 item.fields 对应，由面板保证已填且为有效数。
  */
 export async function sendCommand(index: number, values: CellValue[]): Promise<void> {

@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))   # backe
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # 脚本共用工具目录
 from app.script_api import BackendLink  # noqa: E402
 from motor_names import motor_names  # noqa: E402
+from seg_stats import seg_stats  # noqa: E402
 
 
 def sustained(stats):
@@ -61,7 +62,7 @@ def main():
     twitches = {m: [] for m in motors}  # 每次试验第一次明显抽动的电压
     rows = []  # 每次试验一行，最后写 CSV
 
-    # with 退出时 __exit__ 自动收车收尾（6电机0V / 刹车 / 停记录 / 退订 / 断连接）
+    # with 退出时 __exit__ 自动收车收尾（刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("motor_start_repeat_%s" % args.tag)   # 每档一段原始 CSV
         os.makedirs(out_dir, exist_ok=True)
@@ -116,8 +117,10 @@ def main():
                     seg = os.path.join(out_dir, "%s_t%d_v%.2f" % (motor, trial, v))
                     bl.print_log(seg + ".csv")
                     bl.print_log(seg + ".png")
-                    st_r = bl.stats([names["rpm"]], thresholds=[1.0, 3.0])[names["rpm"]]
-                    st_v = bl.stats([names["vact"]])[names["vact"]]
+                    st = seg_stats(seg + ".csv", [names["rpm"], names["vact"]],
+                                   thresholds=[1.0, 3.0])
+                    st_r = st[names["rpm"]]
+                    st_v = st[names["vact"]]
                     # 抽动：本段峰值过3pct（越过齿槽动了一下但没转起来）
                     if twitch_v is None and (st_r["abs_max"] or 0.0) >= 3.0:
                         twitch_v = v

@@ -14,6 +14,9 @@ import {
   CmdSpec,
   CMD_TAG_ARGC_SHIFT,
   CMD_TAG_RANGE,
+  RESP_OK,
+  RESP_REJECT_INDEX_RANGE,
+  buildResponse,
   tagFast,
   tagSubscribed,
 } from './protocol'
@@ -254,11 +257,17 @@ export class MockTransport implements SerialTransport {
   async send(data: Uint8Array): Promise<void> {
     if (data.length < 2 || data[0] !== FRAME_HEAD) return
     const cmd = data[1]
+    // 与真机一致的回执语义：目录请求在 burst 发完后回 OK；Subscribe/调参/动作命令立即回。
+    // 拒绝用内定err（0xC0|n）：1=下标超表 2=类型不可写——演示源照实模拟
+    const respond = (echoPayload: number[], status = RESP_OK) =>
+      this.emit(buildResponse(cmd, echoPayload, status))
     if (cmd === CmdGet.RequestTunable) {
       directoryFrames(CmdPost.TunableDirectory, tunableItems).forEach((f) => this.emit(f))
+      respond([])
     } else if (cmd === CmdGet.RequestMonitor) {
       directoryFrames(CmdPost.MonitorDirectory, monitorItems).forEach((f) => this.emit(f))
       this.startTimers()
+      respond([])
     } else if (cmd === CmdGet.Subscribe) {
       // [index][tag]，与真机 merge_subscribe_tag 同语义：
       // 只合并上位机的 SUB/FAST 两位，GETTER/KIND 等本机位保留；bit7=0 即退订；index=0xFF 全部生效
@@ -268,23 +277,31 @@ export class MockTransport implements SerialTransport {
       const merge = (old: number) => (incoming & hostBits) | (old & ~hostBits & 0xff)
       if (index === 0xff) monitorItems.forEach((it) => (it.tag = merge(it.tag)))
       else if (monitorItems[index]) monitorItems[index]!.tag = merge(monitorItems[index]!.tag)
+      const ok = index === 0xff || monitorItems[index] !== undefined
+      respond([index, incoming], ok ? RESP_OK : RESP_REJECT_INDEX_RANGE)
     } else if (cmd === CmdGet.SetTunable) {
-      // [index][value 8B]：按类型解码写入状态，下一"拍"回 TunableEcho
+      // [index][value 8B]：按类型解码写入状态，下一"拍"回 TunableEcho（成功=显式回应，
+      // 不重复回 Response）；下标越界才回拒绝帧——与固件 handle_command 同分支
       const index = data[2]!
       const it = tunableItems[index]
-      if (!it) return
+      if (!it) {
+        respond([index, ...Array.from(data.subarray(3, 11))], RESP_REJECT_INDEX_RANGE)
+        return
+      }
       const v = decodeValueLE(data.subarray(3, 11), it.type)
       tunableState[index] = v
       const payload: number[] = [index]
       appendValue(payload, it.type, v)
       this.emit(frame(CmdPost.TunableEcho, payload))
     } else if (cmd === CmdGet.RequestCommand) {
-      // 命令目录：一条命令一帧，分两拍发，模拟真机分批轮转
+      // 命令目录：一条命令一帧，分两拍发，模拟真机分批轮转；末批后回 OK
       mockCommands.forEach((c, i) => {
         setTimeout(() => this.cb.onData(cmdDirectoryFrame(c)), i * 10)
       })
+      setTimeout(() => respond([]), mockCommands.length * 10)
     } else if (cmd >= CMD_USER_MIN && cmd <= CMD_USER_MAX) {
-      // 动作命令下发：演示源不执行真动作，静默吞掉（无ACK协议，真机同理不回帧）
+      // 动作命令：演示源不执行真动作，但照真机回 OK 回执
+      respond(Array.from(data.subarray(2, data.length - 1)))
     }
   }
 
