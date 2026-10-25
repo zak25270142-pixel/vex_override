@@ -223,9 +223,9 @@ export class ResponseEvent {
     readonly echoPayload: Uint8Array,
     /** status 字节（位域见 respIsRetry 等 helper） */
     readonly status: number,
-    /** 原因串（串模式才有；内定err为空串，用 respReasonText 取名） */
-    readonly reason: string,
-  )
+    /** 尾字节：串模式=UTF-8 原因串；OK 模式=二进制附加信息（如目录项数）。用 respReasonText 转人话 */
+    readonly reason: Uint8Array,
+  ) {}
 }
 
 export class PongEvent {
@@ -244,7 +244,9 @@ export type RxEvent =
    bit7 类别：0=需补发（重发可能成功） 1=明确拒绝（重发无意义）
    bit6 模式：0=原因串（低6位=串长1~63B） 1=内定err（低6位=err号，不带串）
    分区：0x00 OK / 0x01~0x3F 补发+串 / 0x40~0x7F 补发+内定err /
-        0x80 拒绝无串 / 0x81~0xBF 拒绝+串 / 0xC0~0xFF 拒绝+内定err */
+        0x80 拒绝无串 / 0x81~0xBF 拒绝+串 / 0xC0~0xFF 拒绝+内定err
+   0x00 的尾字节是二进制附加信息（长度隐式=帧长剩余）：目录请求=表内总项数1B，
+   由后端对照补发；前端只是观察者，见 respStrLen(-1) 与 decodeResponse */
 export const RESP_OK = 0x00
 export const RESP_CLASS_MASK = 0x80
 export const RESP_MODE_MASK = 0x40
@@ -267,6 +269,8 @@ export function respIsReject(status: number): boolean {
   return (status & RESP_CLASS_MASK) !== 0
 }
 export function respStrLen(status: number): number {
+  // OK 的尾字节长度隐式：0x00 低6位恒0装不下，长度由帧长反推（见 decodeResponse）
+  if (status === RESP_OK) return -1
   return status & RESP_MODE_MASK ? 0 : status & RESP_PAYLOAD_MASK
 }
 
@@ -274,61 +278,68 @@ export function respStrLen(status: number): number {
 const RESP_ERR_RETRY_NAMES = ['通用重试', '校验失败', '命令字未注册']
 const RESP_ERR_REJECT_NAMES = ['通用拒绝', '下标超表', '类型不可写', '忙']
 
-/** status+reason → 一句人话（诊断日志用） */
-export function respReasonText(status: number, reason: string): string {
+/** status+尾字节 → 一句人话（诊断日志用）。尾字节：串模式=UTF-8 原因串，
+    OK 模式=二进制 info（这里只显示 OK，info 由后端按回显 cmd 解释） */
+export function respReasonText(status: number, reason: Uint8Array): string {
   if (respIsOk(status)) return 'OK'
   if (status & RESP_MODE_MASK) {
     const code = status & RESP_PAYLOAD_MASK
     const names = respIsRetry(status) ? RESP_ERR_RETRY_NAMES : RESP_ERR_REJECT_NAMES
     return names[code] ?? `未知内定err#${code}`
   }
-  return reason || '(空)'
+  return reason.length ? new TextDecoder('utf-8').decode(reason) : '(空)'
 }
 
-/** 内置下行命令的 payload 定长（Response 回显长度兜底用；动作命令查命令目录） */
+/** 内置下行命令的 payload 定长（Response 回显长度兜底用；动作命令查命令目录）。
+    目录请求是 [len][index...] 变长：兜底按全量请求算 1B（补发帧的回显长度
+    由待确认表/登记表给出，不走这里） */
 const BUILTIN_ECHO_LEN: Record<number, number> = {
-  [CmdGet.RequestTunable]: 0,
-  [CmdGet.RequestMonitor]: 0,
-  [CmdGet.RequestCommand]: 0,
+  [CmdGet.RequestTunable]: 1,
+  [CmdGet.RequestMonitor]: 1,
+  [CmdGet.RequestCommand]: 1,
   [CmdGet.Subscribe]: 2,
   [CmdGet.SetTunable]: 9,
   [CmdGet.Ping]: 0,
 }
 
-/** 解 Response 帧 payload：[payloadlen][原话cmd][原话payload][status][原因串]。
+/** 解 Response 帧 payload：[payloadlen][原话cmd][原话payload][status][尾字节]。
     echoLen=回显payload应有字节数（调用方从命令目录/内置定长得知；
-    同命令字长度恒定是不变量）。一致性校验不过返回 null（流错位/截断），
+    同命令字长度恒定是不变量）。尾字节按 status 模式解释：串模式=UTF-8 原因串
+    （长度=低6位，须与帧长吻合）；OK 模式=二进制 info（长度隐式=帧长剩余，
+    目录请求时是 1B 表内总项数）。一致性校验不过返回 null（流错位/截断），
     与后端 decode_response 同构——前端只是观察者，补发逻辑在后端。 */
 export function decodeResponse(
   p: Uint8Array,
   echoLen: number,
-): { echoCmd: number; echoPayload: Uint8Array; status: number; reason: string } | null {
+): { echoCmd: number; echoPayload: Uint8Array; status: number; reason: Uint8Array } | null {
   if (p.length < 3) return null
   if (p[0]! < 2 || p[0]! !== p.length - 1) return null
   const echoCmd = p[1]!
   const statusAt = 2 + echoLen
   if (statusAt >= p.length) return null
   const status = p[statusAt]!
+  if (respIsOk(status)) {
+    // OK+info：尾字节长度隐式（帧长剩余即附加信息），不再做第二重校验
+    return { echoCmd, echoPayload: p.subarray(2, statusAt), status, reason: p.subarray(statusAt + 1) }
+  }
   const strLen = respStrLen(status)
   if (statusAt + 1 + strLen !== p.length) return null
-  const decoder = new TextDecoder('utf-8')
-  return {
-    echoCmd,
-    echoPayload: p.subarray(2, statusAt),
-    status,
-    reason: decoder.decode(p.subarray(statusAt + 1)),
-  }
+  return { echoCmd, echoPayload: p.subarray(2, statusAt), status, reason: p.subarray(statusAt + 1) }
 }
 
-/** 组一帧 Response（演示源/测试用；真机由固件 send_responses 直接拼帧） */
+/** 组一帧 Response（演示源/测试用；真机由固件 send_responses 直接拼帧）。
+    reason 是尾字节、按 status 模式解释：OK=二进制 info（如目录项数，长度隐式）；
+    串模式=UTF-8 原因串，按低6位截断；内定err/裸拒律忽略 */
 export function buildResponse(
   echoCmd: number,
   echoPayload: number[] = [],
   status: number = RESP_OK,
-  reason = '',
+  reason: Uint8Array | number[] = [],
 ): Uint8Array {
+  const tail = Array.from(reason)
   const body: number[] = [echoCmd & 0xff, ...echoPayload, status & 0xff]
-  if (respStrLen(status)) body.push(...new TextEncoder().encode(reason).slice(0, respStrLen(status)))
+  if (respIsOk(status)) body.push(...tail) // 隐式长度：payloadlen 会算进去
+  else if (respStrLen(status)) body.push(...tail.slice(0, respStrLen(status)))
   return buildFrame(CmdPost.Response, [body.length & 0xff, ...body])
 }
 
@@ -480,7 +491,10 @@ function encodeValue8(type: ValueType, value: CellValue): Uint8Array {
 
 /* ===== 组帧（下发） ===== */
 
-export function buildFrame(cmd: CmdGet, payload: number[] = []): Uint8Array {
+/** cmd 收 CmdGet | number：动作命令字(0x80~0x9F)不在 CmdGet 小枚举里（commandSend
+    传 item.index），演示源的 Response 帧又是上行命令字——这里只写一个字节，
+    按段判定的活儿不归它管，故不收窄成 CmdGet 逼各处 cast */
+export function buildFrame(cmd: CmdGet | number, payload: number[] = []): Uint8Array {
   const frame = new Uint8Array(payload.length + 3)
   frame[0] = FRAME_HEAD
   frame[1] = cmd
@@ -493,11 +507,20 @@ export function buildFrame(cmd: CmdGet, payload: number[] = []): Uint8Array {
   return frame
 }
 
-export function requestTunable(): Uint8Array {
-  return buildFrame(CmdGet.RequestTunable)
+/** 目录请求帧：[len 1B][index...]；len=0 全量，非0=只补发这些下标。
+    补发由后端算缺失项后发起（不清已收目录）；直连串口模式同理。 */
+function requestDir(cmd: number, indices?: number[]): Uint8Array {
+  const idx = indices ?? []
+  return buildFrame(cmd, [idx.length & 0xff, ...idx.map((i) => i & 0xff)])
 }
-export function requestMonitor(): Uint8Array {
-  return buildFrame(CmdGet.RequestMonitor)
+
+/** 请求调参目录（indices 省略/空=全量） */
+export function requestTunable(indices?: number[]): Uint8Array {
+  return requestDir(CmdGet.RequestTunable, indices)
+}
+/** 请求监控目录（indices 语义同 requestTunable） */
+export function requestMonitor(indices?: number[]): Uint8Array {
+  return requestDir(CmdGet.RequestMonitor, indices)
 }
 /**
  * 改订阅档位；index=0xff 对全部生效。
@@ -516,9 +539,9 @@ export function ping(): Uint8Array {
 export function setTunable(index: number, type: ValueType, value: CellValue): Uint8Array {
   return buildFrame(CmdGet.SetTunable, [index, ...encodeValue8(type, value)])
 }
-/** 请求动作命令目录（主控分批回 CMDDirectory） */
-export function requestCommand(): Uint8Array {
-  return buildFrame(CmdGet.RequestCommand)
+/** 请求动作命令目录（主控分批回 CMDDirectory；indices 语义同 requestTunable） */
+export function requestCommand(indices?: number[]): Uint8Array {
+  return requestDir(CmdGet.RequestCommand, indices)
 }
 /**
  * 动作命令下发帧：Cmd 就是命令字本身（0x80~0x9F，不是 CmdGet 段），
@@ -531,7 +554,7 @@ export function commandSend(item: CmdDirItem, values: CellValue[]): Uint8Array {
   item.fields.forEach((f, i) => {
     payload.push(...encodeValue(f.type, values[i] ?? 0))
   })
-  return buildFrame(item.index as CmdGet, payload)
+  return buildFrame(item.index, payload)
 }
 
 /* ===== 解帧（接收状态机，与下位机 refresh 里的状态机同构） =====
@@ -833,12 +856,15 @@ export class FrameParser {
         break
       }
       case CmdPost.Response: {
-        // [payloadlen][原话cmd][原话payload][status][原因串]。
+        // [payloadlen][原话cmd][原话payload][status][尾字节]。
         // status 位置依赖回显长度：已登记命令字/内置命令可推；推不出按 0 猜解，
         // 一致性校验不过就静默丢（前端只是观察者，补发与重试在后端做）
         if (this.len < 3) return
         const echoCmd = p[1]!
-        const decoded = decodeResponse(p, this.expectedEchoLen(echoCmd))
+        // decodeResponse 与后端 decode_response 同构，内部用 p[0] === p.length-1 自校验，
+        // 必须传"本帧 payload 的紧致切片"。this.payload 是 MAX_PAYLOAD 满缓冲，整个传进去
+        // 校验永远不过——Response 帧会被全部静默丢弃（ACK 日志/busy 弹 toast 全成死代码）。
+        const decoded = decodeResponse(p.subarray(0, this.len), this.expectedEchoLen(echoCmd))
         if (decoded === null) return
         onEvent(
           new ResponseEvent(decoded.echoCmd, decoded.echoPayload, decoded.status, decoded.reason),

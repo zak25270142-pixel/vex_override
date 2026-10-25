@@ -10,8 +10,8 @@
 extern RobotAction robot_action;
 // 底盘实例：监控菜单要直接读它的全局坐标x/y与航向heading，故对外可见。
 extern Chassis chassis;
-extern MyMotorGroup left_motors;
-extern MyMotorGroup right_motors;
+extern ChassisMotorGroup left_motors;
+extern ChassisMotorGroup right_motors;
 
 // 逐台电机属性数组：组内持指针共用本数组；菜单/监控表直接绑本数组字段取址
 // （数组基址是链接期常量，不依赖组构造时序，勿改回经 left_motors.motors[i] 绑址）

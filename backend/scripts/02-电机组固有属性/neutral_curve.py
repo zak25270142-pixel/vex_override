@@ -107,7 +107,8 @@ def group_for_test(test_name: str) -> dict:
 
 
 def set_voltage(link: BackendLink, mid: int, volts: float) -> None:
-    """调用现有 0x84 给单台电机直接加电压（钳在 ±12V）。"""
+    """给单台电机直接加电压（钳在 ±12V）。底层是 0x84 组开环电压，
+    由 BackendLink.set_volt 补全同组另外两台的原值。"""
     link.set_volt(mid, max(-12.0, min(12.0, float(volts))))
 
 
@@ -671,11 +672,11 @@ def main():
             all_zero(link)
             link.stop_move()  # 交出底盘：is_busy 期间 0x84 被固件静默丢弃，会全录到 0
             link.sleep(0.4)
-            # 开环直设电压要求速度环空闲：环活着会每 10ms 覆盖 0x84，读到被扶住的假数据
+            # 0x84 组开环电压会自己把速度环踹开并保持（open_loop 态），不必先停车。
             st_l, st_r = link.latest("左环状态"), link.latest("右环状态")
             if st_l != 0 or st_r != 0:
-                print(f"[warn] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}），"
-                      f"0x84 会被每拍覆盖，结论不可信")
+                print(f"[note] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}），"
+                      f"说明上一次没收车；本脚本会自行接管，不影响结论")
             all_zero(link)
             link.sleep(1.0)
 

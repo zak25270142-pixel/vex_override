@@ -36,24 +36,22 @@ const struct MENU_ITEM menu_item[] =
         {"R_vmin0", type_float, &right_motor_list[0].volt_min, "右0最小电压", "V"},
         {"R_vmin1", type_float, &right_motor_list[1].volt_min, "右1最小电压", "V"},
         {"R_vmin2", type_float, &right_motor_list[2].volt_min, "右2最小电压", "V"},
-        {"L_vmax0", type_float, &left_motor_list[0].volt_max, "左0最大电压", "V"},
-        {"L_vmax1", type_float, &left_motor_list[1].volt_max, "左1最大电压", "V"},
-        {"L_vmax2", type_float, &left_motor_list[2].volt_max, "左2最大电压", "V"},
-        {"R_vmax0", type_float, &right_motor_list[0].volt_max, "右0最大电压", "V"},
-        {"R_vmax1", type_float, &right_motor_list[1].volt_max, "右1最大电压", "V"},
-        {"R_vmax2", type_float, &right_motor_list[2].volt_max, "右2最大电压", "V"},
         {"L_vf0", type_float, &left_motor_list[0].volt_factor, "左0电压系数", ""},
         {"L_vf1", type_float, &left_motor_list[1].volt_factor, "左1电压系数", ""},
         {"L_vf2", type_float, &left_motor_list[2].volt_factor, "左2电压系数", ""},
         {"R_vf0", type_float, &right_motor_list[0].volt_factor, "右0电压系数", ""},
         {"R_vf1", type_float, &right_motor_list[1].volt_factor, "右1电压系数", ""},
         {"R_vf2", type_float, &right_motor_list[2].volt_factor, "右2电压系数", ""},
-        {"L_odz", type_float, &left_motors.output_deadzone, "左速度死区", "pct"},
-        {"R_odz", type_float, &right_motors.output_deadzone, "右速度死区", "pct"},
-        {"L_slewB", type_float, &left_motors.slew_boost, "左升压斜率", "V/s"},
-        {"R_slewB", type_float, &right_motors.slew_boost, "右升压斜率", "V/s"},
-        {"L_slewR", type_float, &left_motors.slew_release, "左撤压斜率", "V/s"},
-        {"R_slewR", type_float, &right_motors.slew_release, "右撤压斜率", "V/s"},
+        {"L_odz", type_float, &left_motors.target_deadzone, "左速度死区", "pct"},
+        {"R_odz", type_float, &right_motors.target_deadzone, "右速度死区", "pct"},
+        // 绑的是标定值 slow/fast（基类 slew_boost/slew_release 是每拍被状态覆盖的生效值，
+        // 绑那里等于调了立刻被盖掉）。常规态下 slow=升压上限、fast=撤压上限。
+        {"L_slewB", type_float, &left_motors.slew_slow, "左升压斜率", "V/s"},
+        {"R_slewB", type_float, &right_motors.slew_slow, "右升压斜率", "V/s"},
+        {"L_slewR", type_float, &left_motors.slew_fast, "左撤压斜率", "V/s"},
+        {"R_slewR", type_float, &right_motors.slew_fast, "右撤压斜率", "V/s"},
+        {"L_jump", type_float, &left_motors.target_jump_abs, "左大跳阈值", "pct"},
+        {"R_jump", type_float, &right_motors.target_jump_abs, "右大跳阈值", "pct"},
         {"L_errI", type_float, &left_motors.error_for_i, "左I误差阈值", "pct"},
         {"R_errI", type_float, &right_motors.error_for_i, "右I误差阈值", "pct"},
         {"L_recA", type_float, &left_motors.recover_accel, "左反常加速度", "pct/s"},
@@ -79,14 +77,10 @@ const struct MENU_ITEM menu_item[] =
         {"lift_vf1", type_float, &lift_motor_list[1].volt_factor, "升1电压系数", ""},
         {"lift_vf2", type_float, &lift_motor_list[2].volt_factor, "升2电压系数", ""},
         {"lift_vf3", type_float, &lift_motor_list[3].volt_factor, "升3电压系数", ""},
-        {"lift_vmax0", type_float, &lift_motor_list[0].volt_max, "升0最大电压", "V"},
-        {"lift_vmax1", type_float, &lift_motor_list[1].volt_max, "升1最大电压", "V"},
-        {"lift_vmax2", type_float, &lift_motor_list[2].volt_max, "升2最大电压", "V"},
-        {"lift_vmax3", type_float, &lift_motor_list[3].volt_max, "升3最大电压", "V"},
         {"lift_vmin0", type_float, &lift_motor_list[0].volt_min, "升0最小电压", "V"},
         {"lift_vmin1", type_float, &lift_motor_list[1].volt_min, "升1最小电压", "V"},
         {"lift_vmin2", type_float, &lift_motor_list[2].volt_min, "升2最小电压", "V"},
-        {"lift_vmin3", type_float, &lift_motor_list[3].volt_min, "升3最小电压", "V"}
+        {"lift_vmin3", type_float, &lift_motor_list[3].volt_min, "升3最小电压", "V"},
 
         // 手柄松杆减速缓冲
         {"man_decay", type_uint32_t, &robot_action.manual_stop_delay, "松杆停车延迟", "us"},
@@ -110,8 +104,8 @@ const struct MENU_ITEM menu_item[] =
         // {"t_max", type_float, &robot_action.turn_pid.max_output, "转向限速", "pct"},
 
         // // ========== 满速 / 容差 ==========
-        // {"L_max", type_float, &chassis.left_max_speed, "左满速", "pct"},
-        // {"R_max", type_float, &chassis.right_max_speed, "右满速", "pct"},
+        // {"L_max", type_float, &left_motors.max_speed, "左满速", "pct"},
+        // {"R_max", type_float, &right_motors.max_speed, "右满速", "pct"},
 
         // {"dist_tol", type_float, &robot_action.distance_tolerance, "距离容差", "m"},
         // {"v_tol", type_float, &robot_action.linear_speed_tolerance, "线速度容差", "m/s"},
@@ -158,8 +152,12 @@ static struct MENU_ITEM monitor_menu_item[] =
         // 本拍前馈输出
         {"L_ff", type_float, &left_motors.feedforward, "左前馈", "", monitor_tag_fast},
         {"R_ff", type_float, &right_motors.feedforward, "右前馈", "", monitor_tag_fast},
-        {"L_error", type_float, &left_motors.previous_error, "左PID误差", "", monitor_tag_fast},
-        {"R_error", type_float, &right_motors.previous_error, "右PID误差", "", monitor_tag_fast},
+        {"L_error", type_float, &left_motors.error, "左PID误差", "", monitor_tag_fast},
+        {"R_error", type_float, &right_motors.error, "右PID误差", "", monitor_tag_fast},
+        // 可调电压还能给多少（12 − 垫底 − 个体死区）。比例限幅的分母、抗饱和的天花板
+        // 都是它；volt_scale > 1 时看这里就知道是被谁顶住的。
+        {"L_head", type_float, &left_motors.headroom, "左电压余量", "V", monitor_tag_slow},
+        {"R_head", type_float, &right_motors.headroom, "右电压余量", "V", monitor_tag_slow},
         // 速度环状态机：0=Stopped 1=Transit 2=Track 3=Stable 4=Recover 5=Stall
         {"L_state", type_uint8_t, &left_motors.spin_state, "左环状态", "", monitor_tag_fast},
         {"R_state", type_uint8_t, &right_motors.spin_state, "右环状态", "", monitor_tag_fast},
@@ -228,25 +226,35 @@ static struct MENU_ITEM monitor_menu_item[] =
 
         // 逐台：验转向同号、验齿轮都啮上（某台空转时它这几项会明显离群）
         {"lift_m0_pos", []
-         { return static_cast<float>(lift_bar.motors[0].motor->position(vex::rotationUnits::rev)); }, "升0位置", "rev", monitor_tag_slow},
+         { return static_cast<float>(lift_bar.motor_group.motors[0].motor->position(vex::rotationUnits::rev)); }, "升0位置", "rev", monitor_tag_slow},
         {"lift_m1_pos", []
-         { return static_cast<float>(lift_bar.motors[1].motor->position(vex::rotationUnits::rev)); }, "升1位置", "rev", monitor_tag_slow},
+         { return static_cast<float>(lift_bar.motor_group.motors[1].motor->position(vex::rotationUnits::rev)); }, "升1位置", "rev", monitor_tag_slow},
         {"lift_m2_pos", []
-         { return static_cast<float>(lift_bar.motors[2].motor->position(vex::rotationUnits::rev)); }, "升2位置", "rev", monitor_tag_slow},
+         { return static_cast<float>(lift_bar.motor_group.motors[2].motor->position(vex::rotationUnits::rev)); }, "升2位置", "rev", monitor_tag_slow},
         {"lift_m3_pos", []
-         { return static_cast<float>(lift_bar.motors[3].motor->position(vex::rotationUnits::rev)); }, "升3位置", "rev", monitor_tag_slow},
+         { return static_cast<float>(lift_bar.motor_group.motors[3].motor->position(vex::rotationUnits::rev)); }, "升3位置", "rev", monitor_tag_slow},
         {"lift_m0_I", []
-         { return static_cast<float>(lift_bar.motors[0].motor->current(vex::currentUnits::amp)); }, "升0电流", "A", monitor_tag_slow},
+         { return static_cast<float>(lift_bar.motor_group.motors[0].motor->current(vex::currentUnits::amp)); }, "升0电流", "A", monitor_tag_slow},
         {"lift_m1_I", []
-         { return static_cast<float>(lift_bar.motors[1].motor->current(vex::currentUnits::amp)); }, "升1电流", "A", monitor_tag_slow},
+         { return static_cast<float>(lift_bar.motor_group.motors[1].motor->current(vex::currentUnits::amp)); }, "升1电流", "A", monitor_tag_slow},
         {"lift_m2_I", []
-         { return static_cast<float>(lift_bar.motors[2].motor->current(vex::currentUnits::amp)); }, "升2电流", "A", monitor_tag_slow},
+         { return static_cast<float>(lift_bar.motor_group.motors[2].motor->current(vex::currentUnits::amp)); }, "升2电流", "A", monitor_tag_slow},
         {"lift_m3_I", []
-         { return static_cast<float>(lift_bar.motors[3].motor->current(vex::currentUnits::amp)); }, "升3电流", "A", monitor_tag_slow},
-        {"lift_m0_Vcmd", type_float, &lift_bar.motors[0].volt_output, "升0指令电压", "V", monitor_tag_slow},
-        {"lift_m1_Vcmd", type_float, &lift_bar.motors[1].volt_output, "升1指令电压", "V", monitor_tag_slow},
-        {"lift_m2_Vcmd", type_float, &lift_bar.motors[2].volt_output, "升2指令电压", "V", monitor_tag_slow},
-        {"lift_m3_Vcmd", type_float, &lift_bar.motors[3].volt_output, "升3指令电压", "V", monitor_tag_slow}
+         { return static_cast<float>(lift_bar.motor_group.motors[3].motor->current(vex::currentUnits::amp)); }, "升3电流", "A", monitor_tag_slow},
+        {"lift_m0_Vcmd", type_float, &lift_motor_list[0].volt_output, "升0指令电压", "V", monitor_tag_slow},
+        {"lift_m1_Vcmd", type_float, &lift_motor_list[1].volt_output, "升1指令电压", "V", monitor_tag_slow},
+        {"lift_m2_Vcmd", type_float, &lift_motor_list[2].volt_output, "升2指令电压", "V", monitor_tag_slow},
+        {"lift_m3_Vcmd", type_float, &lift_motor_list[3].volt_output, "升3指令电压", "V", monitor_tag_slow},
+
+        // 实际电压：SDK 回读
+        {"lift_m0_Vact", []
+         { return static_cast<float>(lift_bar.motor_group.motors[0].motor->voltage(vex::voltageUnits::volt)); }, "升0实际电压", "V", monitor_tag_slow},
+        {"lift_m1_Vact", []
+         { return static_cast<float>(lift_bar.motor_group.motors[1].motor->voltage(vex::voltageUnits::volt)); }, "升1实际电压", "V", monitor_tag_slow},
+        {"lift_m2_Vact", []
+         { return static_cast<float>(lift_bar.motor_group.motors[2].motor->voltage(vex::voltageUnits::volt)); }, "升2实际电压", "V", monitor_tag_slow},
+        {"lift_m3_Vact", []
+         { return static_cast<float>(lift_bar.motor_group.motors[3].motor->voltage(vex::voltageUnits::volt)); }, "升3实际电压", "V", monitor_tag_slow},
 
         // 手柄摇杆原始值
         {"axis_Lx", type_int32_t, &left_axis.now_x, "左杆X", nullptr, monitor_tag_slow},

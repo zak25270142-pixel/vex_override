@@ -12,6 +12,7 @@ import {
   RIGHT_WIDTH_MIN,
 } from '@/services/persist'
 import {
+  CmdGet,
   FrameParser,
   MONITOR_TAG_FAST,
   MONITOR_TAG_SUB,
@@ -30,6 +31,7 @@ import {
   formatFloat32,
   typeName,
   valueSize,
+  respIsReject,
   respReasonText,
   type CellValue,
   type DirItem,
@@ -65,7 +67,8 @@ export const keyword = ref('')
 /* ===== 通信诊断（让"点了没反应"能定位到具体环节） ===== */
 export interface DiagLog {
   t: string
-  dir: 'TX' | 'RX' | 'EVT' | 'ERR'
+  /** TX=发出的请求 RX=收到的字节 EVT=状态/目录事件 ERR=错误 ACK=固件回执确认 */
+  dir: 'TX' | 'RX' | 'EVT' | 'ERR' | 'ACK'
   text: string
 }
 export const commStats = reactive({
@@ -132,6 +135,62 @@ export function clearDiag(): void {
   commStats.dirFrames = 0
   commStats.valueFrames = 0
   parser.clearStats()
+}
+
+/* ===== 操作提示 toast：固件回执异常的即时提示（原来只进诊断日志，等于没人看） =====
+   两个来源，覆盖两种模式：
+   ① Response 帧非 OK——store 自己解析（直连串口/后端模式都看得到这帧）；
+   ② 后端 op="alert"——补发预算耗尽/无法结算，前端等不到帧，只有后端知道。 */
+export interface UiAlert {
+  id: number
+  level: 'reject' | 'retry' | 'giveup'
+  text: string
+}
+export const uiAlerts = ref<UiAlert[]>([])
+/** toast 自动消失时长：提示是快照不是账本，完整记录在诊断日志里 */
+const ALERT_TTL_MS = 6000
+/** 同屏上限：超出丢最旧，防止固件连续拒绝时糊满屏幕 */
+const ALERT_MAX = 4
+let alertSeq = 0
+
+export function pushAlert(level: UiAlert['level'], text: string): void {
+  const id = ++alertSeq
+  uiAlerts.value.push({ id, level, text })
+  while (uiAlerts.value.length > ALERT_MAX) uiAlerts.value.shift()
+  window.setTimeout(() => {
+    const i = uiAlerts.value.findIndex((a) => a.id === id)
+    if (i >= 0) uiAlerts.value.splice(i, 1)
+  }, ALERT_TTL_MS)
+}
+
+export function dismissAlert(id: number): void {
+  const i = uiAlerts.value.findIndex((a) => a.id === id)
+  if (i >= 0) uiAlerts.value.splice(i, 1)
+}
+
+/* ===== 回显命令字 → 带中文名的描述（诊断/toast 用，与后端 hub._cmd_label 同规则） ===== */
+const BUILTIN_CMD_NAMES: Record<number, string> = {
+  [CmdGet.RequestTunable]: '请求调参目录',
+  [CmdGet.RequestMonitor]: '请求监控目录',
+  [CmdGet.RequestCommand]: '请求命令目录',
+  [CmdGet.Subscribe]: '订阅监控项',
+  [CmdGet.SetTunable]: '写调参项',
+  [CmdGet.Ping]: '心跳',
+}
+
+/** 动作命令名查命令表；SetTunable/Subscribe 的回显首字节是 index，反查参数表项名 */
+function cmdLabel(cmd: number, echo: Uint8Array): string {
+  if (cmd === CmdGet.SetTunable && echo.length > 0) {
+    const item = tunableMap[echo[0]!]
+    if (item) return `写调参项「${item.name}」`
+  }
+  if (cmd === CmdGet.Subscribe && echo.length > 0) {
+    const item = monitorMap[echo[0]!]
+    if (item) return `订阅监控项「${item.name}」`
+  }
+  const c = commandMap[cmd]
+  if (c) return `动作命令「${c.name}」`
+  return BUILTIN_CMD_NAMES[cmd] ?? `命令 0x${cmd.toString(16).padStart(2, '0')}`
 }
 
 /**
@@ -716,12 +775,15 @@ function handleEvent(e: RxEvent): void {
   }
   if (e.kind === 'response') {
     // 通用响应帧（固件回执）：前端只观察——补发/重试在后端待确认表里做。
-    // 拒绝与需补发都进诊断日志，排"命令发了车没动"时看这里
-    const label = `0x${e.echoCmd.toString(16).padStart(2, '0')}`
+    // OK 只记诊断日志（每帧都记会淹没什么都看不出来的关键事件）；
+    // 非 OK（拒绝/需补发）记 ERR 并弹 toast——"命令发了车没动"必须当场看得见
+    const label = cmdLabel(e.echoCmd, e.echoPayload)
     if (e.status === 0x00) {
       pushDiag('ACK', `命令 ${label} 已确认`)
     } else {
-      pushDiag('ACK', `命令 ${label}：${respReasonText(e.status, e.reason)}`)
+      const text = respReasonText(e.status, e.reason)
+      pushDiag('ERR', `命令 ${label}：${text}`)
+      pushAlert(respIsReject(e.status) ? 'reject' : 'retry', `${label}：${text}`)
     }
     return
   }
@@ -820,6 +882,13 @@ serialClient.onData = (data) => {
     pushDiag('RX', `原始字节 ${data.length}B：${toHex(data)}`)
   }
   parser.feed(data, handleEvent)
+}
+// 后端中转模式：固件回执异常（补发预算耗尽/无法结算）。Response 帧本身的
+// 拒绝/补发由 handleEvent 的 response 分支弹（透传字节谁都看得到），这里只补
+// 后端独有的决策结论——前端等不到帧，不推就彻底无声
+serialClient.onAlert = (a) => {
+  pushDiag('ERR', `${a.name}：${a.text}`)
+  pushAlert(a.level, `${a.name}：${a.text}`)
 }
 
 /* ===== 动作：连接 / 演示 ===== */

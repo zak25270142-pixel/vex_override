@@ -13,6 +13,7 @@ Hub 代理层进程内自测（不连真车）：
 from __future__ import annotations
 
 import asyncio
+import json
 import struct
 import time
 from types import SimpleNamespace
@@ -24,7 +25,7 @@ from app.dataclass import (
     MenuItem,
     MonitorSample,
 )
-from app.hub import ACK_MAX_RETRIES, PRI_SCRIPT, PRI_UI, SCRIPT_LEASE_TTL_S, Hub
+from app.hub import ACK_MAX_RETRIES, DIR_MAX_ROUNDS, PRI_SCRIPT, PRI_UI, SCRIPT_LEASE_TTL_S, Hub
 from app.protocol import (
     CmdGet,
     CmdPost,
@@ -33,6 +34,7 @@ from app.protocol import (
     build_response,
     encode_value,
     ping,
+    request_command,
     request_monitor,
     set_tunable,
     subscribe,
@@ -40,7 +42,7 @@ from app.protocol import (
 
 
 class FakeWS:
-    """最小 WebSocket 桩：收集 send_bytes / send_json。"""
+    """最小 WebSocket 桩：收集 send_bytes / send_json / send_text（JSON 文本通道）。"""
 
     def __init__(self) -> None:
         self.sent_bytes: list[bytes] = []
@@ -51,6 +53,10 @@ class FakeWS:
 
     async def send_json(self, obj: dict) -> None:
         self.sent_json.append(obj)
+
+    async def send_text(self, text: str) -> None:
+        # _broadcast_json 走文本通道（status/alert）：解成 dict 与 send_json 同箱收集
+        self.sent_json.append(json.loads(text))
 
 
 def make_dir_frame(cmd: int, index: int, name: str, unit: str, value: float) -> bytes:
@@ -104,7 +110,7 @@ def feed_echo(hub: Hub, type_: int, index: int, value: float) -> None:
 
 
 def feed_response(hub: Hub, echo_cmd: int, echo_payload: bytes = b"",
-                  status: int = 0x00, reason: str = "") -> None:
+                  status: int = 0x00, reason: bytes = b"") -> None:
     """经 _on_frame 喂一帧 Response（与真实链路同一入口）。"""
     f = build_response(echo_cmd, echo_payload, status, reason)
     hub._on_frame(f[1], f[2:-1])
@@ -176,6 +182,58 @@ def main() -> None:
     feed_dir(hub, f0)
     feed_dir(hub, f1)
     print("[ok] 主动拉表清表（含名字反查）")
+
+    # --- 2.3 目录丢帧自愈：OK 带总项数 → 对照出缺失项 → 自动补发（不清表） ---
+    hub._request_dir(hub.monitor_dir, hub._name_to_mon, request_monitor())
+    assert drain_tx(hub) == [request_monitor()], "全量请求（len=0）应入队"
+    f2 = make_monitor_dir_frame(2, "z", "rad", 0.0)
+    feed_dir(hub, f0)
+    feed_dir(hub, f1)  # #2 丢失：旧行为里静默缺项，主机无从察觉
+    feed_response(hub, CmdGet.RequestMonitor, b"\x00", 0x00, b"\x03")  # OK+count=3
+    sent = drain_tx(hub)
+    assert sent == [request_monitor([2])], f"应自动补发缺失的 #2: {[s.hex() for s in sent]}"
+    assert len(hub.monitor_dir) == 2, "补发不清表：已收两项要留着"
+    assert hub._dir_rounds[CmdGet.RequestMonitor] == 1
+    # 补齐帧到达后再来 OK+count=3：无缺失，不再补发、轮次清零
+    # （回显要对上补发请求的 payload [len=1][idx=2]，不是全量请求的 [0x00]）
+    feed_dir(hub, f2)
+    feed_response(hub, CmdGet.RequestMonitor, b"\x01\x02", 0x00, b"\x03")
+    assert drain_tx(hub) == [], "补齐后不应再补发"
+    assert CmdGet.RequestMonitor not in hub._dir_rounds, "齐了应清轮次"
+    print("[ok] 目录丢帧对照补发（OK+count → 缺项 → 部分补发 → 齐活）")
+
+    # --- 2.3b 命令目录同样对照补发：cmd_dir 按命令字(0x80+)寻键，补发帧按表下标 ---
+    hub._request_dir(hub.cmd_dir, hub._name_to_cmd, request_command())
+    assert drain_tx(hub) == [request_command()]
+    # 命令目录帧到达（[内容长度2B][命令字][tag][名长][名][参数量0]），按命令字入库
+    name = "停车".encode()
+    content = bytes([0x80, 0x00, len(name)]) + name + bytes([0])
+    hub._on_frame(CmdPost.CMDDirectory, len(content).to_bytes(2, "little") + content)
+    assert 0x80 in hub.cmd_dir, "命令目录帧应按命令字入库"
+    feed_response(hub, CmdGet.RequestCommand, b"\x00", 0x00, bytes([3]))  # 表3项，只到1项
+    sent = drain_tx(hub)
+    assert sent == [request_command([1, 2])], f"命令目录应按表下标补发缺失两项: {[s.hex() for s in sent]}"
+    hub.cmd_dir.clear()
+    hub._name_to_cmd.clear()
+    print("[ok] 命令目录对照补发（命令字寻键 / 表下标寻址的基准换算）")
+
+    # --- 2.4 缺项超上限改全量重拉；外循环轮次有上限，不会滚雪球 ---
+    hub._request_dir(hub.monitor_dir, hub._name_to_mon, request_monitor())
+    drain_tx(hub)
+    feed_response(hub, CmdGet.RequestMonitor, b"\x00", 0x00, bytes([20]))  # 表20项，一项都没到
+    assert drain_tx(hub) == [request_monitor()], "缺17项超补发上限，应全量重拉（清表重启）"
+    for _ in range(DIR_MAX_ROUNDS - 1):  # 第2、3轮：仍全缺，继续重拉
+        feed_response(hub, CmdGet.RequestMonitor, b"\x00", 0x00, bytes([20]))
+        assert drain_tx(hub) == [request_monitor()]
+    feed_response(hub, CmdGet.RequestMonitor, b"\x00", 0x00, bytes([20]))  # 第4轮：放弃
+    assert drain_tx(hub) == [], "超过轮次上限应放弃，不再发帧（防滚雪球）"
+    assert CmdGet.RequestMonitor not in hub._dir_rounds, "放弃后清轮次"
+    # 还原成两张表，后续用例依赖
+    feed_dir(hub, f0)
+    feed_dir(hub, f1)
+    # 上面的对照喂了好几个 OK 响应：ACK 记账用例（第6节）按绝对值断言，这里把计数归零
+    hub.ack_ok = hub.ack_retry = hub.ack_reject = hub.ack_timeout = hub.ack_unexpected = 0
+    print("[ok] 缺项超上限全量重拉 + 补发轮次上限")
 
     # --- 3. Subscribe 聚合：UI 低速 + 脚本高速 → 有效高速；UI 断开 → 保留脚本意图 ---
     drain_tx(hub)
@@ -499,11 +557,11 @@ def main() -> None:
     # --- 6. Response 确认与补发（下行帧 → 固件回执 → 待确认表结算）---
     hub._pending_acks.clear()
 
-    # 6.1 入队即登记；OK 响应清除待确认
+    # 6.1 入队即登记；OK 响应清除待确认（回显对上原请求 payload [len=0]；无 info=纯 OK）
     hub._send_tracked(request_monitor(), PRI_UI)
     assert CmdGet.RequestMonitor in hub._pending_acks, "入队即登记待确认"
     assert drain_tx(hub) == [request_monitor()]
-    feed_response(hub, CmdGet.RequestMonitor)
+    feed_response(hub, CmdGet.RequestMonitor, b"\x00")
     assert CmdGet.RequestMonitor not in hub._pending_acks, "OK 响应应清除待确认"
     assert hub.ack_ok == 1
     print("[ok] Response OK 结算清除待确认")
@@ -568,6 +626,59 @@ def main() -> None:
     assert 0x82 in hub._pending_acks, "坏响应不应弄丢待确认帧"
     assert hub.ack_unexpected == 3, hub.ack_unexpected
     print("[ok] 意外/坏响应只记录不崩溃")
+
+    # 6.7 前端看不出来的结局 → 推 WS alert（op="alert"）让前端弹提示
+    fake = FakeWS()
+    hub._ws_clients.add(fake)
+    loop = hub._loop
+
+    def drain_alerts() -> list[dict]:
+        """_broadcast_json 经 run_coroutine_threadsafe 排在 loop 上，跑一拍收下来"""
+        loop.run_until_complete(asyncio.sleep(0.02))
+        out = [m for m in fake.sent_json if m.get("op") == "alert"]
+        fake.sent_json.clear()
+        return out
+
+    # 拒绝/正在补发不推 alert——那两帧前端自己解析透传字节就能看到，双弹反而吵
+    hub._pending_acks.clear()
+    hub._send_tracked(subscribe(0, True, False), PRI_UI)
+    drain_tx(hub)
+    feed_response(hub, CmdGet.Subscribe, bytes([0, 0x80]), 0xC3)  # 拒绝·忙
+    assert drain_alerts() == [], "拒绝不应推 alert（前端自己看得到这帧）"
+
+    # 需补发但无待确认帧可发 → giveup，且解析得出具体项名（回显首字节=index 0="x"）
+    feed_response(hub, CmdGet.Subscribe, bytes([0, 0x80]), 0x41)  # 需补发·校验失败，表里没有
+    alerts = drain_alerts()
+    assert len(alerts) == 1 and alerts[0]["level"] == "giveup", alerts
+    assert alerts[0]["cmd"] == CmdGet.Subscribe, alerts
+    assert alerts[0]["name"] == "订阅监控项「x」", alerts
+    assert "需补发但无原帧可重发" in alerts[0]["text"], alerts
+
+    # 超时预算耗尽 → giveup，带动作命令中文名（0x82="mk"）；重发帧照常入队
+    mv = build_frame(0x82, struct.pack("<f", 3.0))
+    hub._send_tracked(mv, PRI_SCRIPT)
+    drain_tx(hub)
+    for _ in range(ACK_MAX_RETRIES + 1):
+        hub._pending_acks[0x82].deadline = time.monotonic() - 1
+        hub._sweep_acks()
+        drain_tx(hub)
+    alerts = drain_alerts()
+    assert len(alerts) == 1 and alerts[0]["level"] == "giveup", alerts
+    assert alerts[0]["cmd"] == 0x82 and alerts[0]["name"] == "动作命令「mk」", alerts
+    assert "已放弃" in alerts[0]["text"], alerts
+
+    # 响应帧一致性失败（回显长度与目录对不上）→ giveup，名从回显 index 解析（7="kp"）
+    hub._pending_acks.clear()
+    hub._send_tracked(set_tunable(7, ValueType.Float, 1.5), PRI_SCRIPT)
+    drain_tx(hub)
+    bad = build_response(CmdGet.SetTunable, b"\x07\x00\x00\x00\x00", 0xC1)  # 回显5B，原帧说9B
+    hub._on_frame(bad[1], bad[2:-1])
+    alerts = drain_alerts()
+    assert len(alerts) == 1 and alerts[0]["level"] == "giveup", alerts
+    assert alerts[0]["name"] == "写调参项「kp」", alerts
+    assert "一致性校验失败" in alerts[0]["text"], alerts
+    print("[ok] giveup 结局推 WS alert（带命令中文名；拒绝/补发不双弹）")
+    hub._ws_clients.discard(fake)
 
     # --- 7. 脚本写权租约：一次只允许一个脚本写 ---
     hub._lease_token = None

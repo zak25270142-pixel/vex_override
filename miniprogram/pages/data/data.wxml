@@ -1,0 +1,88 @@
+<!-- 数据表页：监控表 / 调参表同页分段（两者结构相近，共用一套行交互）
+     顶栏常驻：连接状态 + 停车按钮（安全最高优先级） -->
+<view class="page">
+
+  <!-- 顶栏 -->
+  <view class="topbar">
+    <view class="conn">
+      <view class="dot dot-{{conn.dot}}"></view>
+      <text class="conn-label">{{conn.label}}</text>
+      <text class="conn-msg">{{conn.msg}}</text>
+    </view>
+    <view class="btn btn-danger stop-btn {{stopReady ? '' : 'btn-dim'}}" bindtap="onStop">停 车</view>
+  </view>
+
+  <!-- toast 区 -->
+  <view class="toasts" wx:if="{{toasts.length}}">
+    <view wx:for="{{toasts}}" wx:key="at" class="toast toast-{{item.level}}">{{item.text}}</view>
+  </view>
+
+  <!-- 分段切换 + 搜索 -->
+  <view class="toolbar">
+    <view class="seg">
+      <view class="seg-item {{tab === 'monitor' ? 'seg-on' : ''}}" bindtap="onSwitchTab" data-t="monitor">监控表</view>
+      <view class="seg-item {{tab === 'tunable' ? 'seg-on' : ''}}" bindtap="onSwitchTab" data-t="tunable">调参表</view>
+    </view>
+    <input class="search" placeholder="搜索名称 / 序号" value="{{keyword}}" bindinput="onKeyword" confirm-type="search" />
+  </view>
+
+  <!-- 监控表 -->
+  <block wx:if="{{tab === 'monitor'}}">
+    <view wx:if="{{!monitorRows.length}}" class="empty">暂无监控项{{conn.dot === 'connected' ? '' : '（未连接或目录未到）'}}</view>
+    <view class="row-card mon-row" wx:for="{{monitorRows}}" wx:key="index"
+          bindtap="onMonitorTap" data-index="{{item.index}}">
+      <view class="mon-main">
+        <text class="mon-name">{{item.name}}</text>
+        <text class="badge badge-{{item.tagClass}}">{{item.tagText}}</text>
+      </view>
+      <view class="mon-val {{item.stale ? 'stale' : ''}}">
+        <text class="num">{{item.text}}</text>
+        <text class="unit" wx:if="{{item.unit}}">{{item.unit}}</text>
+      </view>
+    </view>
+  </block>
+
+  <!-- 调参表 -->
+  <block wx:elif="{{tab === 'tunable'}}">
+    <view wx:if="{{!tunableRows.length}}" class="empty">暂无调参项{{conn.dot === 'connected' ? '' : '（未连接或目录未到）'}}</view>
+    <view class="row-card tun-row" wx:for="{{tunableRows}}" wx:key="index"
+          bindtap="onTunableTap" data-index="{{item.index}}">
+      <view class="mon-main">
+        <text class="mon-name">{{item.name}}</text>
+        <text class="type-tag">{{item.typeText}}</text>
+      </view>
+      <view class="mon-val {{item.pending ? 'stale' : ''}}">
+        <text class="num num-sm">{{item.text}}</text>
+        <text class="unit" wx:if="{{item.unit}}">{{item.unit}}</text>
+      </view>
+    </view>
+  </block>
+
+  <!-- 底部留白（避开 tabBar） -->
+  <view class="bottom-gap"></view>
+
+  <!-- 调参编辑弹层 -->
+  <view class="mask" wx:if="{{edit.show}}" bindtap="onCloseEdit">
+    <view class="dialog" catchtap="noop">
+      <view class="dlg-title">调参 · {{edit.name}}</view>
+      <view class="dlg-sub">序号 {{edit.index}} · 类型 {{edit.typeText}}<text wx:if="{{edit.unit}}"> · 单位 {{edit.unit}}</text></view>
+
+      <block wx:if="{{edit.kind === 'bool'}}">
+        <view class="dlg-row">
+          <text class="dlg-label">开关</text>
+          <switch checked="{{edit.boolValue}}" bindchange="onEditSwitch" color="#2b6cb0" />
+        </view>
+      </block>
+      <block wx:else>
+        <input class="dlg-input" type="text" value="{{edit.input}}" bindinput="onEditInput"
+               placeholder="输入新值" confirm-type="done" />
+        <view class="dlg-hint" wx:if="{{edit.kind === 'color'}}">格式 #RRGGBB，如 #ff0000</view>
+      </block>
+
+      <view class="dlg-btns">
+        <view class="btn btn-plain" bindtap="onCloseEdit">取消</view>
+        <view class="btn btn-primary" bindtap="onSubmitEdit">下发</view>
+      </view>
+    </view>
+  </view>
+</view>

@@ -1,9 +1,10 @@
 <template>
-  <!-- 右侧工作区：标签导航 + 底部 Dock。
+  <!-- 右侧工作区：标签导航 + 底部 Dock + 常驻停车条。
        标签顺序：[该页独有上下文] 任务下发 调参 实参；空间不够自动换行。
        详情页只在「调参表+调参标签」「实参表+实参标签」这组特化组合下出现，
        其余组合（调参表的实参标签 / 实参表的调参标签 / 场地图的调参实参）一律是迷你列表。
-       底部 Dock：仅在非 params 页且当前标签为调参/实参时出现。 -->
+       底部 Dock：仅在非 params 页且当前标签为调参/实参时出现。
+       常驻停车条：所有标签/所有视图都在最底部（右下角），不随任务下发分页消失。 -->
   <aside class="right-work">
     <nav class="right-work__tabs">
       <button
@@ -51,6 +52,22 @@
       <TunableCard v-if="selectedTunableIndex !== null" />
       <MonitorCard v-else-if="selectedMonitorIndex !== null" />
     </div>
+
+    <!-- 常驻停车条：贴最底部、占满整行；有停车命令才出现（v-if），出现即所有标签/视图常驻。
+         文案用下位机命令目录里的中文名，不硬编码；目录里登记了多条停车特化命令时
+         flex 平分各占 1/x，截断不溢出，全名看 hover -->
+    <div v-if="stopCmds.length" class="right-work__stop">
+      <button
+        v-for="c in stopCmds"
+        :key="c.index"
+        class="stop-btn"
+        :disabled="!connected"
+        :title="c.name"
+        @click="onStop(c)"
+      >
+        {{ c.name }}
+      </button>
+    </div>
   </aside>
 </template>
 
@@ -64,12 +81,16 @@ import MonitorMiniList from '@/components/params/MonitorMiniList.vue'
 import MonitorDetail from '@/components/params/MonitorDetail.vue'
 import TunableCard from '@/components/params/TunableCard.vue'
 import MonitorCard from '@/components/params/MonitorCard.vue'
+import { CmdSpec, cmdSpec, type CmdDirItem } from '@/services/protocol'
 import {
+  commandMap,
+  connected,
   focusCh,
   paramTable,
   rightTab,
   selectedMonitorIndex,
   selectedTunableIndex,
+  sendCommand,
   view,
   type RightTab,
 } from '@/stores/globle'
@@ -140,6 +161,21 @@ const showDock = computed(
     (activeTab.value === 'tunable' || activeTab.value === 'monitor') &&
     (selectedTunableIndex.value !== null || selectedMonitorIndex.value !== null),
 )
+
+/** 停车类特化命令（tag SPEC=Stop）：下位机命令目录里可能登记多条（不同机构各自停车），
+    按命令字排序。按钮文案直接用目录里的中文名——不硬编码，固件改名即跟随；
+    目录未到/固件没登记时整条不渲染（v-if），不放一个按了没反应的假按钮 */
+const stopCmds = computed<CmdDirItem[]>(() =>
+  Object.values(commandMap)
+    .filter((c) => cmdSpec(c.tag) === CmdSpec.Stop)
+    .sort((a, b) => a.index - b.index),
+)
+
+/** 一键停车：直发对应的停车特化命令（无参）；不依赖任何标签页的选中项 */
+async function onStop(cmd: CmdDirItem): Promise<void> {
+  if (!connected.value) return
+  await sendCommand(cmd.index, [])
+}
 </script>
 
 <style scoped>
@@ -220,5 +256,51 @@ const showDock = computed(
   flex: 0 0 30%;
   min-height: 140px;
   max-height: 30%;
+}
+
+/* 常驻停车条：贴最底部、占满整行；有停车命令才渲染（v-if） */
+.right-work__stop {
+  flex-shrink: 0;
+  padding: 12px 14px;
+  background: var(--surface-floating);
+  border: var(--border-panel);
+  border-radius: var(--radius);
+  display: flex;
+  gap: 8px;
+}
+
+.stop-btn {
+  /* 一条时占满整行，多条时各占 1/x。min-width:0 是 flex 允许压缩的前提，
+     配下面的截断三件套：字可以被截短，但不许溢出按钮，全名看 hover title */
+  flex: 1 1 0;
+  min-width: 0;
+  height: 34px;
+  font-size: 15px;
+  font-family: inherit;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #fff;
+  background: var(--status-danger);
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  box-shadow: var(--glow-danger);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.stop-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* hover 红→深红（同色系加深一档）：全局 button:hover 的背景是 --surface-hover
+   （10% 半透明青），叠在纯红底上会发浑；这里显式覆写成 --danger-deep 实底，
+   发光仍用 danger 红。resting 态的亮红是急停语义，不动 */
+.stop-btn:not(:disabled):hover {
+  background: var(--danger-deep);
+  box-shadow: var(--glow-danger);
 }
 </style>

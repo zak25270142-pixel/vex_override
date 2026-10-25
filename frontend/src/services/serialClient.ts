@@ -44,6 +44,8 @@ class SerialClient {
   onStatus: TransportCallbacks['onStatus'] | null = null
   /** 由 store 注册：收到原始字节回调 */
   onData: TransportCallbacks['onData'] | null = null
+  /** 由 store 注册：后端推来的固件回执异常（仅后端中转模式会收到） */
+  onAlert: TransportCallbacks['onAlert'] | null = null
 
   state: ConnState = 'idle'
   private transport: SerialTransport | null = null
@@ -129,6 +131,7 @@ class SerialClient {
       }
     },
     onData: (data) => this.onData?.(data),
+    onAlert: (alert) => this.onAlert?.(alert),
   }
 
   /** 应用启动：按持久化接入方式预选传输（直连串口预选已授权设备，后端模式无需选口） */

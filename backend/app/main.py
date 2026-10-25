@@ -34,15 +34,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vex.main")
 
-# 三个环境变量都只在启动时读一次，运行中改无效
+# 环境变量都只在启动时读一次，运行中改无效
 V5_PORT = os.environ.get("V5_PORT")  # 例如 COM3 / /dev/ttyACM0；不设则 Ping 探测
 V5_BAUD = int(os.environ.get("V5_BAUD", "115200"))  # CDC 虚拟口，波特率仅占位（USB 全速跑）
 AUTO_CONNECT = os.environ.get("V5_AUTO_CONNECT", "1") not in ("0", "false", "False")
+# 演示模式：没有真车/真固件时，用 mock_v5.MockV5Bridge 顶替串口后面的那台 V5。
+# 小程序/网页连 WS 的行为与真机完全一致（目录 burst、100Hz 推送、回执、心跳），
+# 区别只在数据是本地模拟的
+V5_MOCK = os.environ.get("V5_MOCK", "0") in ("1", "true", "True")
 
 # hub 是模块级单例：整个进程只有一个，所有路由共享同一份目录缓存和下行队列。
 # 这也是"串口独占"的落点——别在别处再 new 一个 Hub。
 
-hub = Hub(port=V5_PORT, baud=V5_BAUD)
+_bridge_factory = None
+if V5_MOCK:
+    from .mock_v5 import MockV5Bridge
+
+    _bridge_factory = MockV5Bridge
+
+hub = Hub(port=V5_PORT, baud=V5_BAUD, bridge_factory=_bridge_factory)
 
 
 @asynccontextmanager
@@ -56,7 +66,13 @@ async def lifespan(app: FastAPI):
     # 投回这个循环里执行（线程里不能 await）。必须在 start() 之前注入，
     # 否则首批串口事件推不出去。
     hub.set_loop(asyncio_get_loop())
-    logger.info("启动 Hub, port=%s baud=%s auto=%s", V5_PORT or "自动探测", V5_BAUD, AUTO_CONNECT)
+    logger.info(
+        "启动 Hub, port=%s baud=%s auto=%s mock=%s",
+        V5_PORT or "自动探测",
+        V5_BAUD,
+        AUTO_CONNECT,
+        V5_MOCK,
+    )
     hub.start(auto_connect=AUTO_CONNECT)
     try:
         yield
@@ -399,7 +415,8 @@ def api_values():
     要判新鲜度请用 /api/value，它带 lag_ms（主判据）/age_s（诊断）。
     """
     out = []
-    for idx, s in hub.monitor_latest.items():
+    # list() 快照：本路由在线程池里跑，rx 线程 100Hz 在往 monitor_latest 里写（R1）
+    for idx, s in list(hub.monitor_latest.items()):
         entry = hub.monitor_dir.get(idx)
         out.append(
             ValueSnapshot(

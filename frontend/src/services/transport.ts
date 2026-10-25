@@ -2,11 +2,30 @@
 
 export type ConnState = 'idle' | 'connecting' | 'connected' | 'error'
 
+/**
+ * 后端 WS 推送的固件回执异常（文本 JSON，op="alert"）。
+ * 只在"后端中转"模式下出现：直连串口时 Response 帧的意义由 store 自己解析
+ * （见 globle.ts 的 response 分支），没有这层消息。level 与 toast 档位一致：
+ *   reject 固件明确拒绝（命令没执行） / retry 帧没成正在自动重发 /
+ *   giveup 重试预算耗尽或无法结算（命令状态不明，该查链路）
+ */
+export interface FwAlert {
+  level: 'reject' | 'retry' | 'giveup'
+  /** 回显的命令字（动作命令 0x80~0x9F 或内置命令字） */
+  cmd: number
+  /** 命令中文名描述，如 动作命令「直行」 */
+  name: string
+  /** 结局说明，如 补发 3 次仍无固件确认，已放弃 */
+  text: string
+}
+
 export interface TransportCallbacks {
   /** 连接状态变化（含人类可读的说明文本） */
   onStatus: (state: ConnState, message: string) => void
   /** 收到原始字节块（可能含半帧/粘包，由协议层 FrameParser 消化） */
   onData: (data: Uint8Array) => void
+  /** 后端推来的固件回执异常（仅后端中转模式；直连串口无此消息） */
+  onAlert?: (alert: FwAlert) => void
 }
 
 /**

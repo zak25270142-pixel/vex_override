@@ -362,6 +362,10 @@ const verdict = computed(() => {
   color: var(--status-waiting);
 }
 
+.log__dir--ACK {
+  color: var(--accent-muted);
+}
+
 .log__dir--ERR {
   color: var(--status-danger);
 }

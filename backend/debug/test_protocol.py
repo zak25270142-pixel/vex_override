@@ -13,6 +13,7 @@ from app.protocol import (
     CmdGet,
     CmdPost,
     MAX_PAYLOAD,
+    REQ_LIST_MAX,
     ValueType,
     FrameParser,
     build_response,
@@ -21,7 +22,9 @@ from app.protocol import (
     encode_value,
     is_ack_tracked,
     ping,
+    request_command,
     request_monitor,
+    request_tunable,
     resp_is_ok,
     resp_is_reject,
     resp_is_retry,
@@ -170,6 +173,27 @@ def test_parser_directory_framing():
     assert frames == [(CmdPost.MonitorDirectory, f[2:-1]), (CmdPost.Pong, b"")], frames
 
 
+def _str_dir_frame(index: int, name: str) -> bytes:
+    """str 目录项：[index][type=10][tag][名长][名][单位长0]——值宽0，帧到单位段即止"""
+    nb = name.encode("utf-8")
+    payload = bytes([index, 10, 0, len(nb)]) + nb + bytes([0])
+    return _frame(CmdPost.MonitorDirectory, payload)
+
+
+def test_parser_directory_str_zero_width():
+    """str/other 目录项也发（值宽0）：帧长试算走到单位段即止，不能把后续帧的字节当值吞。"""
+    frames: list[tuple[int, bytes]] = []
+    p = FrameParser()
+    f = _str_dir_frame(5, "模式名")
+    p.feed(f + ping(), _rec(frames))
+    assert frames == [(CmdPost.MonitorDirectory, f[2:-1]), (CmdPost.Pong, b"")], frames
+    frames.clear()
+    p.feed(f[:7], _rec(frames))  # 半帧
+    assert frames == []
+    p.feed(f[7:], _rec(frames))
+    assert frames == [(CmdPost.MonitorDirectory, f[2:-1])], frames
+
+
 def test_parser_cmd_directory_framing():
     """命令目录头 2B 即内容长度：收够 2B 定长，无需遍历字段走查。"""
     frames: list[tuple[int, bytes]] = []
@@ -225,7 +249,7 @@ def test_max_payload_constant():
 
 
 def test_build_response_roundtrip():
-    """组帧→解帧往返：payloadlen/回显/status/原因串都对得上。"""
+    """组帧→解帧往返：payloadlen/回显/status/尾字节都对得上。"""
     echo = bytes([0x82, 1, 2])  # 动作命令字 + 2B 回显payload
     f = build_response(0x82, echo, 0x00)
     assert f[0] == 0xA5 and f[1] == CmdPost.Response
@@ -233,7 +257,7 @@ def test_build_response_roundtrip():
     frames: list[tuple[int, bytes]] = []
     FrameParser().feed(f, _rec(frames))
     assert frames == [(CmdPost.Response, f[2:-1])], frames
-    assert decode_response(f[2:-1], 3) == (0x82, echo, 0x00, "")
+    assert decode_response(f[2:-1], 3) == (0x82, echo, 0x00, b"")
 
 
 def test_parser_response_framing():
@@ -265,15 +289,43 @@ def test_decode_response_consistency():
     """一致性校验：payloadlen 必须 = 2 + 回显长 + 串长；对不上返回 None（不猜）。"""
     echo = bytes([1, 2, 3])
     f = build_response(0x82, echo, 0x00)
-    assert decode_response(f[2:-1], 3) == (0x82, echo, 0x00, "")
+    assert decode_response(f[2:-1], 3) == (0x82, echo, 0x00, b"")
     assert decode_response(f[2:-1], 2) is None, "回显长度猜错：status 落错位置"
     assert decode_response(f[2:-1], 4) is None
     # 串模式：长度取低6位（"忙" 3B UTF-8 → status 0x83 = 拒绝+串长3）
-    f2 = build_response(0x82, echo, 0x83, "忙")
-    assert decode_response(f2[2:-1], 3) == (0x82, echo, 0x83, "忙")
+    f2 = build_response(0x82, echo, 0x83, "忙".encode())
+    assert decode_response(f2[2:-1], 3) == (0x82, echo, 0x83, "忙".encode())
     # 内定err模式：不带原因串（0xC3 = 拒绝·忙）
     f3 = build_response(0x82, echo, 0xC3)
-    assert decode_response(f3[2:-1], 3) == (0x82, echo, 0xC3, "")
+    assert decode_response(f3[2:-1], 3) == (0x82, echo, 0xC3, b"")
+
+
+def test_response_ok_info():
+    """OK+info：0x00 后跟二进制附加信息（目录项数），长度隐式=帧长剩余，不按 UTF-8 解。"""
+    echo = bytes([0x00])  # 全量目录请求的回显就是 [len=0]
+    f = build_response(CmdGet.RequestMonitor, echo, 0x00, b"\x05")
+    assert decode_response(f[2:-1], 1) == (CmdGet.RequestMonitor, echo, 0x00, b"\x05")
+    # 纯 OK（无 info）：尾字节为空
+    f2 = build_response(0x82, b"", 0x00)
+    assert decode_response(f2[2:-1], 0) == (0x82, b"", 0x00, b"")
+    # info 是二进制：0xFF 之流不能当 UTF-8 解坏
+    f3 = build_response(CmdGet.RequestTunable, echo, 0x00, b"\xff")
+    assert decode_response(f3[2:-1], 1)[3] == b"\xff"
+
+
+def test_request_dir_indices():
+    """目录请求 [len][index...]：len=0 全量；非0=补发指定下标；超上限抛错。"""
+    f = request_monitor()
+    assert list(f) == [0xA5, 0x01, 0x00, 0x01], "全量=[A5][cmd][len=0][XOR]"
+    f2 = request_monitor([3, 7])
+    assert list(f2) == [0xA5, 0x01, 0x02, 0x03, 0x07, 0x01 ^ 0x02 ^ 0x03 ^ 0x07]
+    f3 = request_command([0x80])
+    assert list(f3) == [0xA5, 0x04, 0x01, 0x80, 0x04 ^ 0x01 ^ 0x80]
+    try:
+        request_tunable(list(range(REQ_LIST_MAX + 1)))
+        raise AssertionError("补发列表超上限应抛错（让调用方改全量）")
+    except ValueError as e:
+        assert "全量" in str(e)
 
 
 def test_response_status_helpers():
@@ -281,10 +333,12 @@ def test_response_status_helpers():
     assert resp_is_ok(0x00) and not resp_is_ok(0x01)
     assert resp_is_retry(0x01) and resp_is_retry(0x41) and not resp_is_retry(0x00)
     assert resp_is_reject(0x80) and resp_is_reject(0xC3) and not resp_is_reject(0x40)
-    assert resp_str_len(0x00) == 0 and resp_str_len(0x83) == 3 and resp_str_len(0xC3) == 0
-    assert resp_reason_text(0x41, "") == "Checksum(内定err#1)"
-    assert resp_reason_text(0xC3, "") == "Busy(内定err#3)"
-    assert resp_reason_text(0x83, "下标超表") == "下标超表"
+    assert resp_str_len(0x00) == -1, "OK 的尾字节长度隐式（哨兵-1，由帧长反推）"
+    assert resp_str_len(0x83) == 3 and resp_str_len(0xC3) == 0
+    assert resp_reason_text(0x41, b"") == "Checksum(内定err#1)"
+    assert resp_reason_text(0xC3, b"") == "Busy(内定err#3)"
+    assert resp_reason_text(0x83, "下标超表".encode()) == "下标超表"
+    assert resp_reason_text(0x00, b"\x05") == "OK", "info 不进 reason_text，由调用方按 cmd 解释"
 
 
 def test_is_ack_tracked():
@@ -298,7 +352,7 @@ def test_is_ack_tracked():
 
 def test_request_monitor():
     f = request_monitor()
-    assert f[0] == 0xA5 and f[1] == 0x01 and f[2] == 0x01
+    assert f[0] == 0xA5 and f[1] == 0x01 and f[2] == 0x00 and f[3] == 0x01  # [len=0] 全量
 
 
 if __name__ == "__main__":
@@ -313,6 +367,7 @@ if __name__ == "__main__":
     test_parser_echo_type_prefix()
     test_parser_echo_bad_type_resyncs()
     test_parser_directory_framing()
+    test_parser_directory_str_zero_width()
     test_parser_cmd_directory_framing()
     test_parser_unknown_cmd_resyncs()
     test_parser_overflow_resyncs()
@@ -322,6 +377,8 @@ if __name__ == "__main__":
     test_parser_response_framing()
     test_parser_response_short_len_resyncs()
     test_decode_response_consistency()
+    test_response_ok_info()
+    test_request_dir_indices()
     test_response_status_helpers()
     test_is_ack_tracked()
     test_request_monitor()

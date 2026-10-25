@@ -73,11 +73,6 @@
           </template>
         </template>
       </div>
-
-      <!-- 底部常驻停车条：不走表单，选中任何命令时都可用 -->
-      <div class="cmd-panel__footer">
-        <button class="stop-btn" :disabled="!connected" @click="onStop">停 车</button>
-      </div>
     </div>
   </aside>
 </template>
@@ -160,15 +155,7 @@ async function onSend(): Promise<void> {
   })
   await sendCommand(sel.value.index, values)
 }
-
-/** 一键停车：按目录 tag 的特化位找停车命令直发（无参），不依赖表单当前选中项 */
-async function onStop(): Promise<void> {
-  if (!connected.value) return
-  const stop = Object.values(commandMap).find((c) => cmdSpec(c.tag) === CmdSpec.Stop)
-  if (stop) await sendCommand(stop.index, [])
-}
 </script>
-
 <style scoped>
 .cmd-panel {
   height: 100%;
@@ -207,7 +194,7 @@ async function onStop(): Promise<void> {
   flex-direction: column;
 }
 
-/* 表单滚动区：内容多时自己滚，不把底部停车条顶出去 */
+/* 表单滚动区：内容多时自己滚（停车条已提到右工作区常驻底栏，见 RightWorkbench） */
 .cmd-panel__form {
   flex: 1;
   min-height: 0;
@@ -216,35 +203,6 @@ async function onStop(): Promise<void> {
   display: flex;
   flex-direction: column;
   gap: 14px;
-}
-
-.cmd-panel__footer {
-  flex-shrink: 0;
-  padding: 12px 14px;
-  border-top: var(--border-panel);
-  display: flex;
-  justify-content: flex-end;
-}
-
-.stop-btn {
-  height: 40px;
-  min-width: 104px;
-  font-size: 15px;
-  font-family: inherit;
-  font-weight: 700;
-  letter-spacing: 2px;
-  color: #fff;
-  background: var(--status-danger);
-  border: none;
-  border-radius: var(--radius);
-  cursor: pointer;
-  box-shadow: var(--glow-danger);
-}
-
-.stop-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-  box-shadow: none;
 }
 
 .empty {

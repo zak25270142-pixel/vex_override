@@ -11,9 +11,10 @@ uint16_t USB_Comm::cmd_payload_len(uint8_t cmd)
 {
     switch (cmd)
     {
-    case Request_Tunable: // 目录请求都只是"我要"一个信号，不带数据
+    case Request_Tunable: // 目录请求带1B长度前缀（[len][index...]），长度运行时才知
     case Request_Monitor:
     case Request_Command:
+        return CMD_LEN_PREFIX;
     case Ping:
         return 0;
     case Subscribe:
@@ -173,32 +174,24 @@ void USB_Comm::send_frame(uint8_t cmd, uint16_t len)
         write(usb_fd, tx_frame, len + 3); // /dev/serial1原始通道直出，无CRLF翻译
 }
 
-// 发目录的一批：只发原数组下标 [batch*DIR_BATCH, +DIR_BATCH) 这连续几项，一项一帧。
+// 发目录的一批共n项，一项一帧：idx=nullptr时按表内下标[off, off+n)连续取（全量拉取）；
+// 非空时按idx[off..off+n)寻址（补发，下标在请求时已校验）。str/other照发（值宽0，
+// 帧到单位段即止）：index空间必须稠密，上位机才能拿OK里的总项数对照出缺失的是哪几项。
 // 目录由tx_tick分多个10ms拍发完，避免一次性write几百项时长时间占用发送任务。
-// 参数cmd决定这些帧标成"可调目录"还是"监控目录"，复用同一套拼帧逻辑。
 // 直接在成员tx_frame里拼帧，不再用临时payload数组中转，省一次栈空间和拷贝：
 //   [A5][Cmd]由send_frame补，
 //   [index][类型][tag][名字长度][名字][单位长度][单位][当前值]在这里写
-void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, uint8_t batch)
+void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, const uint8_t *idx,
+                              uint8_t off, uint8_t n)
 {
-    uint8_t start = batch * DIR_BATCH;
-    if (start >= count)
-        return; // 批次超界（正常不会发生，倒计时保证batch取0~总批数-1），容错直接返回
-    // 本批实际发几项：剩余不足一批时发完为止。用"剩余数"限幅而不用start+8，
-    // 因为255项满载最后一批start=248，start+8=256会撑爆uint8回0
-    uint8_t n = count - start;
-    if (n > DIR_BATCH)
-        n = DIR_BATCH;
-
     for (uint8_t k = 0; k < n; k++)
     {
-        uint8_t i = start + k; // start+k最大255，不会溢出
+        uint8_t i = idx != nullptr ? idx[off + k] : off + k; // 补发按列表寻址，全量按连续区间
+        if (i >= count)
+            continue; // 越界容错（请求时已校验，正常不会发生）
         const MENU_ITEM &item = items[i];
 
-        if (item.data_type == type_str || item.data_type == type_other)
-            continue;
-
-        uint8_t vlen = value_size(item.data_type);
+        uint8_t vlen = value_size(item.data_type); // str/other为0：不返回值字节
         uint8_t name_len = (uint8_t)strlen(item.Chinese_name);
 
         if (name_len > DIR_NAME_MAX)
@@ -217,32 +210,28 @@ void USB_Comm::send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd
         tx_frame[6 + name_len] = unit_len; // 单位字节数，0表示无单位
         if (unit_len > 0)
             memcpy(&tx_frame[7 + name_len], item.unit, unit_len);
-        append_value(&tx_frame[7 + name_len + unit_len], item);
+        append_value(&tx_frame[7 + name_len + unit_len], item); // 零宽值不写字节
         send_frame(cmd, 5 + name_len + unit_len + vlen);
     }
 }
 
-// 发动作命令目录的一批：直接取外部表下标 [batch*CMD_DIR_BATCH, +CMD_DIR_BATCH)
-// 这连续几条，一条拼一帧。
+// 发动作命令目录的一批共n条：idx=nullptr时按注册序取[off, off+n)这连续几条（全量）；
+// 非空时按idx[off..off+n)寻址（补发，下标在请求时已校验）。一条拼一帧。
 // 帧payload: [内容长度2B][命令字][tag][命令名长][命令名][参数量]([字段类型][字段名长][字段名])×N[bit7=1时:(min,max)×参数量]
 // 头这2B长度是给上位机省事的：本帧长度要沿字段走查、还要按各字段类型累加 min/max 宽度
 // 才能算出来，让上位机再实现一遍这套走查纯属折磨。带上长度后它收2B就能定帧长。
-void USB_Comm::send_cmd_dir_batch(uint8_t batch)
+void USB_Comm::send_cmd_dir_batch(const uint8_t *idx, uint8_t off, uint8_t n)
 {
-    uint8_t start = batch * CMD_DIR_BATCH;
-    if (start >= cmd_count)
-        return; // 批次超界（正常不会发生，倒计时保证batch取0~总批数-1），容错直接返回
-    uint8_t n = cmd_count - start;
-    if (n > CMD_DIR_BATCH)
-        n = CMD_DIR_BATCH; // 最后一批不足4条时发完为止
-
     for (uint8_t k = 0; k < n; k++)
     {
-        const CMD_ITEM *item = &cmd_items[start + k];
+        uint8_t slot = idx != nullptr ? idx[off + k] : off + k; // 补发按列表寻址，全量按注册序
+        if (slot >= cmd_count)
+            continue; // 越界容错（请求时已校验，正常不会发生）
+        const CMD_ITEM *item = &cmd_items[slot];
 
         // pos用16位：范围数组按上限7参数展开时payload可能超255，uint8会回绕发坏帧
         uint16_t pos = 4; // payload前2B留给内容长度，内容从tx_frame[4]起，最后pos-2是payload总长
-        tx_frame[pos++] = static_cast<uint8_t>(CMD_BASE + start + k);
+        tx_frame[pos++] = static_cast<uint8_t>(CMD_BASE + slot);
         // bit7按ranges是否为空自动置位，上位机据此判断字段后有没有min/max数组
         tx_frame[pos++] = item->ranges != nullptr
                               ? static_cast<uint8_t>(CMD_TAG_RANGE | item->tag)
@@ -298,6 +287,34 @@ static uint8_t merge_subscribe_tag(uint8_t old_tag, uint8_t incoming)
     return static_cast<uint8_t>((incoming & host_bits) | (old_tag & static_cast<uint8_t>(~host_bits)));
 }
 
+// 校验目录补发列表：长度不超REQ_LIST_MAX、每个下标 < 表大小。纯计算，rx线程安全。
+bool USB_Comm::req_list_ok(const uint8_t *p, uint8_t len, uint8_t count)
+{
+    if (len > REQ_LIST_MAX)
+        return false;
+    for (uint8_t i = 0; i < len; i++)
+        if (p[i] >= count)
+            return false;
+    return true;
+}
+
+// 登记一次目录请求并返回本次要发的项数：len=0全量（走表内连续下标，返回count）；
+// 非0=补发（下标拷进req_idx，返回len）。调用前必须过req_list_ok。
+uint8_t USB_Comm::req_register(uint8_t len, const uint8_t *p, uint8_t count, uint8_t &req_len,
+                               uint8_t *req_idx)
+{
+    req_len = len;
+    for (uint8_t i = 0; i < len; i++)
+        req_idx[i] = p[i];
+    return len > 0 ? len : count;
+}
+
+// 回一帧"目录传完"：OK + 1B表内总项数。上位机拿它和实收目录项对照，缺哪项补发哪项。
+void USB_Comm::enqueue_response_count(uint8_t cmd, uint8_t count)
+{
+    enqueue_response(cmd, RESP_OK, nullptr, 0, reinterpret_cast<const char *>(&count), 1);
+}
+
 // 接收状态机收齐一帧、且校验通过后调用。
 // 此时rx_cmd是命令字，rx_payload前rx_len字节是数据。
 void USB_Comm::handle_command()
@@ -305,26 +322,41 @@ void USB_Comm::handle_command()
     switch (rx_cmd)
     {
     case Request_Tunable:
-        // 上位机要可调参数目录。不在接收任务里直接发（一次性发几百项会阻塞read），
-        // 只置"还剩几批"的倒计时，真正的发送由后续tx_tick每拍一批完成。
-        dir_tun = (tunable_count + DIR_BATCH - 1) / DIR_BATCH;
+        // 上位机要可调参数目录。Payload:[len][index...]，len=0全量，非0=只补发这些下标。
+        // 不在接收任务里直接发（一次性发几百项会阻塞read），只置"还剩几项"的倒计时，
+        // 真正的发送由后续tx_tick每拍一批完成。校验（纯计算）：超长/越界整帧拒绝。
+        if (!req_list_ok(rx_payload, rx_len, tunable_count))
+        {
+            enqueue_response(Request_Tunable, RESP_REJECT_INDEX_RANGE, rx_payload, rx_len, nullptr, 0);
+            break;
+        }
+        dir_tun = req_register(rx_len, rx_payload, tunable_count, req_len_tun, req_idx_tun);
         if (dir_tun == 0)
-            enqueue_response(Request_Tunable, RESP_OK, nullptr, 0, nullptr, 0); // 空表：无burst可发，立即确认
+            enqueue_response_count(Request_Tunable, (uint8_t)tunable_count); // 空表：无burst可发，立即确认（项数0）
         break;
     case Request_Monitor:
         // 上位机要监控目录：同样置倒计时分批发送，随后打开推送开关。
         // 推送是按tx_tick节拍走的，下一拍自然就开始发，不用特殊触发。
-        dir_mon = (monitor_count + DIR_BATCH - 1) / DIR_BATCH;
+        if (!req_list_ok(rx_payload, rx_len, monitor_count))
+        {
+            enqueue_response(Request_Monitor, RESP_REJECT_INDEX_RANGE, rx_payload, rx_len, nullptr, 0);
+            break;
+        }
+        dir_mon = req_register(rx_len, rx_payload, monitor_count, req_len_mon, req_idx_mon);
         monitor_active = true;
         if (dir_mon == 0)
-            enqueue_response(Request_Monitor, RESP_OK, nullptr, 0, nullptr, 0); // 空表：立即确认
+            enqueue_response_count(Request_Monitor, (uint8_t)monitor_count); // 空表：立即确认（项数0）
         break;
     case Request_Command:
-        // 上位机要动作命令目录：按外部表条数分批，每拍CMD_DIR_BATCH条
-        if (cmd_count > 0)
-            dir_cmd = (cmd_count + CMD_DIR_BATCH - 1) / CMD_DIR_BATCH;
-        else
-            enqueue_response(Request_Command, RESP_OK, nullptr, 0, nullptr, 0); // 空表：立即确认，否则上位机永远等不到
+        // 上位机要动作命令目录：按请求的项数置倒计时，tx_tick每拍CMD_DIR_BATCH条
+        if (!req_list_ok(rx_payload, rx_len, cmd_count))
+        {
+            enqueue_response(Request_Command, RESP_REJECT_INDEX_RANGE, rx_payload, rx_len, nullptr, 0);
+            break;
+        }
+        dir_cmd = req_register(rx_len, rx_payload, cmd_count, req_len_cmd, req_idx_cmd);
+        if (dir_cmd == 0)
+            enqueue_response_count(Request_Command, (uint8_t)cmd_count); // 空表：立即确认，否则上位机永远等不到
         break;
     case Subscribe:
     {
@@ -499,31 +531,38 @@ void USB_Comm::tx_tick()
 
     // 有待发目录时这一拍先发一批。两个倒计时同时非零（理论上几乎不会，
     // 两类目录请求是人工低频操作）则tunable优先，下一拍再发monitor，串行不并行。
-    // 当前批次号 = 总批数 - 剩余批数：倒计时从总批数减到0，批次号正好从0走到总批数-1。
+    // dir_x 是"剩余项数"：每拍发 min(批量, dir_x) 项，扣到0时回 OK+总项数。
+    // 补发请求（req_len 非0）按登记的显式下标列表寻址，全量走表内连续下标；
+    // 游标现推：pos = req_len - dir_x（补发）或 count - dir_x（全量）。
     if (dir_tun > 0)
     {
-        uint8_t total = (tunable_count + DIR_BATCH - 1) / DIR_BATCH;
-        send_dir_batch(tunable_items, tunable_count, Post_Tunable_Directory, total - dir_tun);
-        dir_tun--;
+        uint8_t n = dir_tun < DIR_BATCH ? dir_tun : DIR_BATCH;
+        uint8_t off = req_len_tun > 0 ? req_len_tun - dir_tun : tunable_count - dir_tun;
+        send_dir_batch(tunable_items, tunable_count, Post_Tunable_Directory,
+                       req_len_tun > 0 ? req_idx_tun : nullptr, off, n);
+        dir_tun -= n;
         if (dir_tun == 0)
-            enqueue_response(Request_Tunable, RESP_OK, nullptr, 0, nullptr, 0); // 末批发完=目录传完
+            enqueue_response_count(Request_Tunable, (uint8_t)tunable_count); // 末批发完=目录传完，带总项数
     }
     else if (dir_mon > 0)
     {
-        uint8_t total = (monitor_count + DIR_BATCH - 1) / DIR_BATCH;
-        send_dir_batch(monitor_items, monitor_count, Post_Monitor_Directory, total - dir_mon);
-        dir_mon--;
+        uint8_t n = dir_mon < DIR_BATCH ? dir_mon : DIR_BATCH;
+        uint8_t off = req_len_mon > 0 ? req_len_mon - dir_mon : monitor_count - dir_mon;
+        send_dir_batch(monitor_items, monitor_count, Post_Monitor_Directory,
+                       req_len_mon > 0 ? req_idx_mon : nullptr, off, n);
+        dir_mon -= n;
         if (dir_mon == 0)
-            enqueue_response(Request_Monitor, RESP_OK, nullptr, 0, nullptr, 0);
+            enqueue_response_count(Request_Monitor, (uint8_t)monitor_count);
     }
     else if (dir_cmd > 0)
     {
-        // 命令目录排最后，批次号算法同上
-        uint8_t total = (cmd_count + CMD_DIR_BATCH - 1) / CMD_DIR_BATCH;
-        send_cmd_dir_batch(total - dir_cmd);
-        dir_cmd--;
+        // 命令目录排最后，算法同上（批量CMD_DIR_BATCH）
+        uint8_t n = dir_cmd < CMD_DIR_BATCH ? dir_cmd : CMD_DIR_BATCH;
+        uint8_t off = req_len_cmd > 0 ? req_len_cmd - dir_cmd : cmd_count - dir_cmd;
+        send_cmd_dir_batch(req_len_cmd > 0 ? req_idx_cmd : nullptr, off, n);
+        dir_cmd -= n;
         if (dir_cmd == 0)
-            enqueue_response(Request_Command, RESP_OK, nullptr, 0, nullptr, 0);
+            enqueue_response_count(Request_Command, (uint8_t)cmd_count);
     }
 
     monitor_tick();
@@ -630,10 +669,22 @@ void USB_Comm::rx_task()
             rx_expect = expect;
             rx_len = 0;
             rx_xor = ch; // 校验从命令字起算，不含帧头
-            // Payload长度为0的命令直接去等校验字节
-            rx_state = (expect > 0) ? RX_DATA : RX_XOR;
+            // 长度前缀模式（目录请求）先多等一个字节拿长度；定长/零长命令直接走
+            if (expect == CMD_LEN_PREFIX)
+                rx_state = RX_LEN;
+            else
+                rx_state = (expect > 0) ? RX_DATA : RX_XOR;
             break;
         }
+
+        case RX_LEN:
+            // 长度前缀字节：接下来再收这么多个Payload字节（目录请求的index列表）。
+            // 取0=全量请求（[A5][cmd][0x00][XOR]），无Payload直接去等校验字节。
+            rx_expect = ch;
+            rx_xor ^= ch;
+            rx_len = 0;
+            rx_state = (rx_expect > 0) ? RX_DATA : RX_XOR;
+            break;
 
         case RX_DATA:
             // 收数据的同时一边存一边累计校验。

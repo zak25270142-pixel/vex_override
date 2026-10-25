@@ -38,6 +38,8 @@
   --glow-success: 0 0 8px var(--status-success);
   --glow-waiting: 0 0 8px var(--status-waiting);
   --glow-danger: 0 0 8px var(--status-danger);
+  /* 急停键 hover 加深档：红→深红，与 --status-danger 同色系深一档（#ff533d 降 ~28% 亮度） */
+  --danger-deep: #b83a2a;
 
   /* 成功/危险按钮软底 */
   --success-soft: rgba(85, 229, 152, 0.14);

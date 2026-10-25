@@ -150,11 +150,14 @@ const mockCommands: MockCmd[] = [
     { type: ValueType.Float, name: 'y右(米)' },
     { type: ValueType.Float, name: '航向(度)' },
   ], ranges: [-10, 10, -10, 10, -360, 360] },
-  // 字段异型的例子：编号是 uint8_t、电压是 float，min/max 各自按字段类型定宽
-  { index: 0x84, tag: (2 << CMD_TAG_ARGC_SHIFT) | CMD_TAG_RANGE, name: '设置电机电压', fields: [
-    { type: ValueType.UInt8, name: '编号(0-2左1-3,3-5右1-3)' },
-    { type: ValueType.Float, name: '电压(伏)' },
-  ], ranges: [0, 5, -12, 12] },
+  // 字段异型的例子：组别是 uint8_t、后面 4 个电压是 float，min/max 各自按字段类型定宽
+  { index: 0x84, tag: (5 << CMD_TAG_ARGC_SHIFT) | CMD_TAG_RANGE, name: '组开环电压', fields: [
+    { type: ValueType.UInt8, name: '组别(0左1右)' },
+    { type: ValueType.Float, name: '0号电压' },
+    { type: ValueType.Float, name: '1号电压' },
+    { type: ValueType.Float, name: '2号电压' },
+    { type: ValueType.Float, name: '3号电压' },
+  ], ranges: [0, 1, -12, 12, -12, 12, -12, 12, -12, 12] },
 ]
 
 /** 拼动作命令目录帧：[内容长度2B][命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×N] */
@@ -196,9 +199,10 @@ function frame(cmd: number, payload: number[]): Uint8Array {
   return out
 }
 
-/** 拼调参/监控目录帧：[index][type][tag][名长][名][单位长][单位][值]，与真机 send_dir_batch 同构 */
-function directoryFrames(cmd: number, items: MockItem[]): Uint8Array[] {
-  return items.map((it, i) => {
+/** 拼调参/监控目录帧：[index][type][tag][名长][名][单位长][单位][值]，与真机 send_dir_batch 同构。
+    entries 显式带 index：全量取表内位置，补发取请求指定的下标 */
+function directoryFrames(cmd: number, entries: [number, MockItem][]): Uint8Array[] {
+  return entries.map(([i, it]) => {
     const enc = new TextEncoder()
     const nameBytes = [...enc.encode(it.name)]
     const unitBytes = [...enc.encode(it.unit)]
@@ -257,17 +261,41 @@ export class MockTransport implements SerialTransport {
   async send(data: Uint8Array): Promise<void> {
     if (data.length < 2 || data[0] !== FRAME_HEAD) return
     const cmd = data[1]
-    // 与真机一致的回执语义：目录请求在 burst 发完后回 OK；Subscribe/调参/动作命令立即回。
+    // 与真机一致的回执语义：目录请求在 burst 发完后回 OK+总项数；Subscribe/调参/动作命令立即回。
     // 拒绝用内定err（0xC0|n）：1=下标超表 2=类型不可写——演示源照实模拟
     const respond = (echoPayload: number[], status = RESP_OK) =>
       this.emit(buildResponse(cmd, echoPayload, status))
+    /** 目录请求 [len][index...]：len=0 全量，非0=补发指定下标；越界返回 null（整帧拒绝） */
+    const parseDirReq = (total: number): { indices: number[]; echo: number[] } | null => {
+      const len = data[2] ?? 0
+      const indices =
+        len === 0
+          ? Array.from({ length: total }, (_, i) => i)
+          : Array.from(data.subarray(3, 3 + len))
+      if (indices.some((i) => i >= total)) return null
+      return { indices, echo: Array.from(data.subarray(2, data.length - 1)) }
+    }
+    /** 目录传完：OK + 1B 表内总项数（与真机 enqueue_response_count 同语义，后端据此对照补发） */
+    const respondDir = (echo: number[], count: number) =>
+      this.emit(buildResponse(cmd, echo, RESP_OK, [count & 0xff]))
+    const rejectDir = () => respond(Array.from(data.subarray(2, data.length - 1)), RESP_REJECT_INDEX_RANGE)
     if (cmd === CmdGet.RequestTunable) {
-      directoryFrames(CmdPost.TunableDirectory, tunableItems).forEach((f) => this.emit(f))
-      respond([])
+      const req = parseDirReq(tunableItems.length)
+      if (!req) return rejectDir()
+      directoryFrames(
+        CmdPost.TunableDirectory,
+        req.indices.map((i) => [i, tunableItems[i]!] as [number, MockItem]),
+      ).forEach((f) => this.emit(f))
+      respondDir(req.echo, tunableItems.length)
     } else if (cmd === CmdGet.RequestMonitor) {
-      directoryFrames(CmdPost.MonitorDirectory, monitorItems).forEach((f) => this.emit(f))
+      const req = parseDirReq(monitorItems.length)
+      if (!req) return rejectDir()
+      directoryFrames(
+        CmdPost.MonitorDirectory,
+        req.indices.map((i) => [i, monitorItems[i]!] as [number, MockItem]),
+      ).forEach((f) => this.emit(f))
       this.startTimers()
-      respond([])
+      respondDir(req.echo, monitorItems.length)
     } else if (cmd === CmdGet.Subscribe) {
       // [index][tag]，与真机 merge_subscribe_tag 同语义：
       // 只合并上位机的 SUB/FAST 两位，GETTER/KIND 等本机位保留；bit7=0 即退订；index=0xFF 全部生效
@@ -294,11 +322,13 @@ export class MockTransport implements SerialTransport {
       appendValue(payload, it.type, v)
       this.emit(frame(CmdPost.TunableEcho, payload))
     } else if (cmd === CmdGet.RequestCommand) {
-      // 命令目录：一条命令一帧，分两拍发，模拟真机分批轮转；末批后回 OK
-      mockCommands.forEach((c, i) => {
-        setTimeout(() => this.cb.onData(cmdDirectoryFrame(c)), i * 10)
+      // 命令目录：按请求的下标逐条发（全量=全部），分拍发出，模拟真机分批轮转；末批后回 OK+总条数
+      const req = parseDirReq(mockCommands.length)
+      if (!req) return rejectDir()
+      req.indices.forEach((slot, k) => {
+        setTimeout(() => this.cb.onData(cmdDirectoryFrame(mockCommands[slot]!)), k * 10)
       })
-      setTimeout(() => respond([]), mockCommands.length * 10)
+      setTimeout(() => respondDir(req.echo, mockCommands.length), req.indices.length * 10)
     } else if (cmd >= CMD_USER_MIN && cmd <= CMD_USER_MAX) {
       // 动作命令：演示源不执行真动作，但照真机回 OK 回执
       respond(Array.from(data.subarray(2, data.length - 1)))

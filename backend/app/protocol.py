@@ -119,6 +119,10 @@ def cmd_spec(tag: int) -> int:
 CMD_ACTION_MIN = 0x80
 CMD_ACTION_MAX = 0x9F
 
+# 目录补发列表上限（Request_* 的 index_list 长度，与固件 REQ_LIST_MAX 一致）：
+# 超出固件整帧拒绝，主机端应改走全量重拉
+REQ_LIST_MAX = 16
+
 # ---------- 通用响应帧（CmdPost.Response）----------
 # 帧格式: A5 | 05 | payloadlen | 原话cmd | 原话payload | status | 原因串 | XOR
 #   payloadlen 覆盖 原话cmd+原话payload+status+原因串（不含自身与 XOR），收 1B 即定帧长；
@@ -182,14 +186,19 @@ def resp_is_reject(status: int) -> bool:
 
 
 def resp_str_len(status: int) -> int:
-    """原因串字节数（串模式取低6位；内定err/OK/裸拒律为0）"""
+    """尾字节数。串模式取低6位；内定err/裸拒为0；OK 为 -1（隐式）：
+    0x00 低6位恒0装不下长度，OK 的尾字节是二进制附加信息（如目录项数），
+    长度由帧长反推（payloadlen - 回显长 - 2），见 decode_response。"""
+    if status == RESP_OK:
+        return -1
     if status & RESP_MODE_MASK:
         return 0
     return status & RESP_PAYLOAD_MASK
 
 
-def resp_reason_text(status: int, reason: str) -> str:
-    """status+原因串 → 一句人话（日志/UI用）。内定err给编号名，串模式给原文。"""
+def resp_reason_text(status: int, reason: bytes) -> str:
+    """status+尾字节 → 一句人话（日志/UI用）。内定err给编号名，串模式给原文（UTF-8），
+    OK 给 "OK"（info 由调用方按回显 cmd 解释，如目录项数）。"""
     if resp_is_ok(status):
         return "OK"
     if status & RESP_MODE_MASK:
@@ -199,17 +208,19 @@ def resp_reason_text(status: int, reason: str) -> str:
             return f"{table(code).name}(内定err#{code})"
         except ValueError:
             return f"未知内定err#{code}"
-    return reason or "(空)"
+    return reason.decode("utf-8", errors="replace") or "(空)"
 
 
-def decode_response(p: bytes, echo_len: int) -> tuple[int, bytes, int, str] | None:
-    """解 Response 帧 payload：[payloadlen][原话cmd][原话payload][status][原因串]。
+def decode_response(p: bytes, echo_len: int) -> tuple[int, bytes, int, bytes] | None:
+    """解 Response 帧 payload：[payloadlen][原话cmd][原话payload][status][尾字节]。
 
     echo_len = 回显 payload 应有字节数，由调用方得知：待确认表里存着原帧
     （len(frame)-3，最可靠），或按命令目录字段累加/内置命令定长推。
     同一命令字的 payload 长度恒定（字段表固定），是不变量——回显长度因此可预期。
-    一致性校验 payloadlen == 2 + echo_len + 串长，对不上返回 None（流错位/
-    回显被截断等异常）：ACK 丢失由上位机超时重发自愈，这里不猜。
+    尾字节按 status 模式解释：串模式=UTF-8 原因串（长度=低6位，须与帧长吻合）；
+    OK 模式=二进制附加信息（长度隐式=帧长剩余，目录请求时是 1B 表内总项数）。
+    一致性校验对不上返回 None（流错位/回显被截断等异常）：ACK 丢失由上位机
+    超时重发自愈，这里不猜。
     """
     if len(p) < 3:
         return None
@@ -220,25 +231,27 @@ def decode_response(p: bytes, echo_len: int) -> tuple[int, bytes, int, str] | No
     if status_at >= len(p):
         return None
     status = p[status_at]
+    if resp_is_ok(status):
+        # OK+info：尾字节长度隐式（0x00 低6位恒0装不下），帧长剩余即 info，
+        # 不再做第二重校验——帧总长已由 payloadlen 在上层钉过
+        return (echo_cmd, bytes(p[2:status_at]), status, bytes(p[status_at + 1 :]))
     str_len = resp_str_len(status)
     if status_at + 1 + str_len != len(p):
         return None
-    return (
-        echo_cmd,
-        bytes(p[2:status_at]),
-        status,
-        p[status_at + 1 :].decode("utf-8", errors="replace"),
-    )
+    return (echo_cmd, bytes(p[2:status_at]), status, bytes(p[status_at + 1 :]))
 
 
-def build_response(echo_cmd: int, echo_payload: bytes = b"", status: int = RESP_OK, reason: str = "") -> bytes:
+def build_response(echo_cmd: int, echo_payload: bytes = b"", status: int = RESP_OK, reason: bytes = b"") -> bytes:
     """组一帧 Response（测试/前端模拟源用；固件侧在 send_responses 里直接拼帧）。
 
-    reason 仅在 status 为串模式时带上；传入其他模式时忽略（协议规定内定err不带串）。
+    reason 是尾字节、按 status 模式解释：OK=二进制附加信息（如目录项数，长度隐式，
+    帧长即其长度）；串模式=UTF-8 原因串，按低6位截断；内定err/裸拒律忽略（不带尾字节）。
     """
     body = bytes([echo_cmd & 0xFF]) + echo_payload + bytes([status & 0xFF])
-    if resp_str_len(status):
-        body += reason.encode("utf-8")[: resp_str_len(status)]
+    if resp_is_ok(status):
+        body += reason  # 隐式长度：payloadlen 会把这几个字节算进去
+    elif resp_str_len(status):
+        body += reason[: resp_str_len(status)]
     return build_frame(CmdPost.Response, bytes([len(body)]) + body)
 
 
@@ -378,17 +391,24 @@ def build_frame(cmd: int, payload: bytes = b"") -> bytes:
         xor ^= b
     return bytes([FRAME_HEAD, cmd & 0xFF]) + payload + bytes([xor & 0xFF])
 
-def request_tunable() -> bytes:
-    """请求调参目录"""
-    return build_frame(CmdGet.RequestTunable)
+def _req_payload(indices: list[int] | None) -> bytes:
+    """目录请求 payload：[len 1B][index...]；len=0 全量，非0=只补发指定下标。"""
+    idx = list(indices or [])
+    if len(idx) > REQ_LIST_MAX:
+        raise ValueError(f"补发列表 {len(idx)} 项超上限 {REQ_LIST_MAX}，应改全量重拉")
+    return bytes([len(idx)]) + bytes(i & 0xFF for i in idx)
 
-def request_monitor() -> bytes:
-    """请求监控目录"""
-    return build_frame(CmdGet.RequestMonitor)
+def request_tunable(indices: list[int] | None = None) -> bytes:
+    """请求调参目录。indices=None/空=全量；非空=只补发这些下标（不清已收项）"""
+    return build_frame(CmdGet.RequestTunable, _req_payload(indices))
 
-def request_command() -> bytes:
-    """请求动作命令目录"""
-    return build_frame(CmdGet.RequestCommand)
+def request_monitor(indices: list[int] | None = None) -> bytes:
+    """请求监控目录（indices 语义同 request_tunable）"""
+    return build_frame(CmdGet.RequestMonitor, _req_payload(indices))
+
+def request_command(indices: list[int] | None = None) -> bytes:
+    """请求动作命令目录（indices 语义同 request_tunable）"""
+    return build_frame(CmdGet.RequestCommand, _req_payload(indices))
 
 def subscribe(index: int, sub: bool, fast: bool) -> bytes:
     """订阅帧。只带 SUB/FAST 两个 bit，下位机会保留它自己的 GETTER/KIND。
@@ -536,7 +556,8 @@ class FrameParser:
                     # 边收边试算长度：收到足够字节能确定总长就定下来。
                     # 监控值帧自带 1B 长度前缀，收 1 字节就能定长；
                     # 调参回显 [type][index][value] 的 type 前缀自带宽度；
-                    # 响应帧 [payloadlen][原话cmd][原话payload][status][原因串] 同理，
+                    # 响应帧 [payloadlen][原话cmd][原话payload][status][尾字节] 同理，
+                    #   尾字节=原因串（串模式）或 OK 的二进制 info（长度隐式，帧长即长度）；
                     #   payloadlen 最小 2（原话cmd+status），0/1 只可能是流错位；
                     # 目录帧要收完名字长度、单位长度才能算（_dir_len/_cmd_dir_len）。
                     if self.cmd == CmdPost.MonitorValue:

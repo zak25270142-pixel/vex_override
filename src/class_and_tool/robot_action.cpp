@@ -195,8 +195,8 @@ void RobotAction::update_manual(uint32_t now)
         chassis.output(left_cmd * scale, right_cmd * scale);
         return;
     }
-    if (chassis.left_motors.spin_state == MyMotorGroup::SpinState::Stopped &&
-        chassis.right_motors.spin_state == MyMotorGroup::SpinState::Stopped)
+    // 两侧都停了就直接待命，不必再走停止通道
+    if (chassis.left_motors.is_stopped() && chassis.right_motors.is_stopped())
         return;
     // 松杆：走停止通道（0V 减速→转速低于阈值或到 manual_stop_delay 硬刹），刹完留在 manual 待命
     if (stop_start_us == 0)
@@ -214,7 +214,7 @@ void RobotAction::refresh()
     if (chassis_task_ptr != nullptr)
         (this->*chassis_task_ptr)(now);
     chassis.speed_tick(); // 任务计算完下达完后，更新速度环
-    lift.tick();          // 升降杆（与底盘同拍；停机态也更新位置/电流读数供监控）
+    lift.refresh();       // 升降杆（与底盘同拍；数据恒刷，控制指令按挂载情况运行）
 }
 
 void RobotAction::turn(float angle)

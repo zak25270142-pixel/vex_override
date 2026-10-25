@@ -4,7 +4,8 @@
  *
  * 数据约定：
  *   - 后端 → 浏览器：ArrayBuffer 原样协议帧（进 FrameParser，store 零改动）
- *                   文本 JSON 仅连接状态 {"op":"status",...}
+ *                   文本 JSON：连接状态 {"op":"status",...} + 固件回执异常
+ *                   {"op":"alert",...}（后端待确认表的拒绝/放弃结论，见 transport.FwAlert）
  *   - 浏览器 → 后端：ArrayBuffer 原样协议帧
  *
  * OPEN 之前发出的帧进入待发队列，连接一建立按序 flush，避免「连接中点击/自动拉表」丢命令。
@@ -102,6 +103,15 @@ export class WsTransport implements SerialTransport {
                         ? 'connecting' // 串口 idle 表示 WS 活着但车没接上
                         : 'error'
               this.cb.onStatus(state, obj.message ?? '')
+            } else if (obj.op === 'alert') {
+              // 固件回执异常（补发预算耗尽/无法结算等）：Response 帧本身走二进制
+              // 透传、store 自己解析，这里是后端独有的决策结论，弹 toast 提示
+              this.cb.onAlert?.({
+                level: obj.level,
+                cmd: obj.cmd,
+                name: obj.name,
+                text: obj.text,
+              })
             }
           } catch {
             /* 非 JSON 文本忽略 */

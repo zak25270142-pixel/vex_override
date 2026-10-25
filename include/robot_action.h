@@ -133,6 +133,7 @@ public:
 
     // 停止：0V+brake，兼作 Stall 解锁。由命令层 cmd_stop 调用（停止一切）；
     // 故意不进 stop_move()——那个被掉线 failsafe 复用，见 robot_and_control.cpp。
+    void lift_stop();
 };
 
 #endif

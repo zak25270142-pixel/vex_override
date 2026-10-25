@@ -18,8 +18,9 @@
 //     Cmd     1B命令字，说明这帧是干什么的（见下面两个枚举）
 //     Payload 0~445B数据，有些命令没有数据
 //     XOR     1B校验，把Cmd和Payload每个字节依次异或得到；传错一个字节就对不上
-//   带长度前缀的帧（Cmd后紧跟1B payloadlen，收信方收1B就能定帧长=1+payloadlen）：
-//     监控值帧 Monitor_Post、通用响应帧 Response，见下面枚举处说明。
+//   带长度前缀的帧（Cmd后紧跟1B长度，收信方收1B就能定帧长）：
+//     上行：监控值帧 Monitor_Post、通用响应帧 Response（1B=payloadlen，定帧长=1+payloadlen）；
+//     下行：目录请求（1B=index个数，0=全量），见下面Cmd_Get枚举处说明。
 //
 // 订阅档位存在每个监控项的 tag 字段里（见 MENU_ITEM / my_main.h 位域说明）：
 //   bit7 SUB：是否推送；bit6 FAST：高速/低速；bit5 GETTER：函数指针取数；
@@ -74,7 +75,8 @@ static inline uint8_t cmd_tag_argc(uint8_t tag)
 //   bit6  模式  0=原因串（低6位=串长1~63）         1=内定err（低6位=err号0~63，不带串）
 //   bit5~0 载荷 串长或内定err号，按bit6解释
 // 分区（每个字节值都有定义，无洞无越界）：
-//   0x00      OK，一切正常
+//   0x00      OK；帧尾若还有字节＝二进制附加信息（长度不在本字节里，由payloadlen反推），
+//             语义由回显cmd决定：目录请求=表内总项数1B。错误原因串仍是UTF-8，两种尾字节不混用
 //   0x01~0x3F 需补发+原因串（长度=低6位，UTF-8中文）
 //   0x40~0x7F 需补发+内定err（号=低6位）
 //   0x80      明确拒绝，无原因串（裸拒绝）
@@ -122,6 +124,8 @@ private:
     {
         // 目录项 Payload:
         // [index 1B][数据类型 1B][tag 1B][名称长度 1B][名称][单位长度 1B][单位][当前值?B取决于type]
+        // str/other也发（值宽0，帧到单位段即止）：index空间必须稠密，上位机才能拿OK里的
+        // 总项数对照出缺失的是哪几项、按index补发。这两类不可订阅/写入，上位机登记为只读。
         Post_Tunable_Directory, // 调参目录（tag 位调参表固定为0）
         Post_Monitor_Directory, // 监控目录；其中 tag 为位域字节（见 my_main.h）
         // 监控值帧 Payload: [payloadlen 1B][time 2B]([index 1B][值?B取决于type])×N
@@ -148,8 +152,8 @@ private:
     };
     enum Cmd_Get
     {
-        Request_Tunable, // 无Payload，接收后发送可调参数目录(遍历tunable_items数组)
-        Request_Monitor, // 无Payload，接收后发送监控目录，并开始按各项tag推送
+        Request_Tunable, // Payload:[len 1B][index len B]：len=0全量；非0=只补发这些下标（主机按缺失项算，上限REQ_LIST_MAX）。接收后发送可调参数目录(遍历tunable_items数组)
+        Request_Monitor, // 同上；接收后发送监控目录，并开始按各项tag推送
 
         // Payload 2B: [index 1B][tag 1B]
         // tag 位域：上位机主要写 bit7(SUB)/bit6(FAST)；bit5 与 bit2~0 由下位机保留。
@@ -160,13 +164,14 @@ private:
         // Payload固定9B: [index 1B][value 8B]，按调参表里该项的真实类型只取前若干字节，
         // 不足8B的类型高位补零。改完后主控回一帧Tunable_Echo确认真实生效值。
         Set_Tunable,
-        Request_Command, // 无Payload，接收后分批回传动作命令目录（遍历已注册命令槽）
+        Request_Command, // 同Request_Tunable的[len][index]格式；接收后分批回传动作命令目录（遍历已注册命令槽）
         Ping = 0xFF,
     };
     enum RxState
     {
         WAIT_HEAD, // 等帧头0xA5
         RX_CMD,    // 等待命令字
+        RX_LEN,    // 等长度前缀字节（仅目录请求：Cmd后先收1B index个数，再收这么多个字节）
         RX_DATA,   // 正在按命令字规定的长度收Payload
         RX_XOR,    // 等校验字节，无误后执行命令
     };
@@ -174,6 +179,11 @@ private:
     static constexpr uint8_t FRAME_HEAD = 0xA5; // 固定帧头
     // Payload上限445B：整帧最长448B(A5+Cmd+445+XOR)，仍小于USB单包512B，一帧不会被USB拆开。
     static constexpr uint16_t MAX_PAYLOAD = 445;
+    // 目录请求带1B长度前缀（[len][index...]）：cmd_payload_len 对它返回本哨兵，
+    // rx 收到命令字后多等一个字节拿长度。0xFFFF保留给"不认识的命令"。
+    static constexpr uint16_t CMD_LEN_PREFIX = 0xFFFE;
+    // 补发下标列表上限（与上位机约定一致）：超出整帧拒绝，让上位机改走全量重拉
+    static constexpr uint8_t REQ_LIST_MAX = 16;
     static constexpr uint8_t SLOW_PHASES = 8; // 低速项轮转相数：单项刷新周期=8×10ms=80ms
     static constexpr uint8_t MON_PACK_MAX = 16; // 监控值帧最多并几项：满额先发一帧（最宽8B值也只有150B，payloadlen 1B 装得下）
     static constexpr uint8_t DIR_BATCH = 8;   // 调参/监控目录分批：每个10ms拍最多连续发8项
@@ -203,9 +213,18 @@ private:
 
     uint16_t tx_stamp = 0; // 本拍时间戳：get_time_ms()低16位，tx_tick开头取一次，同拍的监控帧共用
     uint8_t tick = 0;    // 节拍计数，每拍+1，uint8自然溢出回0，只用于低速项按 tick%8 轮转。
-    uint8_t dir_tun = 0; // 目录发送倒计时：收到目录请求时置"还剩几批"，每发一批-1，到0结束。
+    uint8_t dir_tun = 0; // 目录发送倒计时：收到目录请求时置"还剩几项"，每拍发一批、扣到0结束。
     uint8_t dir_mon = 0; // 三张表各一个；同一拍内只发一个表的一批（tunable优先），保证目录不并行。
     uint8_t dir_cmd = 0;
+    // 目录"当前请求"（补发机制）：req_len=0 表示全量（走表内连续下标，列表不用）；
+    // 非0=主机算出的缺失下标列表（请求时已逐个校验 < 表大小）。游标不另存：
+    // pos = req_len - dir_x（补发）或 count - dir_x（全量），tx_tick 现推。
+    uint8_t req_len_tun = 0;
+    uint8_t req_len_mon = 0;
+    uint8_t req_len_cmd = 0;
+    uint8_t req_idx_tun[REQ_LIST_MAX] = {};
+    uint8_t req_idx_mon[REQ_LIST_MAX] = {};
+    uint8_t req_idx_cmd[REQ_LIST_MAX] = {};
 
     bool monitor_active = false; // 是否正在周期推送
 
@@ -238,7 +257,7 @@ private:
         uint8_t echo_len;            // 回显payload实际字节数
         uint8_t str_len;             // 原因串实际字节数
         uint8_t echo[RESP_ECHO_MAX]; // 回显的payload
-        char str[RESP_STR_MAX];      // 原因串（UTF-8，按字节数取用，不当C串）
+        char str[RESP_STR_MAX];      // 尾字节：status=OK时是二进制附加信息（如目录项数）；其余为UTF-8原因串，按字节数取用，不当C串
     };
     RespSlot resp_q[RESP_QUEUE_DEPTH];
     uint8_t resp_head = 0; // 环形队列头（待发）；头=尾即空
@@ -249,7 +268,7 @@ private:
 
     // 内建命令返回固定长度（static，无表可查）；动作命令长度查注册表，
     // 所以整体不是static——rx_task收到命令字时调用它决定再收几字节。
-    // 返回0xFFFF表示不认识的命令：445超出uint8，未知哨兵不能用0xFF了。
+    // 目录请求返回CMD_LEN_PREFIX（长度前缀模式）；0xFFFF表示不认识的命令：445超出uint8，未知哨兵不能用0xFF了。
     uint16_t cmd_payload_len(uint8_t cmd);
     static uint8_t value_size(VALUE_TYPE type);
 
@@ -267,16 +286,29 @@ private:
     // payload已直接拼在tx_frame[2]起时调用：补帧头、命令、校验后整帧发出，len是payload字节数
     void send_frame(uint8_t cmd, uint16_t len);
 
-    // 发目录的第batch批（下标连续的DIR_BATCH项），一项一帧，str/other跳过
-    void send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, uint8_t batch);
+    // 发目录的一批共n项，一项一帧：idx=nullptr时按表内下标[off,off+n)连续取（全量）；
+    // 非空时按idx[off..off+n)寻址（补发）。str/other照发（值宽0，见Cmd_Post枚举处说明）。
+    void send_dir_batch(const MENU_ITEM *items, uint8_t count, uint8_t cmd, const uint8_t *idx,
+                        uint8_t off, uint8_t n);
 
-    // 发动作命令目录的第batch批：扫非空槽按注册序取连续CMD_DIR_BATCH条，一条一帧
-    void send_cmd_dir_batch(uint8_t batch);
+    // 发动作命令目录的一批共n条：idx=nullptr按注册序[off,off+n)，非空按idx寻址（补发），一条一帧
+    void send_cmd_dir_batch(const uint8_t *idx, uint8_t off, uint8_t n);
 
-    // 入队一帧通用响应：echo=回显的payload（可为nullptr），str=原因串（可为nullptr，仅串模式）。
+    // 入队一帧通用响应：echo=回显的payload（可为nullptr），str=尾字节（可为nullptr）：
+    // 串模式=UTF-8原因串；status=OK时=二进制附加信息（如目录项数）。
     // echo截断到RESP_ECHO_MAX、str截断到RESP_STR_MAX；队列满丢最新（丢ACK可自愈）。rx线程安全。
     void enqueue_response(uint8_t cmd, uint8_t status, const uint8_t *echo, uint16_t echo_len,
                           const char *str, uint8_t str_len);
+
+    // 回一帧"目录传完"：OK + 1B表内总项数（二进制附加信息）。上位机拿它和实收目录项
+    // 对照，缺哪项发哪项（见Cmd_Get目录请求的index格式）。
+    void enqueue_response_count(uint8_t cmd, uint8_t count);
+
+    // 校验并登记一次目录请求：len=0全量；非0=补发列表（须不超REQ_LIST_MAX且每个下标<count）。
+    // 登记 req_len/req_idx，返回本次要发的项数（全量=count，补发=len）。false=整帧拒绝。
+    bool req_list_ok(const uint8_t *p, uint8_t len, uint8_t count);
+    uint8_t req_register(uint8_t len, const uint8_t *p, uint8_t count, uint8_t &req_len,
+                         uint8_t *req_idx);
 
     // 把队列里的Response帧全部发出（tx_tick末尾调用；Pong已在拍首发完）
     void send_responses();

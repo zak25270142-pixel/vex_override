@@ -8,6 +8,7 @@
 """
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, NamedTuple
 
 # 监控/调参项能取的值形态。注意这是"Python 侧解出来的类型"，
@@ -236,29 +237,27 @@ class EndLogResult:
 
 
 @dataclass
-class LogRow:
-    """一条原始样本（长表的一行）。"""
-    t: float  # 相对本段零点的毫秒
+class LogSeries:
+    """一段记录里某一项的非空样本（宽表的一列）。
+
+    长表（每行都带 t / index / name）已废：同样的点体积膨胀 N 倍，读回来还得 pivot。
+    宽表导出改成"一根共享时间轴 + 每列只存非空点"。
+    """
     index: int
     name: str
-    value: Any
-
-
-@dataclass
-class LogRowsResult:
-    """整段原始样本长表（log_rows() 与 print_log 内部使用；对外取原始点请用
-    /api/log/print 导出，或 /api/log/calc 传 window 做子区间计算）。"""
-    rows: list[LogRow]
+    unit: str
+    points: list[list[float]]  # [[t_ms, 值], ...]，只含本项非空的那几拍
 
 
 @dataclass
 class LogFileMeta:
-    """导出 JSON 的元信息 + 原始样本长表。"""
+    """导出 JSON 的元信息 + 共享时间轴 + 每项一条非空点列。"""
     created: str
     samples: int
     dropped: int
     registered: list[RegisteredItem]
-    data: list[LogRow]
+    t_ms: list[float]  # 共享时间轴：每拍的时刻（毫秒，相对本段零点）
+    series: list[LogSeries]
 
 
 @dataclass
@@ -322,3 +321,28 @@ class StatusMessage:
     op: str
     state: str
     message: str
+
+
+class AlertLevel(str, Enum):
+    """WS alert 的严重度（str 子类：asdict 后 json.dumps 直接出 "reject" 这类值，
+    不会出成 "AlertLevel.Reject"）。前端按它定 toast 样式。"""
+
+    Reject = "reject"  # 固件明确拒绝：命令没执行，重发无意义，该换操作
+    Retry = "retry"    # 固件说这帧没成（校验失败等），已自动重发
+    GiveUp = "giveup"  # 重试预算耗尽/超时放弃/无法结算：命令状态不明，该查链路
+
+
+@dataclass
+class AlertMessage:
+    """WS 文本通道推给前端的固件回执异常（前端按 op=="alert" 弹 toast）。
+
+    与 StatusMessage 同一通道、按 op 分流。为什么需要它：Response 帧本身随
+    串口字节透传给前端，但"补发 3 次仍失败所以放弃""响应帧无法结算"这类结论
+    只有后端待确认表知道——前端没有原帧长度和重试预算，推不过来。
+    name 是命令中文名（目录/内置命令表/回显下标解析得来），text 是一句人话。
+    """
+    op: str
+    level: AlertLevel
+    cmd: int   # 回显的命令字（动作命令 0x80~0x9F 或内置命令字）
+    name: str  # 命令中文名描述，如 动作命令「直行」
+    text: str  # 结局说明，如 补发 3 次仍无固件确认，已放弃

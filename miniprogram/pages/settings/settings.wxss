@@ -1,0 +1,90 @@
+/* 设置页样式 */
+.page { padding-bottom: 40rpx; }
+
+.card {
+  background: #1b1e26;
+  border-radius: 16rpx;
+  margin: 16rpx 24rpx 0;
+  padding: 24rpx;
+}
+.card-title {
+  font-size: 26rpx;
+  color: #8a8f9c;
+  margin-bottom: 16rpx;
+}
+
+/* 连接状态卡 */
+.conn-card { display: flex; align-items: center; justify-content: space-between; }
+.conn-line { display: flex; align-items: center; }
+.conn-label { font-size: 30rpx; font-weight: 600; color: #e8eaf0; }
+.conn-msg {
+  font-size: 22rpx;
+  color: #6b7280;
+  max-width: 380rpx;
+  text-align: right;
+}
+
+/* 表单 */
+.form-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12rpx 0;
+  border-bottom: 1rpx solid #2a2e39;
+}
+.form-label { font-size: 28rpx; color: #c8cdd6; }
+.form-input {
+  flex: 1;
+  margin-left: 24rpx;
+  text-align: right;
+  font-size: 28rpx;
+  color: #e8eaf0;
+  padding: 8rpx 0;
+}
+.btn-row {
+  display: flex;
+  margin-top: 24rpx;
+}
+.btn-row .btn { flex: 1; margin: 0 8rpx; padding: 16rpx 0; }
+
+/* 测试结果 */
+.test-msg {
+  font-size: 24rpx;
+  color: #c8cdd6;
+  white-space: pre-wrap;
+  line-height: 1.7;
+}
+
+/* 诊断计数 */
+.stats-grid {
+  display: flex;
+  flex-wrap: wrap;
+}
+.stat {
+  width: 33.33%;
+  text-align: center;
+  padding: 12rpx 0;
+}
+.stat-num {
+  display: block;
+  font-size: 34rpx;
+  font-weight: 600;
+  color: #4fc3f7;
+  font-variant-numeric: tabular-nums;
+}
+.stat-num.err { color: #f18a8a; }
+.stat-label {
+  display: block;
+  font-size: 20rpx;
+  color: #8a8f9c;
+  margin-top: 4rpx;
+}
+
+/* 排查清单 */
+.help-item {
+  font-size: 24rpx;
+  color: #8a8f9c;
+  line-height: 1.8;
+}
+
+.bottom-gap { height: 40rpx; }

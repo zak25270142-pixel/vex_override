@@ -8,6 +8,7 @@
 constexpr float math_pi = 3.1415927f;
 constexpr float deg_to_rad = math_pi / 180.0f;
 constexpr float rad_to_deg = 180.0f / math_pi;
+constexpr float full_volt = 12.0f;
 
 struct position16t
 {
@@ -20,7 +21,7 @@ struct Size16t
     int16_t width;       // 标记宽
     int16_t height;      // 高
 };
-// 通用二维点。目前唯一的用途是 kf 前馈表的节点：x = |target|(pct)，y = 前馈输出(归一)。
+// 通用二维点。目前唯一的用途是 kf 前馈表的节点：x = 带符号目标速度(pct)，y = 稳态前馈(V)。
 // 表的口径与标定方法见 docs/代码功能说明/kf阻力前馈插值表.md，改口径前先看那边。
 struct Vec2f
 {

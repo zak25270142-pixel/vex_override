@@ -48,12 +48,16 @@
         </button>
       </div>
     </main>
+
+    <!-- 固件回执异常 toast（拒绝/补发/放弃）：Teleport 到 body，右下角堆叠 -->
+    <AlertToasts />
   </div>
 </template>
 
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import AppHeader from '@/components/shell/AppHeader.vue'
+import AlertToasts from '@/components/common/AlertToasts.vue'
 import ViewStage from '@/components/stage/ViewStage.vue'
 import RightWorkbench from '@/components/shell/RightWorkbench.vue'
 import {

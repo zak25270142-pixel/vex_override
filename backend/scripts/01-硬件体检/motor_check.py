@@ -36,11 +36,12 @@ def main() -> None:
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("motor_check_%s" % args.tag)   # 每台一段原始 CSV
         os.makedirs(out_dir, exist_ok=True)
-        # 开环直设电压要求速度环空闲：环活着会每 10ms 覆盖 0x84，读到的是被扶住的假数据
+        # 0x84 组开环电压会自己把速度环踹开并保持（open_loop 态），不需要先停车。
+        # 这里只是提醒"上一次没收车"，不影响本次结论。
         st_l, st_r = bl.latest("左环状态"), bl.latest("右环状态")
         if st_l != 0 or st_r != 0:
-            print(f"[warn] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}），"
-                  f"0x84 会被每拍覆盖，结论不可信")
+            print(f"[note] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}），"
+                  f"说明上一次没收车；本脚本会自行接管，不影响结论")
         bl.sub(rpm_names + cur_names + pos_names)  # 登记要记录的项
         rows = []
         for mid in range(6):

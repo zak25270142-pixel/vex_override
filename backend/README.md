@@ -16,8 +16,29 @@ py -3.13 -m venv .venv                      # 固定用 3.13 建（本机 py 默
 
 ```bash
 cd d:\work\vex\test1\backend
-.\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+> **`--host 0.0.0.0` 不能省**：`127.0.0.1` 只有跑后端的这台机器能连。手机小程序
+> （`miniprogram/`）要连后端，手机与 PC 必须同网段（同连一个热点），且后端必须绑
+> `0.0.0.0` 监听局域网。只跑浏览器上位机（同机）时绑哪个都行。
+
+## 演示模式（没有真车/真固件）
+
+`V5_MOCK=1` 起服务，后端用 `app/mock_v5.py` 的 MockV5Bridge 顶替串口后面的那台 V5：
+
+```powershell
+$env:V5_MOCK=1
+.\.venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+- 小程序/网页连 WS 的行为与真机**完全一致**：拉三张表（burst + OK 项数）、订阅后
+  100Hz/80ms 推送、调参回显、命令回执、80ms 心跳、status/alert 带外消息
+- 模拟主控内置 14 个监控项 / 9 个调参项 / 5 条命令（含停车）；「原地转向」永远返回
+  BUSY 拒绝，用来演示拒绝 toast；「设备备注」是 str 类型只读项（2026-10-25 协议行为）
+- 实现方式：Hub 构造时注入 bridge 工厂（`bridge_factory`），只换"字节怎么进出设备"，
+  WS 透传/订阅 diff/停车插队/重连全部走真实路径——演示模式测的是真链路，不是 mock 本身
+- 自测（不起服务）：`.\.venv\Scripts\python -m debug.test_mock_v5`
 
 自测（无需串口、不起服务；改了协议/hub 后跑一遍）：
 
@@ -119,7 +140,7 @@ with BackendLink() as bl:
 v.sub(["左0转速", "左0实际电压"])
 for volt in (0.5, 1.0, 1.5):
     v.start_log()                                    # 每档一段独立记录
-    v.cmd("设置电机电压", 0, volt)
+    v.cmd("组开环电压", 0, volt, 0.0, 0.0)   # 组别 0=左组，后三个是该组逐台电压
     v.sleep(0.4)
     v.end_log()
     print(volt, v.calc("左0转速", agg="mean")["value"])   # 本段均值（mean/sum 二选一）

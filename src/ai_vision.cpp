@@ -6,7 +6,7 @@ static vex::aivision::colordesc AI_YELLOW(2, 224, 190, 34, 20.0f, 0.30f);
 static vex::aivision::colordesc AI_BLUE(3, 35, 55, 205, 20.0f, 0.30f);
 static vex::aivision::colordesc AI_GRAY(4, 92, 94, 96, 12.0f, 0.16f);
 
-vex::aivision ai_sensor(vex::PORT12,
+vex::aivision ai_sensor(vex::PORT14,
                         AI_RED, AI_YELLOW, AI_BLUE, AI_GRAY,
                         vex::aivision::ALL_TAGS);
 

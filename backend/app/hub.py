@@ -15,11 +15,13 @@ from collections import deque
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import numpy as np
 from fastapi import WebSocket
 
 from .protocol import (
+    CMD_ACTION_MIN,
     CMD_TAG_RANGE,
     CmdGet,
     CmdPost,
@@ -35,6 +37,7 @@ from .protocol import (
     request_command,
     request_monitor,
     request_tunable,
+    REQ_LIST_MAX,
     resp_is_ok,
     resp_is_retry,
     resp_reason_text,
@@ -45,6 +48,8 @@ from .protocol import (
     value_size,
 )
 from .dataclass import (
+    AlertLevel,
+    AlertMessage,
     CalcResult,
     CmdDirItem,
     CmdField,
@@ -53,8 +58,7 @@ from .dataclass import (
     EndLogResult,
     LeaseResult,
     LogFileMeta,
-    LogRow,
-    LogRowsResult,
+    LogSeries,
     MenuItem,
     MonitorReading,
     MonitorSample,
@@ -100,11 +104,36 @@ RECONNECT_INTERVAL_S = 5.0
 # 固件对需要确认的下行帧回 CmdPost.Response：OK / 需补发 / 明确拒绝。
 # 上位机按 cmd 键维护待确认表：响应到达即结算，超时则原帧重发。
 # 超时口径：响应延迟 ≤1 拍（10ms，rx 入队→下一 tx_tick 发出），动作命令/订阅/
-# 调参取 100ms（10 倍余量）；目录请求要等整个 burst 传完才回 OK，最坏
-# 255 项 ÷ 8 项/拍 = 32 拍 ≈ 320ms，取 1000ms（3 倍余量）。
+# 调参取 100ms（10 倍余量）。
+# 目录请求为什么给到 1s——两件事要分清，原注释把它们混成了一句：
+#   ① 发目录分批是**被迫**的：固件 handle_command 里不直接发（一次性几百帧会阻塞
+#      串口 read），只置"还剩几批"的倒计时，由 tx_tick 每拍发 DIR_BATCH=8 项
+#      （命令目录 CMD_DIR_BATCH=4）。目录数据本来就在固件数组里，没有"去取"的延迟。
+#   ② 回 OK 排在末批是**选择**：回 OK 就几个字节，收到时立刻入队完全不阻塞。固件
+#      注释写的是"末批发完=目录传完"——**OK 的语义是"目录传完了"，不是"收到了"**。
+#      上位机因此能拿 OK 当"目录齐了"的信号；若改成收到即回，OK 就退化成纯链路确认，
+#      burst 半路断了（固件复位 / 串口卡死）上位机再也无从察觉。
+# 余量的真实口径（原注释按"单个 burst"算，错了）：后端 :541-543 连续发三个目录请求，
+#   而固件 tx_tick 是 if/else if **串行**处理（tunable→monitor→command），所以第三个
+#   请求的 OK 要等三个 burst 之和。极限 255+255+32 项：32+32+8 = 72 拍 ≈ 720ms，
+#   1s 只留约 1.4 倍余量，不是 3 倍。够用，但没原注释写的那么宽裕。
 ACK_TIMEOUT_DIR_S = 1.0
 ACK_TIMEOUT_CMD_S = 0.1
 ACK_MAX_RETRIES = 3  # 超时/需补发的重发上限；用尽后放弃并记日志（防版本不匹配无限重发）
+# 目录"对照→补发"外循环的轮次上限。每个补发帧自带 ACK_MAX_RETRIES 次重发，
+# 但外循环每轮发的都是新帧、预算永远烧不完——不单独数轮次会滚雪球。
+DIR_MAX_ROUNDS = 3
+
+# 内置下行命令的中文名（Response 回显/alert 提示用）。动作命令名不在表里——
+# 查 cmd_dir（下位机命令目录发的中文名），见 Hub._cmd_label。
+BUILTIN_CMD_NAMES = {
+    CmdGet.RequestTunable: "请求调参目录",
+    CmdGet.RequestMonitor: "请求监控目录",
+    CmdGet.RequestCommand: "请求命令目录",
+    CmdGet.Subscribe: "订阅监控项",
+    CmdGet.SetTunable: "写调参项",
+    CmdGet.Ping: "心跳",
+}
 
 
 def _ack_timeout_s(cmd: int) -> float:
@@ -115,8 +144,13 @@ def _ack_timeout_s(cmd: int) -> float:
 
 # ---------- 日志缓冲上限 ----------
 # 脚本忘了 end_log 会一直攒到内存吃满。超出后"丢新不丢旧"：
-# 保留已记录的时间窗完整，事后按窗口统计仍有意义
-MAX_LOG_SAMPLES = 500_000
+# 保留已记录的时间窗完整，事后按窗口统计仍有意义。
+#
+# 上限按"拍"（宽表的行）而不是按样本条数：条数会随登记项数漂移（记 20 项能撑 250s、
+# 记 50 项只有 100s），语义说不清；帧数才是"最长记多久"。100Hz 下 5000 帧 = 50 秒。
+# 内存不再是约束：宽表一格 8 B，50 列 × 5000 帧 = 2 MB（旧的分桶 list-of-tuple 是
+# 120 B/样本，同样规模要 30 MB），给到 3 万帧也才 12 MB。
+MAX_LOG_FRAMES = 5000
 
 # 默认 pytest 输出目录（相对 backend/）
 DEFAULT_PYTEST_DIR = Path(__file__).resolve().parent.parent / "pytest"
@@ -166,15 +200,20 @@ class Hub:
         port: str | None = None, # 串口端口
         baud: int = 115200, # usb 中仅占位
         pytest_dir: Path | None = None, # pytest 输出目录
+        bridge_factory: Callable[..., SerialBridge] | None = None, # 建桥工厂：None=真串口
     ) -> None:
-        """建 Hub：组装 SerialBridge（回调指回本类），建目录缓存/队列/锁等全部内部状态。
+        """建 Hub：组装串口桥（回调指回本类），建目录缓存/队列/锁等全部内部状态。
 
         port      : 串口名；None=交给 SerialBridge 自动探测
         baud      : 波特率（CDC 虚拟口仅占位）
         pytest_dir: print_log 不传 path 时的默认落盘目录；None 用 backend/pytest
+        bridge_factory: 建桥工厂；None=默认 SerialBridge（真串口）。演示模式
+                        （V5_MOCK=1）由 main.py 注入 mock_v5.MockV5Bridge——
+                        只换"字节怎么进出设备"，Hub/WS/脚本 API 其余一律不动。
         注意：这里只建对象不开串口，真正连接由 start()/ensure_connected() 触发。
         """
-        self.bridge = SerialBridge(
+        factory = bridge_factory or SerialBridge
+        self.bridge = factory(
             port=port,
             baud=baud,
             on_frame=self._on_frame, # 完整帧回调 (cmd, payload)
@@ -219,7 +258,7 @@ class Hub:
         '''下位机实际推送档位 {index -> (sub:bool, fast:bool)}'''
 
         # 脚本 sub(x, 'log'/'both') 写入
-        # value 推送只有在 logging 且 idx 在集合里时才进 log_dir
+        # value 推送只有在 logging 且 idx 在集合里时才进记录矩阵
         self.log_reg: set[int] = set() 
         '''要监听打印的数据index {index1,index2,...}'''
 
@@ -240,13 +279,39 @@ class Hub:
         self.logging = False
         '''是否正在记录。start_log 置 True,end_log 置 False'''
 
-        # t_ms:相对 _log_stamp0 的下位机毫秒（不是到达时刻）,每条按时间升序 append；
-        self.log_dir: dict[int, list[tuple[int, Any]]] = {}
-        '''记录样本缓冲 {index: [(t_ms:int, value:Any), ...]}'''
+        # 记录缓冲是一张宽表：行 = 一拍，列 = 监控项 index，格 = 该拍该项的值，
+        # NaN = 这一拍没收到（空单元格的位置就是丢包位置）。
+        #
+        # 为什么是宽表而不是"按项分桶的 list"：
+        #   · 写入是 O(1) 的标量赋值，不是每样本造一个 tuple+int+float（实测 120 B/样本）
+        #   · 常驻内存降到 8 B/格，50 列 × 5000 帧 = 2 MB（同样规模旧结构 30 MB）
+        #   · 行在写入时就按拍对齐好，导出/统计不用再打散重组
+        # 行 = 拍的依据：下位机一帧带一个时间戳 + N 个监控项，同帧内时刻完全相同。
+        self._log_mat: np.ndarray | None = None
+        '''记录矩阵 (MAX_LOG_FRAMES, 列数) float64，NaN 表示该拍缺样本'''
+
+        self._log_t: np.ndarray | None = None
+        '''每行的时刻（毫秒，相对 _log_stamp0）；长度同 MAX_LOG_FRAMES'''
+
+        self._log_row = 0
+        '''下一个待写行号；数值上等于本段已写入的行数'''
+
+        # 列 ↔ 监控项 index 的映射，start_log 那一刻按 log_reg 定死（本段内不再变）。
+        # 为什么不直接用 index 当列号（直接寻址）：那样列宽得按"目录里最大的 index+1"
+        # 预分配，只登记几个高 index 项时会白占上百列；而按登记集合紧凑排，
+        # 列宽 = len(log_reg) 精确，也顺带让"记录期间新登记"自然落到集合外。
+        # 关键是**本段内不 grow**：矩阵只在列数变化时重建，而重建只发生在 start_log
+        # （HTTP 线程）里。绝不能在 _record（rx 线程，100Hz 每帧 10ms）里扩列——
+        # 实测 5000 行扩一次 1.99~2.71 ms，头几帧新 index 集中到达会直接打穿帧预算。
+        self._log_col_idx: list[int] = []
+        '''本段列号 → 监控项 index（按 index 升序）'''
+
+        self._log_col_of: dict[int, int] = {}
+        '''本段监控项 index → 列号；不在表里 = 本段没登记它'''
 
         # >0 说明这轮记录不完整；end_log / print_log / snapshot 都会带上它。
         self.log_dropped = 0
-        '''到 MAX_LOG_SAMPLES后 丢弃的新样本数'''
+        '''到 MAX_LOG_FRAMES 后 丢弃的帧数'''
 
         self._stamp_raw = -1
         '''下位机时间戳展开：上一帧的原始 uint16；-1=还没收到过（与前端 expandStamp 同构）'''
@@ -257,10 +322,10 @@ class Hub:
         self._log_stamp0 = 0
         '''start_log 那一刻的下位机时刻；样本里的 t_ms 都相对它'''
 
-        # 守护整份记录缓冲：rx 线程 100Hz 在 _record 里 append，
-        # HTTP 线程同时在 _samples（取副本）/ start_log（清空）——不锁就会边读边改。
+        # 守护整份记录缓冲：rx 线程 100Hz 在 _record 里写格子，
+        # HTTP 线程同时在取宽表副本 / start_log 复位写指针——不锁就会边读边改。
         self._log_lock = threading.Lock()
-        '''锁：护 log_dir（rx 100Hz append vs HTTP 线程取样本 / start_log 清空）'''
+        '''锁：护记录宽表（rx 100Hz 写格 vs HTTP 线程取整段 / start_log 复位）'''
 
         # ---------- WebSocket 上位机：广播目标名单 ----------
 
@@ -297,6 +362,8 @@ class Hub:
         '''护 _pending_acks 的读写锁（rx 线程结算 vs tx 线程扫描重发）'''
         self._pending_acks: dict[int, PendingAck] = {}
         '''待确认下行帧 {命令字: PendingAck}，重连时清空'''
+        self._dir_rounds: dict[int, int] = {}
+        '''目录补发轮次 {命令字: 已补发轮数}；目录齐了/重连时清除（外循环上限见 _check_dir_complete）'''
 
         # 确认过程计数（诊断用：日志/后续 UI；目前只累加不对外出口）
         self.ack_ok = 0
@@ -441,6 +508,7 @@ class Hub:
                 self._name_to_cmd.clear()
                 # 旧链路的在途帧永远等不到响应了：待确认表作废，重拉从头计时
                 self._pending_acks.clear()
+                self._dir_rounds.clear()
                 self._request_all_dirs()
                 # 把聚合后的订阅意图补发给下位机（重连不丢订阅）
                 self._restore_subscriptions()
@@ -491,6 +559,80 @@ class Hub:
         table.clear()
         names.clear()
         self._send_tracked(request_frame, PRI_UI)  # 登记待确认：burst 末批的 OK 才算拉到
+
+    # ---------- 目录完整性对照（OK 带总项数 → 缺项补发） ----------
+
+    # 目录请求命令字 → 请求构建器（全量与补发同一个构建器，indices 区分）
+    _DIR_REQUEST_BUILDERS = {
+        CmdGet.RequestTunable: request_tunable,
+        CmdGet.RequestMonitor: request_monitor,
+        CmdGet.RequestCommand: request_command,
+    }
+
+    def _dir_table(self, cmd: int) -> tuple[dict[int, DirEntry], dict[str, int], int] | None:
+        """目录请求命令字 → (目录表, 名字反查表, 下标基准)；不是目录请求返回 None。
+
+        下标基准：tunable/monitor 的表下标就是寻键（0 起）；cmd_dir 按命令字寻键
+        （0x80 起），而补发帧按表下标寻址（固件 req_idx 直接索引 cmd_items）——
+        两者差一个 CMD_ACTION_MIN，对照和补发都要换算。
+        """
+        if cmd == CmdGet.RequestTunable:
+            return self.tunable_dir, self._name_to_tun, 0
+        if cmd == CmdGet.RequestMonitor:
+            return self.monitor_dir, self._name_to_mon, 0
+        if cmd == CmdGet.RequestCommand:
+            return self.cmd_dir, self._name_to_cmd, CMD_ACTION_MIN
+        return None
+
+    def _check_dir_complete(self, cmd: int, info: bytes) -> None:
+        """目录请求的 OK 带回 1B 表内总项数：和实收目录项对照，缺哪项补发哪项。
+
+        在 _handle_response 锁外调用（补发要入队新帧）。三种结局：
+          无缺失        → 清轮次计数，完事
+          缺失 ≤16 项   → 部分补发（不清表，补齐帧按 index upsert 进现有目录）
+          缺失更多       → 全量重拉（清表重启：一次丢这么多项，多半是链路问题）
+          轮次超过上限   → 推 GiveUp alert 并放弃——每个补发帧自带 ACK_MAX_RETRIES
+                           次重发，但"对照→补发→对照"的外循环每轮都是新帧、预算
+                           永远烧不完，必须单独数轮次防滚雪球
+        """
+        pair = self._dir_table(cmd)
+        if pair is None or not info:
+            return
+        table, names, base = pair
+        count = info[0]
+        # 期望键集 = 下标基准起连续 count 个（命令目录按命令字，其余按表下标）
+        missing = set(range(base, base + count)) - table.keys()
+        if not missing:
+            self._dir_rounds.pop(cmd, None)
+            return
+        rounds = self._dir_rounds.get(cmd, 0) + 1
+        label = self._cmd_label(cmd)
+        if rounds > DIR_MAX_ROUNDS:
+            self._dir_rounds.pop(cmd, None)
+            logger.warning(
+                "%s 补发 %d 轮仍缺 %d 项（如 %s），放弃自动补发，请手动刷新目录",
+                label, DIR_MAX_ROUNDS, len(missing), sorted(missing)[:8],
+            )
+            self._push_alert(
+                AlertLevel.GiveUp, cmd, label,
+                f"目录补发 {DIR_MAX_ROUNDS} 轮仍缺 {len(missing)} 项，请手动刷新目录",
+            )
+            return
+        self._dir_rounds[cmd] = rounds
+        builder = self._DIR_REQUEST_BUILDERS[cmd]
+        if len(missing) <= REQ_LIST_MAX:
+            logger.info(
+                "%s 应收 %d 项、实收 %d 项，补发缺失 %d 项（第 %d 轮）",
+                label, count, len(table), len(missing), rounds,
+            )
+            # 补发帧按表下标寻址（固件 req_idx 直接索引表），命令目录要减掉基准
+            self._send_tracked(builder(sorted(k - base for k in missing)), PRI_UI)
+        else:
+            logger.info(
+                "%s 缺 %d 项超过补发上限 %d，改全量重拉（第 %d 轮）",
+                label, len(missing), REQ_LIST_MAX, rounds,
+            )
+            self._request_dir(table, names, builder())  # 全量重拉：清表重启
 
     def _request_all_dirs(self) -> None:
         """拉三张表：调参目录、监控目录、命令目录。连上和重连后都要调。"""
@@ -732,9 +874,9 @@ class Hub:
         if entry is not None:
             return len(entry.frame) - 3  # A5 + cmd + XOR
         builtin = {
-            CmdGet.RequestTunable: 0,
-            CmdGet.RequestMonitor: 0,
-            CmdGet.RequestCommand: 0,
+            CmdGet.RequestTunable: 1,  # [len]：全量请求的回显就1B；补发帧的回显长度由待确认表里的原帧给出
+            CmdGet.RequestMonitor: 1,
+            CmdGet.RequestCommand: 1,
             CmdGet.Subscribe: 2,
             CmdGet.SetTunable: 9,
             CmdGet.Ping: 0,
@@ -746,6 +888,36 @@ class Hub:
             return sum(value_size(f.type) for f in dir_entry.item.fields)
         return None
 
+    def _cmd_label(self, cmd: int, echo: bytes = b"") -> str:
+        """回显命令字 → 带中文名的描述（alert/日志用）。
+
+        动作命令名取命令目录（下位机发的中文名）；SetTunable/Subscribe 的回显
+        payload 首字节是 index，顺势解析出具体项名——"写调参项「左轮kp」被拒绝"
+        比"命令 0x03 被拒绝"有用得多。查不出一律退回 0xXX，不猜。
+        """
+        if cmd == CmdGet.SetTunable and echo:
+            entry = self.tunable_dir.get(echo[0])
+            if entry is not None:
+                return f"写调参项「{entry.item.name}」"
+        if cmd == CmdGet.Subscribe and echo:
+            entry = self.monitor_dir.get(echo[0])
+            if entry is not None:
+                return f"订阅监控项「{entry.item.name}」"
+        dir_entry = self.cmd_dir.get(cmd)
+        if dir_entry is not None and isinstance(dir_entry.item, CmdDirItem):
+            return f"动作命令「{dir_entry.item.name}」"
+        return BUILTIN_CMD_NAMES.get(cmd, f"命令 0x{cmd:02X}")
+
+    def _push_alert(self, level: AlertLevel, cmd: int, name: str, text: str) -> None:
+        """推一条 WS alert 给所有前端（_broadcast_json 的 alert 专用壳）。
+
+        与 logger 双写不重复：logger 给后台排查，alert 给操作者即时提示。
+        没有客户端时 _broadcast_json 自己空转，这里不判断。
+        """
+        self._broadcast_json(
+            AlertMessage(op="alert", level=level, cmd=cmd, name=name, text=text)
+        )
+
     def _handle_response(self, p: bytes) -> None:
         """结算一帧 Response（_on_frame 的 Response 分支，rx 线程里执行）。
 
@@ -755,12 +927,26 @@ class Hub:
                       计入同一份重试预算——永久性原因（如版本不匹配）不会无限重发
           明确拒绝   → 不重发（重发无意义）：内定err号/原因串进日志。
                       拒绝类是给机器决策的（INDEX_RANGE 该去刷目录、BUSY 该等待）
-        表操作持 _ack_lock；入队/日志在锁外（enqueue 另持 _tx_cv，不嵌套）。
+
+        非 OK 且前端看不出来的结局，另推 WS alert（op="alert"）弹提示：
+          giveup = 补发预算耗尽 / 超时放弃 / 响应帧无法结算——命令状态不明。
+        拒绝与"正在补发"不在这里推：Response 帧本身随串口字节透传给前端，
+        它自己解析后弹提示（见前端 store 的 response 分支），两端都推会双弹。
+        目录请求的 OK 附带 1B 表内总项数：锁外做一次完整性对照，缺项自动补发
+        （见 _check_dir_complete）。
+        表操作持 _ack_lock；入队/广播/日志在锁外（enqueue 另持 _tx_cv，不嵌套）。
         """
         if len(p) < 2:
             self.ack_unexpected += 1
+            self._push_alert(
+                AlertLevel.GiveUp, 0, "响应帧", f"响应帧过短（{len(p)}B），无法结算"
+            )
             return
         echo_cmd = p[1]
+        # alert: (级别, 命令名, 说明)。None = 这帧前端自己看得见，不双弹
+        alert: tuple[AlertLevel, str, str] | None = None
+        # 目录 OK 的对照+补发：(命令字, info字节)。持锁内只登记，锁外才执行（要入队新帧）
+        dir_check: tuple[int, bytes] | None = None
         with self._ack_lock:
             # 先取不 pop：坏响应（一致性校验失败）不弄丢待确认帧，留给超时重发自愈
             entry = self._pending_acks.get(echo_cmd)
@@ -768,21 +954,35 @@ class Hub:
             if echo_len is None:
                 self.ack_unexpected += 1
                 log = f"Response 无法解析：回显命令字 0x{echo_cmd:02X} 无待确认帧且长度不可知"
+                alert = (
+                    AlertLevel.GiveUp,
+                    self._cmd_label(echo_cmd),
+                    log,
+                )
                 resend = None
             else:
                 decoded = decode_response(p, echo_len)
                 if decoded is None:
                     self.ack_unexpected += 1
                     log = "Response 一致性校验失败（payloadlen 与回显长度不符），丢弃"
+                    alert = (
+                        AlertLevel.GiveUp,
+                        self._cmd_label(echo_cmd, p[2 : 2 + echo_len]),
+                        log,
+                    )
                     resend = None
                 else:
-                    _, _, status, reason = decoded
+                    _, echo, status, reason = decoded
+                    label = self._cmd_label(echo_cmd, echo)
                     reason_text = resp_reason_text(status, reason)
                     if resp_is_ok(status):
                         self._pending_acks.pop(echo_cmd, None)
                         self.ack_ok += 1
                         log = None
                         resend = None
+                        # 目录请求的 OK 带 1B 总项数：登记，锁外对照补发
+                        if echo_cmd in self._DIR_REQUEST_BUILDERS and reason:
+                            dir_check = (echo_cmd, reason)
                     elif not resp_is_retry(status):  # 明确拒绝
                         self._pending_acks.pop(echo_cmd, None)
                         self.ack_reject += 1
@@ -791,11 +991,21 @@ class Hub:
                     elif entry is None:  # 需补发但无帧可发
                         self.ack_unexpected += 1
                         log = f"命令 0x{echo_cmd:02X} 需补发但无待确认帧可发：{reason_text}"
+                        alert = (
+                            AlertLevel.GiveUp,
+                            label,
+                            f"需补发但无原帧可重发：{reason_text}",
+                        )
                         resend = None
                     elif entry.retries <= 0:  # 预算耗尽
                         self._pending_acks.pop(echo_cmd, None)
                         self.ack_timeout += 1
                         log = f"命令 0x{echo_cmd:02X} 补发预算已用尽：{reason_text}"
+                        alert = (
+                            AlertLevel.GiveUp,
+                            label,
+                            f"补发 {ACK_MAX_RETRIES} 次仍失败：{reason_text}",
+                        )
                         resend = None
                     else:  # 需补发：扣预算、顺延 deadline、原帧重发
                         entry.retries -= 1
@@ -813,6 +1023,10 @@ class Hub:
                 logger.info(log)  # 补发重试：正常流转，info 就够
         if resend is not None:
             self.enqueue(*resend)
+        if dir_check is not None:
+            self._check_dir_complete(*dir_check)
+        if alert is not None:
+            self._push_alert(alert[0], echo_cmd, alert[1], alert[2])
 
     def _sweep_acks(self) -> None:
         """扫待确认帧：超时未收到 Response 就原帧重发（_tx_loop 每轮调，空转时 0.1s 一拍）。
@@ -827,6 +1041,7 @@ class Hub:
                 return
             now = time.monotonic()
             resends: list[tuple[bytes, int]] = []
+            giveups: list[tuple[int, bytes]] = []  # (命令字, 原帧)：放弃的要推 alert
             logs: list[tuple[int, str]] = []
             if not self.bridge.connected:
                 for e in self._pending_acks.values():
@@ -843,6 +1058,7 @@ class Hub:
                         f"命令 0x{cmd:02X} 重试 {ACK_MAX_RETRIES} 次均无确认，"
                         f"放弃（帧 {e.frame.hex()}）",
                     ))
+                    giveups.append((cmd, e.frame))
                     continue
                 e.retries -= 1
                 e.deadline = now + e.timeout
@@ -856,6 +1072,15 @@ class Hub:
             logger.log(level, text)
         for frame, pri in resends:
             self.enqueue(frame, pri)
+        for cmd, frame in giveups:
+            # 超时放弃只有后端知道——前端在等一帧永远不会到的回执，不推 alert
+            # 的话操作者看到的就是"点了没反应"且没有任何提示
+            self._push_alert(
+                AlertLevel.GiveUp,
+                cmd,
+                self._cmd_label(cmd, frame[3:-1]),
+                f"补发 {ACK_MAX_RETRIES} 次均无固件确认，已放弃（帧 {frame.hex()}）",
+            )
 
     def _tx_loop(self) -> None:
         """唯一的串口写线程。没事干时睡在 Condition 上，来帧就被唤醒。"""
@@ -1011,7 +1236,9 @@ class Hub:
         }
         if cmd in dir_map:
             table, names, request_fn = dir_map[cmd]
-            frames = [e.frame for _, e in sorted(table.items())]
+            # list() 快照：本方法跑在事件循环线程，而 rx 线程正在目录 burst 里插 key，
+            # 直接迭代/排序会撞上 "dictionary changed size during iteration"（R1）。
+            frames = [e.frame for _, e in sorted(list(table.items()))]
             if frames:
                 try:
                     loop = self._loop
@@ -1057,11 +1284,12 @@ class Hub:
         # 有了目录后以目录为准（从 tag SPEC=Stop 认出来），硬编码只在早期生效。
         return self._stop_cmd_index if self._stop_cmd_index is not None else 0x80
 
-    def _broadcast_json(self, msg: StatusMessage) -> None:
-        """给所有 WS 客户端推一条状态 JSON 消息（StatusMessage → JSON）。
+    def _broadcast_json(self, msg: StatusMessage | AlertMessage) -> None:
+        """给所有 WS 客户端推一条 JSON 文本消息（StatusMessage / AlertMessage）。
 
         与 _broadcast_bytes 的区别：字节通道走的是"下位机原样数据"，
-        JSON 通道走的是"Backend 自己的状态"（连接状态等），两者互不混淆。
+        JSON 通道走的是"Backend 自己的状态与决策"（连接状态、回执异常），
+        两者互不混淆；前端按 op 字段分流（status / alert）。
         """
         loop = self._loop
         if loop is None:
@@ -1139,7 +1367,8 @@ class Hub:
             return int(name)
         if name in self._name_to_mon:
             return self._name_to_mon[name]
-        for n, i in self._name_to_mon.items():  # 容错：忽略大小写
+        # list() 快照：rx 线程目录 burst 插 key 时迭代会 RuntimeError（R1）
+        for n, i in list(self._name_to_mon.items()):  # 容错：忽略大小写
             if n.lower() == name.lower():
                 return i
         raise KeyError(f"监控项不存在: {index_or_name}")
@@ -1159,7 +1388,7 @@ class Hub:
             return int(name)
         if name in self._name_to_tun:
             return self._name_to_tun[name]
-        for n, i in self._name_to_tun.items():
+        for n, i in list(self._name_to_tun.items()):   # list() 快照，同 resolve_monitor（R1）
             if n.lower() == name.lower():
                 return i
         raise KeyError(f"调参项不存在: {index_or_name}")
@@ -1178,7 +1407,7 @@ class Hub:
         name = str(index_or_name)
         if name in self._name_to_cmd:
             return self.cmd_dir[self._name_to_cmd[name]].item
-        for n, i in self._name_to_cmd.items():
+        for n, i in list(self._name_to_cmd.items()):   # list() 快照，同上（R1）
             if n.lower() == name.lower():
                 return self.cmd_dir[i].item
         raise KeyError(f"命令不存在: {index_or_name}")
@@ -1191,12 +1420,13 @@ class Hub:
         抛错: ValueError 类型不认识
         """
         t = type_.lower()
+        # 三处的 list() 快照同理：HTTP 线程读、rx 线程目录 burst 写（R1）
         if t in ("monitor", "mon"):
-            return [e.item for e in self.monitor_dir.values()]
+            return [e.item for e in list(self.monitor_dir.values())]
         if t in ("tunable", "tun"):
-            return [e.item for e in self.tunable_dir.values()]
+            return [e.item for e in list(self.tunable_dir.values())]
         if t in ("cmd", "command", "commands"):
-            return [e.item for e in self.cmd_dir.values()]
+            return [e.item for e in list(self.cmd_dir.values())]
         raise ValueError("type 必须是 monitor | tunable | cmd")
 
     def _mon_name(self, idx: int) -> str:
@@ -1303,6 +1533,12 @@ class Hub:
         if kind in ("log", "both"):
             if on:
                 self.log_reg.add(idx)
+                # 正在记录时新登记的项不进本段（本段列集合在 start_log 已定死，见那里）。
+                # 不抛错——sub 的返回值没有承载这个信息的字段，抛错会打断本就正确的
+                # 订阅动作；但静默不记太坑，所以在后端日志里留一条。
+                if self.logging and idx not in self._log_col_of:
+                    logger.warning("记录期间新登记 %s：不进本段（列集合在 start_log 已定死），"
+                                   "要记它请重新 start_log", self._mon_name(idx))
                 # 日志要有数据可记：不是高速推送就自动提升（前提/提升二选一，统一提升）
                 if kind == "log":
                     cur = self.fw_sub.get(idx, (False, False))
@@ -1495,93 +1731,170 @@ class Hub:
         self._stamp_raw = raw
         return self._stamp_ms
 
+    # 同拍合并容差 ms。下位机一帧带一个时间戳 + N 个监控项，同帧内时刻完全相同；
+    # 同一拍若被拆成多帧发，帧间时刻差也远小于 2ms——超过 2ms 就算下一拍。
+    # 不插值、不最近邻：这是"同拍精确配对"，与 calc 过去的口径一致。
+    ALIGN_TOL_MS = 2.0
+
     def _record(self, idx: int, value: Any, stamp_ms: int) -> None:
-        """记一条样本；超上限丢新样（防脚本忘 end_log 把内存吃光）。
+        """记一条样本到宽表；超过 MAX_LOG_FRAMES 丢新帧（防脚本忘 end_log 吃光内存）。
 
         丢新不丢旧：保留的是从 start_log 开始的完整一段，
         对"扫参看趋势"更有用；丢尾部只是少记后面一点。
+
+        行定位：与本行时刻相差 ≤ ALIGN_TOL_MS 就并入本行（同一拍），否则新开一行。
+        这样"行 = 拍"在写入时就定死了，导出和统计都不用再对齐。
         """
+        col = self._log_col_of.get(idx)
+        if col is None:
+            # 本段没登记这一项（记录期间新登记的不进本段，见 start_log）。
+            # 调用点已按 log_reg 过滤过，走到这里只会是"记录中新登记"这一种情况。
+            return
         with self._log_lock:
-            # logging / _log_stamp0 都必须在锁内读：start_log 会在锁内重置零点并清空缓冲，
-            # 若在锁外算 t，就可能拿旧零点算出巨大时间戳落进新一段——
-            # 那条样本会排到列表最前，破坏"时间升序"。
+            # logging / _log_stamp0 都必须在锁内读：start_log 会在锁内重置零点并复位写指针，
+            # 若在锁外算 t，就可能拿旧零点算出巨大时间戳落进新一段。
             if not self.logging:
                 return
             # 时间轴零点：start_log 那一刻的下位机时刻。样本里的 t 都是相对它的毫秒数
             t = stamp_ms - self._log_stamp0
-            if self.log_samples() >= MAX_LOG_SAMPLES:
-                self.log_dropped += 1
-                return
-            self.log_dir.setdefault(idx, []).append((t, value))
+            # 矩阵只装数：Color 解码成 "#rrggbb" 字符串，这里转回 0xRRGGBB 整数。
+            # decode_value 本身不改——那个字符串是给前端直接显示的（三端契约）。
+            if isinstance(value, str):
+                value = int(value[1:], 16) if value[:1] == "#" else float("nan")
+            row = self._log_row - 1
+            if row < 0 or abs(t - self._log_t[row]) > self.ALIGN_TOL_MS:
+                if self._log_row >= MAX_LOG_FRAMES:
+                    self.log_dropped += 1
+                    return
+                row = self._log_row
+                self._log_row += 1
+                self._log_t[row] = t
+            self._log_mat[row, col] = value
 
     def log_samples(self) -> int:
-        """样本总数。⚠️ 内部无锁遍历 dict，调用方必须持有 _log_lock
-        （_record 就是持锁调它的——Lock 不可重入，别把锁加进本方法内部）。
+        """本段非空样本数（宽表里非 NaN 的格子数）。
+
+        读的是 numpy 数组，不存在"遍历时 rx 线程插新 key"的问题，
+        所以不再要求调用方持锁——拿到的瞬间值判健康度足够。
         """
-        return sum(len(v) for v in self.log_dir.values())
+        if self._log_row == 0:
+            return 0
+        return int(np.count_nonzero(~np.isnan(self._log_mat[: self._log_row])))
 
     def start_log(self) -> StartLogResult:
-        """开始记录：清掉上一段缓冲，并以此刻为本段零点。
+        """开始记录：按此刻的 log_reg 定死本段列集合，复位写指针，并以此刻为零点。
 
-        记哪些项由脚本先用 sub(x, 'log'/'both') 登记；
-        记录期间新登记/退订即时生效（不用重启记录）。
+        **一段记哪些项，在 start_log 这一刻就定死**，之后 sub(x,'log') 新登记的项
+        **不进本段**（只影响下一段）。换项要重新 start_log——现有脚本本来就是
+        "sub 一次 → 循环里反复 start_log"，所以这条不增加任何负担。
+
+        为什么不允许中途加列：加列要 np.concatenate 整块拷贝矩阵，而 _record 跑在
+        rx 线程上、100Hz 每帧只有 10ms。实测 5000 行（= MAX_LOG_FRAMES）规模单次
+        grow 1.99~2.71 ms，头几帧新 index 集中到达时一帧能占掉 13.5 ms（帧预算的
+        135%）——直接打穿串口接收。把建表放到 start_log（HTTP 线程）里，热路径上
+        就只剩一次 dict 查列号 + 一次标量赋值。
         """
         with self._log_lock:
+            if not self.log_reg:
+                # 空登记集合会建出 0 列的矩阵，整段什么都记不到且毫无提示——
+                # 与其让脚本拿到一份空 csv 再猜，不如在这里就报错。
+                raise ValueError("还没登记要记录的项：先 sub(项名, 'log'/'both') 再 start_log")
             # logging 也要在锁内打开：rx 线程按它判断样本归哪一段，
-            # "重置零点 + 开始收样本"必须是同一个原子步骤
-            self.log_dir.clear()
+            # "定列 + 置零点 + 复位写指针 + 开始收样本"必须是同一个原子步骤
+            self._log_col_idx = sorted(self.log_reg)
+            self._log_col_of = {i: c for c, i in enumerate(self._log_col_idx)}
             self.log_dropped = 0
             self._log_stamp0 = self._stamp_ms  # 零点取当前下位机时刻，样本 t 都相对它
             self.logging = True
+            # 缓冲复用：只在列数变了才重建。上一段的数据留在行号 ≥ _log_row 的位置，
+            # 永远读不到，所以不用清——清一遍 5000×N 是纯浪费。重建走 HTTP 线程。
+            width = len(self._log_col_idx)
+            if self._log_mat is None or self._log_mat.shape[1] != width:
+                self._log_mat = np.full((MAX_LOG_FRAMES, width), np.nan)
+                self._log_t = np.zeros(MAX_LOG_FRAMES)
+            self._log_row = 0
         return StartLogResult(
             ok=True,
-            registered=[RegisteredItem(i, self._mon_name(i)) for i in sorted(self.log_reg)],
+            registered=[RegisteredItem(i, self._mon_name(i)) for i in self._log_col_idx],
         )
 
     def end_log(self) -> EndLogResult:
         """结束记录：锁内一并关掉收样本并数样本，返回本段总数与丢弃数。"""
         # 两件事一起在锁内做完：关掉收样本、数样本。
-        # rx 线程可能正卡在"过了 logging 检查、等锁落盘"那一步，锁住数才不会边遍历边改字典
+        # rx 线程可能正卡在"过了 logging 检查、等锁写格子"那一步，锁住数才不会边读边写
         with self._log_lock:
             self.logging = False
             return EndLogResult(ok=True, samples=self.log_samples(), dropped=self.log_dropped)
 
     def _log_indices(self, names) -> list[int]:
-        """把查询参数解析成一组 index：names=None 取全部已记录项，否则逐项 resolve。
+        """把查询参数解析成一组**列号**（不是 index）：列号 ↔ index 见 _log_col_idx。
 
-        names: None（全部）/ 单个 name 或 index / name、index 混合的列表
-        返回: index 列表（names=None 时按 index 升序）
+        names: None（本段有数据的全部列）/ 单个 name 或 index / name、index 混合的列表
+        本段没登记的项查不到列号，静默跳过——导出一份"没记的项"没有意义。
         """
         if names is None:
-            with self._log_lock:  # 防遍历 keys 时 rx 线程 setdefault 出新 key
-                return sorted(self.log_dir)
+            with self._log_lock:
+                return self._log_used_cols()
         if isinstance(names, (str, int)):
             names = [names]
-        return [self.resolve_monitor(n) for n in names]
+        out = []
+        for n in names:
+            col = self._log_col_of.get(self.resolve_monitor(n))
+            if col is not None:
+                out.append(col)
+        return out
 
-    def _samples(self, idx: int) -> list[tuple[int, Any]]:
-        """取某项整段样本的副本 [(t_ms, 值), ...]（按时间升序）。
+    def _log_used_cols(self) -> list[int]:
+        """本段至少有一个非空样本的**列号**（升序）。调用方须持 _log_lock。"""
+        if self._log_row == 0:
+            return []
+        used = ~np.isnan(self._log_mat[: self._log_row]).all(axis=0)
+        return [int(c) for c in np.nonzero(used)[0]]
 
-        在锁内复制一份指针列表再放锁：既避免遍历时 rx 线程 setdefault 出新 key，
-        也不把锁持有到统计/导出走完。
+    def log_frame(self, names=None):
+        """取整段记录为 pandas 宽表：行 = 拍，列 = 监控项中文名，格 = 值，NaN = 该拍缺。
+
+        这是记录数据的唯一取用形态。行在 _record 写入时就按拍对齐好了，
+        所以 csv / 图 / calc 都直接吃它，不再有"打散成长表 → 再分桶重组"的中间层。
+        实测（50 项 × 5000 帧 = 250k 样本）取这一步：旧 57.9 ms（物化 250k 个
+        LogRow 再排序分桶）→ 新 2.2 ms（矩阵切片 + DataFrame）。注意这只是"取数"，
+        落盘那 117 ms（to_csv 250k 个格子）新旧都要付，省不掉。
+
+        names: None（本段有数据的全部项）/ 单个名字或 index / 混合列表。
+        无 HTTP 路由——脚本取数据走 /api/log/print。
         """
+        import pandas as pd  # 延迟导入：与 matplotlib 同例，不导出就没人付这 368 ms
+
+        idxs = None if names is None else self._log_indices(names)  # 名字解析在锁外
         with self._log_lock:
-            return list(self.log_dir.get(idx) or ())
+            n = self._log_row
+            t = self._log_t[:n].copy() if n else np.zeros(0)
+            mat = self._log_mat[:n, :].copy() if n else np.zeros((0, 0))
+            if idxs is None:
+                idxs = self._log_used_cols()
+            col_idx = list(self._log_col_idx)     # 本段列号 → index，锁内快照
+        idxs = [c for c in idxs if c < len(col_idx)]
+        cols = [self._mon_name(col_idx[c]) for c in idxs]
+        if n == 0 or not cols:
+            return pd.DataFrame(np.zeros((0, len(cols))), columns=cols,
+                                index=pd.Index([], name="t_ms"))
 
-    def log_rows(self, names=None) -> LogRowsResult:
-        """取整段原始样本（长表，按时间排序），供脚本自己画图、落盘或自行统计。"""
-        idxs = self._log_indices(names)
-        rows: list[LogRow] = []
-        for idx in idxs:
-            name = self._mon_name(idx)
-            for t, v in self._samples(idx):
-                rows.append(LogRow(t=t, index=idx, name=name, value=v))
-        rows.sort(key=lambda r: r.t)
-        return LogRowsResult(rows=rows)
-
-    # 时间对齐容差 ms。登记的项都会被提升到高速推送(10ms)，同一拍发出的项时刻一致；
-    # 差 2ms 以上说明不是同一拍，不配对——所以这里只做"同拍精确配对"，不做插值/最近邻。
-    ALIGN_TOL_MS = 2.0
+        df = pd.DataFrame(mat[:, idxs], columns=cols)
+        df["_t"] = t
+        # 行合并兜底：_record 只跟"上一行"比，同一拍的样本若到达顺序被打乱
+        # （时间戳回退，或同一拍被拆成多帧且中间插进了别的拍），就会开成两行。
+        # 这里按 t 排序后把相邻且相差 ≤ALIGN_TOL_MS 的行并成一行（两行的非空格子
+        # 互相填充），使"同一拍 → 同一行"这个不变量与到达顺序无关。
+        # 正常的单调流没有相邻近时刻行，这个分支整段跳过，不付 groupby 的开销。
+        near = df["_t"].diff() <= self.ALIGN_TOL_MS
+        if near.any():
+            df = df.sort_values("_t", kind="stable").reset_index(drop=True)
+            g = df.groupby((df["_t"].diff() > self.ALIGN_TOL_MS).cumsum(), sort=False)
+            df, t = g.mean().drop(columns="_t"), g["_t"].min().to_numpy()
+        else:
+            t = df["_t"].to_numpy()
+            df = df.drop(columns="_t")
+        return df.set_index(pd.Index(t, name="t_ms"))
 
     def calc(self, expr: str, agg: str = "", window=None) -> CalcResult:
         """对本段记录做表达式计算：输入项名做逐点算术，再聚合成一个标量。
@@ -1599,6 +1912,10 @@ class Hub:
               "(左0电流 + 左1电流 + 左2电流) / 3"
         agg ：mean / sum（必填；没有"逐点序列"选项——要原始点就 print_log 导 csv）
         window：可选 [t0_ms, t1_ms]，只算这段时间内的点（t 轴零点 = start_log 时刻）
+
+        逐点对齐不用操心：记录宽表的行就是"拍"，同一拍的各项已经在同一行上
+        （_record 按 ±ALIGN_TOL_MS 定行），所以这里直接在整列上做算术。
+        某一拍缺项 → 该拍算出 NaN → 聚合时跳过，不整段报错。
 
         项的取值来源：有历史序列的（已登记 + 本段有样本）逐点参与运算；
         没有历史的（未登记的低速项）只有当前值，全程用这一个值，并在 missing 里标出。
@@ -1660,13 +1977,21 @@ class Hub:
         for n in names:
             self.resolve_monitor(n)   # 不存在会抛 KeyError
 
+        def _is_seq(v) -> bool:
+            """是否逐点序列（pandas Series / numpy 数组），而不是一个标量。"""
+            return isinstance(v, np.ndarray) or hasattr(v, "to_numpy")
+
         def as_real(v):
-            """运算结果收口：inf/nan 就地转 400，别留到 JSON 序列化时才炸。
+            """标量运算结果收口：inf/nan 就地转 400，别留到 JSON 序列化时才炸。
 
             inf/nan 来自加减乘除溢出（1e300 * 1e300）——复数曾来自负数的分数次幂，
             随 ** 一起删了，这里不再需要挡。
             除零不在这里挡——那是数据问题（某一拍分母为 0），跳点比整体报错合适。
+            Series 原样放过：它的逐点有限性由最后聚合后的 isfinite 统一收口，
+            中间拍出现 inf（如分母为 0）应当跳点而不是整段报错。
             """
+            if _is_seq(v):
+                return v
             if not math.isfinite(v):
                 raise ValueError("运算结果不是有限实数（检查过大的乘除与指数）")
             return v
@@ -1687,16 +2012,19 @@ class Hub:
                 return as_real(v)
             raise ValueError("不支持的语法节点")
 
-        # 取各项：有历史的用序列，没有的用当前值
+        # 宽表的行已经是"拍"，各项天然对齐，不需要再配对——
+        # 旧实现在这里按 ±ALIGN_TOL_MS 做双指针对齐，那是因为存储是分桶的、行要事后拼。
+        df = self.log_frame()
+        if window is not None:
+            df = df[(df.index >= window[0]) & (df.index <= window[1])]
+
+        # 取各项：本段有序列的用整列，没有的用当前值
         seq, single, missing = {}, {}, {}
-        t_index: dict[int, dict[str, float]] = {}
         for n in set(names):
-            idx = self.resolve_monitor(n)
-            pts = self._samples(idx)
-            if pts:
-                seq[n] = pts
+            if n in df.columns:
+                seq[n] = df[n]
             else:
-                s = self.monitor_latest.get(idx)
+                s = self.monitor_latest.get(self.resolve_monitor(n))
                 if s is None:
                     missing[n] = "没有任何取值"
                 else:
@@ -1721,43 +2049,29 @@ class Hub:
             return CalcResult(ok=True, expr=expr, agg=agg, value=v,
                               n=1, missing=missing)
 
-        # 以第一项的时刻为基准，其余项按 ±ALIGN_TOL_MS 同拍配对
-        base_name = sorted(seq)[0]
-        for t, v in seq[base_name]:
-            if window and not (window[0] <= t <= window[1]):
-                continue
-            t_index[int(round(t))] = {base_name: v}
-        for n in sorted(seq):
-            if n == base_name:
-                continue
-            for t, v in seq[n]:
-                k = int(round(t))
-                for cand in (k - 2, k - 1, k, k + 1, k + 2):
-                    if cand in t_index and abs(t - cand) <= self.ALIGN_TOL_MS:
-                        t_index[cand][n] = v
-                        break
+        # 逐点算：Series 之间按行对齐（index 相同），缺项的拍算出 NaN，聚合时自动跳过
+        env = {}
+        for n in set(names):
+            env[n] = seq[n] if n in seq else single[n]
+        res = eval_node(tree.body, env)
 
-        out = []
-        for t in sorted(t_index):
-            env = dict(t_index[t])
-            env.update(single)
-            if not all(n in env for n in names):
-                continue    # 本拍缺项就跳过
-            try:
-                out.append((t, eval_node(tree.body, env)))
-            except ZeroDivisionError:
-                continue
-        if not out:
-            raise ValueError("没有可配对的有效点（窗口内无样本 / 各项未落在同一拍 /"
-                             " 某项完全没有取值）")
-
-        vals = [v for _, v in out]
-        n = len(vals)
-        table = {
-            "mean": sum(vals) / n,
-            "sum": sum(vals),
-        }
-        return CalcResult(ok=True, expr=expr, agg=agg, value=table[agg], n=n,
+        if _is_seq(res):
+            arr = np.asarray(res, dtype=float)
+            # inf 是溢出/除零，是算错了，整段报错；NaN 是这一拍缺输入，跳过这一拍
+            # （等价于旧实现"本拍缺项就跳过"）——两者不能混为一谈。
+            if np.isinf(arr).any():
+                raise ValueError("运算结果不是有限实数（检查过大的乘除与指数）")
+            arr = arr[~np.isnan(arr)]
+            if arr.size == 0:
+                raise ValueError("没有可配对的有效点（窗口内无样本 / 各项未落在同一拍 /"
+                                 " 某项完全没有取值）")
+            n, total = int(arr.size), float(arr.sum())
+        else:
+            n, total = 1, float(res)
+        v = total / n if agg == "mean" else total
+        if not math.isfinite(v):
+            raise ValueError("运算结果不是有限实数（检查过大的乘除与指数）")
+        return CalcResult(ok=True, expr=expr, agg=agg, value=v, n=n,
                           missing=missing)
 
     def print_log(self, path: str | None = None, index_or_name=None) -> PrintLogResult:
@@ -1788,87 +2102,74 @@ class Hub:
             target = self.pytest_dir / "probe_data" / f"log_{datetime.now():%Y%m%d_%H%M%S}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        rows = self.log_rows(index_or_name).rows
+        df = self.log_frame(index_or_name)
         suffix = target.suffix.lower()
         columns: list[str] = []
         missing: dict[str, int] = {}
         if suffix == ".csv":
-            columns, missing = self._write_csv(target, rows)
+            columns, missing = self._write_csv(target, df)
         elif suffix in (".png", ".jpg", ".jpeg", ".pdf", ".svg"):
-            self._write_plot(target, rows)
+            self._write_plot(target, df)
         else:
-            self._write_json(target, rows)
+            self._write_json(target, df)
 
         return PrintLogResult(
             ok=True,
             path=str(target),
             format=suffix.lstrip("."),
-            samples=len(rows),
+            samples=int(df.notna().to_numpy().sum()),
             dropped=self.log_dropped,
             columns=columns,
             missing=missing,
         )
 
-    def _write_json(self, target: Path, rows: list[LogRow]) -> None:
-        """全量 JSON：元信息 + 原始样本长表。"""
+    def _write_json(self, target: Path, df) -> None:
+        """全量 JSON：元信息 + 时间轴 + 每项一条非空点列。
+
+        长表（每行重复中文名）已废：同样的点，长表体积膨胀 N 倍且读回来还得 pivot。
+        这里改成"一根共享时间轴 + 每列只存非空点"，体积约为长表的 40%。
+        """
+        t = df.index.to_numpy()
+        series = []
+        for i, name in enumerate(df.columns):
+            v = df[name].to_numpy()
+            keep = ~np.isnan(v)
+            series.append(LogSeries(
+                index=self._name_to_mon.get(name, -1),
+                name=name,
+                unit=self._mon_unit(self._name_to_mon.get(name, -1)),
+                points=[[float(a), float(b)] for a, b in zip(t[keep], v[keep])],
+            ))
         meta = LogFileMeta(
             created=datetime.now().isoformat(timespec="seconds"),
-            samples=len(rows),
+            samples=sum(len(s.points) for s in series),
             dropped=self.log_dropped,
             registered=[RegisteredItem(i, self._mon_name(i)) for i in sorted(self.log_reg)],
-            data=rows,
+            t_ms=[float(x) for x in t],
+            series=series,
         )
         with open(target, "w", encoding="utf-8") as f:
             json.dump(asdict(meta), f, ensure_ascii=False, indent=2, default=str)
 
-    # 宽表分桶宽度 ms：登记记录会把该项提升到高速推送（100Hz），按这个周期对齐
-    LOG_BUCKET_MS = 10
+    def _write_csv(self, target: Path, df) -> tuple[list[str], dict[str, int]]:
+        """宽表 CSV：一列一项，行首 t_ms = 该拍的时刻。
 
-    def _write_csv(self, target: Path, rows: list[LogRow]) -> tuple[list[str], dict[str, int]]:
-        """宽表 CSV：一列一项，行首 t_ms = 该行各非空样本时刻的均值。
+        宽表而不是长表：导出给 AI/脚本按列算（比值、相关性、差分），长表每行重复
+        中文名、行数与 token 都膨胀 N 倍，还得先 pivot 才能算。
 
-        为什么宽表而不是长表：导出给 AI/脚本按列算（比值、相关性、差分），长表每行
-        重复中文名、行数与 token 都膨胀 N 倍，还得先 pivot 才能算。
-
-        对齐：log 登记会把该项提升到高速推送，故按 LOG_BUCKET_MS 分桶，桶内每项取
-        最后一个样本。桶只由"到达了样本"的 10ms 窗口产生，没有样本的时段不出行；
-        桶内某列缺样本就留空单元格并计入 missing——空单元格的位置就是丢包位置
+        行就是"拍"，写入时已按 ±ALIGN_TOL_MS 对齐好，所以这里只是把 DataFrame 落盘：
+        某列这一拍缺样本 → 空单元格，计入 missing——空单元格的位置就是丢包位置
         （pandas 一样读成 NaN，但省 token）。
 
         返回 (列名, {列名: 空单元格数})。utf-8-sig 带 BOM，Excel 打开中文不乱码。
         """
-        buckets: dict[int, dict[str, Any]] = {}
-        t_of: dict[int, dict[str, float]] = {}
-        idx_of: dict[str, int] = {}
-        for row in rows:
-            b = int(row.t // self.LOG_BUCKET_MS)
-            buckets.setdefault(b, {})[row.name] = row.value   # 桶内取最后
-            t_of.setdefault(b, {})[row.name] = row.t
-            idx_of.setdefault(row.name, row.index)
-        cols = sorted(idx_of, key=lambda n: idx_of[n])        # 列序按 index，多次导出一致
+        missing = {c: int(n) for c, n in df.isna().sum().items()}
+        # %.10g：10 位有效数字能无损表示 uint32 上限（4294967295 恰好 10 位），
+        # 整数值又不会拖出 ".0" 尾巴；再短会丢计数类监控项的精度。
+        df.to_csv(target, encoding="utf-8-sig", na_rep="", float_format="%.10g")
+        return list(df.columns), missing
 
-        missing = {c: 0 for c in cols}
-        with open(target, "w", encoding="utf-8-sig", newline="") as f:
-            f.write("t_ms," + ",".join(cols) + "\n")
-            for b in sorted(buckets):
-                slot = buckets[b]
-                if not slot:
-                    continue
-                t_mean = sum(t_of[b][c] for c in slot) / len(slot)
-                cells = [f"{t_mean:.1f}"]
-                for c in cols:
-                    v = slot.get(c)
-                    if v is None:
-                        cells.append("")
-                        missing[c] += 1
-                    elif isinstance(v, float):
-                        cells.append(f"{v:.6g}")
-                    else:
-                        cells.append(str(v))
-                f.write(",".join(cells) + "\n")
-        return cols, missing
-
-    def _write_plot(self, target: Path, rows: list[LogRow]) -> None:
+    def _write_plot(self, target: Path, df) -> None:
         """按监控项作图并导出图片，横轴为相对本段零点的秒。
 
         一个单位一个子图、各自独立 y 轴：电压(0~12V)和电流(0~0.5A)共用一个 y 轴时，
@@ -1885,22 +2186,20 @@ class Hub:
         plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
         plt.rcParams["axes.unicode_minus"] = False
 
-        # 按单位分桶（保序：目录里先出现的单位在上）
-        by_unit: dict[str, dict[str, list[tuple[float, float]]]] = {}
-        order: list[str] = []
-        for r in rows:
-            u = self._mon_unit(r.index) or "值"
-            if u not in by_unit:
-                by_unit[u] = {}
-                order.append(u)
-            by_unit[u].setdefault(r.name, []).append((r.t / 1000.0, r.value))
+        # 按单位分组（保序：目录里先出现的单位在上）
+        by_unit: dict[str, list[str]] = {}
+        for name in df.columns:
+            u = self._mon_unit(self._name_to_mon.get(name, -1)) or "值"
+            by_unit.setdefault(u, []).append(name)
 
-        n = max(1, len(order))
+        n = max(1, len(by_unit))
         fig, axes = plt.subplots(n, 1, figsize=(12, 3.0 * n), sharex=True, squeeze=False)
-        for i, u in enumerate(order):
+        t = df.index.to_numpy() / 1000.0
+        for i, (u, cols) in enumerate(by_unit.items()):
             ax = axes[i][0]
-            for name, pts in by_unit[u].items():
-                ax.plot([p[0] for p in pts], [p[1] for p in pts], linewidth=1, label=name)
+            for c in cols:
+                # 缺样本的拍是 NaN，matplotlib 会断线而不是连成直线——正是要的效果
+                ax.plot(t, df[c].to_numpy(), linewidth=1, label=c)
             ax.set_ylabel(u)
             ax.grid(True, alpha=0.3)
             ax.legend(loc="upper right", fontsize=7, ncol=3)
@@ -1918,9 +2217,10 @@ class Hub:
         """/api/status 的返回体：一眼看清 Backend 全貌，调试脚本连不上的第一站。
 
         logging / log_samples / log_dropped 三个一起看能判断记录是否健康：
-        dropped > 0 说明撞了 50 万上限，这次记录不完整。
+        dropped > 0 说明撞了 MAX_LOG_FRAMES（5000 帧），这次记录不完整。
         """
-        with self._log_lock:  # 记录中被轮询时 rx 在 append，数样本防字典变尺寸
+        # 锁只为让这三个数取自同一个瞬间（不再有"字典变尺寸"的问题——存储是矩阵）
+        with self._log_lock:
             log_samples = self.log_samples()
         return Snapshot(
             status=self.status.value,
@@ -1935,5 +2235,5 @@ class Hub:
             log_dropped=self.log_dropped,
             abort=self.abort_event.is_set(),
             stop_cmd=self._stop_cmd_index,
-            ports=SerialBridge.list_ports(),
+            ports=self.bridge.list_ports(),
         )
