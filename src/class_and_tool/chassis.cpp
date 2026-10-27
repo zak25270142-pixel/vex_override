@@ -1,5 +1,4 @@
 #include "chassis.h"
-#include "timer.h" // get_time_us
 
 // 本文件装两类实现：
 //   ① ChassisMotorGroup——六态机速度环（底盘专属，只算可调电压）；
@@ -13,29 +12,25 @@ ChassisMotorGroup::ChassisMotorGroup(MyMotor *motor_list, uint8_t count,
 {
 }
 
-// 先调基类做存储与跳变判定，再按状态机决定起步 / 换向
+// 先调基类做存储与历史留痕（target_jump / target_sign_prev），再按状态机决定起步 / 换向
 void ChassisMotorGroup::set_target(float t)
 {
-    const int8_t old_sign = target_sign; // 换向判据要"上一次"的方向
-    const float old_target = target;     // 大跳判据要"上一次"的指令
-    MotorGroup::set_target(t);           // 基类只存储 + 死区归零，判断全在下面
-    const uint32_t now_us = get_time_us();
+    MotorGroup::set_target(t); // 基类只存储 + 死区归零 + 留痕，判断全在下面
 
     // 大跳只看命令自己变了多少，**不掺 pre_v**：阻塞或 I 还没追上时 pre_v 天然远离
     // 目标，掺进来判据就退化成"Δtarget > 阈值"，而它本来想表达的是"车已经在新目标
     // 附近就不算大跳"——那件事 Transit 自己会做（误差进了 error_for_i 一拍就回 Track）。
     // 掺了被控量，同一个拨杆在带载与空载时行为就不同。
-    const bool jumped = fabsf(target - old_target) > target_jump_abs;
+    const bool jumped = fabsf(target_jump) > target_jump_abs;
 
     if (spin_state == Stopped && target != 0.0f)
     {
-        last_time_us = now_us;
         if (fabs_target < err_out_dead)
             spin_state = Track; // 目标很小，直接跟踪，不必走起步窗
         else
         {
             spin_state = Transit;
-            transit_start_us = now_us;
+            transit_elapsed_us = elapsed_idle; // 未开始计；本拍不取钟也不计时长
         }
     }
     else if (jumped)
@@ -44,51 +39,55 @@ void ChassisMotorGroup::set_target(float t)
         // 积分是顶住负载的那一项，阻塞时被清掉等于当场松劲，而操作手在顶东西时
         // 恰恰最爱动杆。Transit 本身很便宜——误差进了 error_for_i 就一拍回 Track。
         spin_state = Transit;
-        transit_start_us = now_us;
+        transit_elapsed_us = elapsed_idle;
     }
-    else if (target_sign != 0 && old_sign != 0 && target_sign != old_sign)
+    else if (target_sign != 0 && target_sign_prev != 0 && target_sign != target_sign_prev)
     {
         spin_state = Transit; // 换向
-        transit_start_us = now_us;
+        transit_elapsed_us = elapsed_idle;
     }
 }
 
-// 六态机版速度环：算本组可调电压（写入 output），不执行、不限幅。
-// 时序：refresh（采样 + PID 前置）→ 状态判定① → 基础计算 → 积分策略 → 状态判定② → 压摆。
-// 五段不是"随手拆细"，各自都有理由：
-//   · 判定①只需要误差/加速度，而它的结果（积不积、积多少）是积分策略的输入；
-//   · 基础计算用"当前 integral"算出本拍输出，本身不含任何判断；
-//   · 积分策略要判"吃掉这段积分后输出会到哪"，只能排在有了输出之后；
-//   · 判定②（Stall/Recover）要用本拍输出判"是否顶格"，所以必须在最后。
-// 基类只提供 refresh / calc_output / apply_output 三段，判断全在本层。
-// 执行由 MotorGroup::apply_output() 负责，横向限幅由调用者（Chassis）负责。
-void ChassisMotorGroup::calc_output()
+// 六态机版速度环：算出本组请求的可调电压（output_raw），不执行、不限幅。
+// 时序：MotorGroup::refresh（采样+前置+算输出）→ 状态判定① → 积分策略 → 状态判定② → 压摆。
+// 基类的输出式子里不含任何判断，判断全在本层；积分策略排在输出之后，是因为它要判
+// "吃掉这段积分输出会到哪"，而那要看本拍输出。
+// 执行由本层 apply_output()（压摆）→ MotorGroup::apply_output()（映射下发）完成，
+// 横向限幅由调用者（Chassis）负责。
+void ChassisMotorGroup::refresh(uint32_t dt_us, float dt_s)
 {
-    // 采样 + 前置。停车也要跑：监控要看真实转速，且 pre_v 一旦冻结，
-    // 重新给目标那拍的加速度会是个巨大的假值（正好撞上 Recover/Stall 的加速度判据）。
-    MotorGroup::refresh();
-
+    // 停车 = 环整个不工作：不采样、不算、也不产生请求，一行都不走。
+    // 残留（output_raw / integral / pre_v / pre_a …）由 stop() 一次清干净——
+    // 在这里每帧擦掉是补丁，"根本不产生"才是正解。
     if (spin_state == Stopped)
-        return; // 环不工作：连 P 项都不算，output 保持 stop() 留下的 0
+        return;
 
-    // 时间戳直接用 refresh 采样的那一刻（last_time_us）：状态机计时与转速采样对齐，
-    // 也省一次系统调用。error / derivative / base_volt / feedforward / headroom
-    // 都已在 refresh 里算好，这里直接读。
-    const uint32_t now_us = last_time_us;
+    MotorGroup::refresh(dt_s);
+
+    // 状态机计时：全是"过了多久"，用本拍 dt 累加，不碰时钟。
+    // 进场那一拍不加 dt——命令往往落在两拍之间，那一整拍并不属于新状态。
+    // 判"是不是进场拍"用的是 elapsed_idle（0xFFFFFFFF）这个哨兵，**靠显式赋值，不靠回绕**：
+    // 0xFFFFFFFF + dt_us 得到的是 dt_us − 1，不是 0，只有当 dt_us == 1 时才凑巧归 0。
+    if (spin_state == Transit)
+    {
+        if (transit_elapsed_us == elapsed_idle)
+            transit_elapsed_us = 0; // 进场那一拍：只开表，不记时长
+        else
+            transit_elapsed_us += dt_us;
+    }
+
+    // error / derivative / base_volt / feedforward / headroom 都已在基类 refresh 里算好。
     const float fabs_error = fabsf(error);
 
     // ---------- 状态判定 1：目标 / 稳定（不依赖本拍输出，先判给 I 项用）----------
     if (spin_state == Transit && (fabs_error <= error_for_i ||
-                                  (now_us - transit_start_us >= transit_freeze_us &&
+                                  (transit_elapsed_us >= transit_freeze_us &&
                                    fabsf(now_a) <= speed_stable && fabsf(pre_a) <= speed_stable)))
         spin_state = Track;
     else if (spin_state == Track && fabs_error <= err_in_dead)
         spin_state = Stable;
     else if (spin_state == Stable && fabs_error > err_out_dead)
         spin_state = Track;
-
-    // ---------- 基础计算：前馈 + P + I + D（用当前 integral，不判不改）----------
-    MotorGroup::calc_output();
 
     // ---------- 积分策略：抗饱和 + 缩放。基类不参与，全在这一层 ----------
     // 状态只决定两件事：本拍积不积（Transit 起步窗不积）、积多少（Stable 打对折防抖）。
@@ -98,9 +97,9 @@ void ChassisMotorGroup::calc_output()
     const float delta = error * dt_s * i_scale; // 本拍"想"积的量，pct·s
     // 判"吃掉这一段之后输出会到哪"，才停在天花板上而不是冲过头再回吐。
     // 输出对积分是线性的，所以只需在现值上补 I 那一段，不必把 P/D/前馈重算一遍。
-    // 天花板必须是 headroom 而不是 12V：output 之上还要叠组级垫底与个体死区，
+    // 天花板必须是 headroom 而不是 12V：output_raw 之上还要叠组级垫底与个体死区，
     // 与比例限幅的分母是同一个数——两者不一致时，内层以为还有余量、外层已经在削。
-    const float candidate = output + ki * delta;
+    const float candidate = output_raw + ki * delta;
     // ki <= 0 时不积：此时积分不影响输出，攒下的只是"ki 一开就生效"的存量。
     if (allow_i && ki > 0.0f &&
         (candidate <= headroom || error <= 0.0f) &&
@@ -110,11 +109,11 @@ void ChassisMotorGroup::calc_output()
     // 结算的历史"）。要当拍生效就得在这里再补一次输出，那等于把 P/D/夹幅再算一遍，
     // 而 10ms 的 I 项延迟对 ki 这个量级毫无意义。
 
-    // ---------- 状态判定 2：非预期运动 / 堵转（要用本拍输出，故排在 PID 之后）----------
+    // ---------- 状态判定 2：非预期运动 / 堵转（要用本拍 output_raw，故排在最后）----------
     // "已给到上限"必须按 headroom 判，不能按 0.99×12V：抗饱和把积分卡在 headroom 上
     // （≈10.6V），12V 那个门槛在低速重载时永远够不着，Stall 就永远进不去。
     // 又一处"两个天花板必须同一个数"。
-    const bool giving_max = fabsf(output) >= headroom * 0.99f;                                   // 输出是否已顶到上限
+    const bool giving_max = fabsf(output_raw) >= headroom * 0.99f;                               // 输出是否已顶到上限
     const bool wheel_low = fabsf(now_v) <= stall_speed;                                          // 轮是否基本没在转
     const bool pulled_away = (target > 0.0f && now_a < 0.0f) || (target < 0.0f && now_a > 0.0f); // 目标与加速度反向
 
@@ -123,8 +122,8 @@ void ChassisMotorGroup::calc_output()
         // Stall 退出：轮速起来了，或操作手松杆（目标落进死区）；杆收小但没收到底不退出
         if (!wheel_low || fabs_target == 0.0f)
         {
-            stall_since_us = 0;
-            transit_start_us = now_us;
+            stall_elapsed_us = elapsed_idle;
+            transit_elapsed_us = elapsed_idle;
             spin_state = Transit;
         }
     }
@@ -133,20 +132,22 @@ void ChassisMotorGroup::calc_output()
         // Stall 计时：给满 + 轮速低须持续够久（滤掉起步瞬间）；Transit 期间不计时
         if (giving_max && wheel_low && spin_state != Transit)
         {
-            if (stall_since_us == 0)
-                stall_since_us = now_us;
+            if (stall_elapsed_us == elapsed_idle)
+                stall_elapsed_us = 0; // 条件刚成立那拍：只开表，不记时长
+            else
+                stall_elapsed_us += dt_us;
         }
         else
-            stall_since_us = 0;
+            stall_elapsed_us = elapsed_idle;
 
-        if (stall_since_us != 0 && now_us - stall_since_us >= stall_time)
+        if (stall_elapsed_us >= stall_time) // 已计入的时长够久；进场拍不计，故用 >=
             spin_state = Stall;
         else if (spin_state == Recover)
         {
             // Recover 退出：误差回到 I 工作区且输出不再顶格，走 Transit 重新观察（积分不清零）
             if (fabs_error <= error_for_i && !giving_max)
             {
-                transit_start_us = now_us;
+                transit_elapsed_us = elapsed_idle;
                 spin_state = Transit;
             }
         }
@@ -162,34 +163,30 @@ void ChassisMotorGroup::calc_output()
     // ---------- 压摆策略：把状态翻译成两个数值，写进基类 ----------
     slew_policy();
 
-    // pre_v / pre_a 的提交在 refresh() 里，本函数不再写历史值。
+    // pre_v / pre_a 由 MotorGroup::refresh() 提交；本函数只读、不写历史值。
 }
 
-// 状态 → 斜率数值。基类只认数，不认枚举；这里就是策略的唯一出处。
+// 状态 → 本拍生效的两个速率。基类只认数，不认枚举；这里就是策略的唯一出处。
 // 每个状态都必须显式覆盖，别指望"沿用上一次"——状态是在本函数前段判出来的，
 // 漏写一个分支就等于让上一种策略漏到这一种里。
+// Stopped 不在表里：那时 refresh 提前返回，走不到这里；apply_output 也不会被调。
 void ChassisMotorGroup::slew_policy()
 {
     switch (spin_state)
     {
-    case Stopped: // 电压钉死：stop() 已把各台清零并刹车，之后不再重写电压
-        slew_boost = 0.0f;
-        slew_release = 0.0f;
-        break;
-
     case Recover: // 外力带偏、车还在动：两方向都放开，抢时间补力矩
-        slew_boost = INFINITY;
-        slew_release = INFINITY;
+        slew_rise = INFINITY;
+        slew_fall = INFINITY;
         break;
 
     case Stall: // 顶死：顶住要快（别被推回去），松劲要慢（松了会被弹回来）
-        slew_boost = slew_fast;
-        slew_release = slew_slow;
+        slew_rise = slew_fast;
+        slew_fall = slew_slow;
         break;
 
     default: // Transit / Track / Stable：升压慢（护齿箱、防打滑），撤压快
-        slew_boost = slew_slow;
-        slew_release = slew_fast;
+        slew_rise = slew_slow;
+        slew_fall = slew_fast;
         break;
     }
 }
@@ -198,11 +195,33 @@ void ChassisMotorGroup::stop()
 {
     MotorGroup::stop(); // 清积分、输出、各台电压
     spin_state = Stopped;
-    transit_start_us = 0;
-    stall_since_us = 0;
-    // Stopped 态 calc_output 会提前返回，走不到里面的 slew_policy()，
-    // 必须在这里补写一次——否则会留着上一个状态的斜率（比如 Recover 的无穷）。
-    slew_policy();
+    transit_elapsed_us = elapsed_idle;
+    stall_elapsed_us = elapsed_idle;
+}
+
+// 压摆窗口：把 req 收到"以 prev 为锚、按速率张开"的区间里，返回收好之后的值。
+// rise / fall 是"离 0 / 朝 0"的速率，不是"正 / 负"方向的速率——所以过零那一拍要把
+// 这一拍的额度拆成两段：先用 fall 撤到 0，剩下的时间用 rise 往反向张开。
+// 不换向时窗口对称，两条边各张 step；step 取哪条速率取决于这拍幅值在增大还是减小。
+static float slew_step(float req, float prev, float rise, float fall, float dt)
+{
+    if (req * prev < 0.0f) // 换向
+    {
+        const float t_zero = fabsf(prev) / fall; // 撤到 0 要花的时间
+        if (t_zero >= dt)                        // 本拍撤不完，窗口缩成一个点
+            return prev - copysignf(fall * dt, prev);
+        return copysignf(fminf(fabsf(req), rise * (dt - t_zero)), req);
+    }
+    const float step = (fabsf(req) > fabsf(prev) ? rise : fall) * dt;
+    return fminf(fmaxf(req, prev - step), prev + step);
+}
+
+// 执行：request（已按跨侧比例限缩）→ 收进本拍压摆窗口 → 基类映射下发。
+// 限速对象是**可调电压**而不是每台电压：只要这一段被限住，factor 的比例在爬升全程不变。
+// 锚点是 output_applied（上一次真正下发的可调电压），由基类在映射时写入。
+void ChassisMotorGroup::apply_output(float request)
+{
+    MotorGroup::apply_output(slew_step(request, output_applied, slew_rise, slew_fall, dt_s));
 }
 
 // ==================== 以下为 Chassis（里程计 + 横向协调）====================
@@ -254,16 +273,13 @@ void Chassis::finish_init()
     // gyro_bias = bias_sum / bias_samples;
     // heading_origin = now;
     inertial_sensor.resetRotation();
-    uint32_t now = get_time_us();
-    previous_time = now;
-    reset(now);
+    reset(0); // 初始化没有"上一拍"，dt 给 0：update_gap=0 → linear_speed 保持旧值
 }
 
 // 更新里程、速度和航向
-void Chassis::update(uint32_t now)
+void Chassis::update(uint32_t dt_us)
 {
-    update_gap = now - previous_time;
-    previous_time = now;
+    update_gap = dt_us; // 本拍间隔由调用者给（全机一拍一戳），本层不再记时间戳
 
     // 在有定位轮后可舍弃 编码器里程相关计算
     // // 电机内置编码器测得的是电机轴转数。经过外部齿轮组后：
@@ -368,9 +384,9 @@ void Chassis::begin_segment()
     // right_distance_change = 0.0f;
 }
 
-void Chassis::reset(uint32_t now)
+void Chassis::reset(uint32_t dt_us)
 {
-    update(now);
+    update(dt_us);
     begin_segment();
 }
 
@@ -390,7 +406,7 @@ void Chassis::output(float left_output, float right_output)
     right_motors.set_target(right_output / s);
 }
 
-void Chassis::speed_tick()
+void Chassis::speed_tick(uint32_t dt_us, float dt_s)
 {
     // 本拍这个组要不要跑速度环？只看状态机：Stopped = 环不工作。
     // 环不工作时这里什么都不做——**不是"每帧补一个 0V"**。0V 也是一条指令，
@@ -398,30 +414,36 @@ void Chassis::speed_tick()
     // （按 setStopping 的刹车）表达过了，不需要每秒重复声明 100 次。
     // 这样开环电压天然不会被覆盖，也就不需要任何"开环标志"。
 
-    // ① 算本拍可调电压。两组都调：停车组在里面自己停在采样之后就返回了，
-    //    所以监控照样能看到真实转速，而 output 保持 0。
-    left_motors.calc_output();
-    right_motors.calc_output();
+    // ① 算本拍请求的可调电压。两组都收到同一个 dt：左右就不会各自夹出一个来。
+    left_motors.refresh(dt_us, dt_s);
+    right_motors.refresh(dt_us, dt_s);
 
-    // ② 比例限幅只统计在跑的组。停车组的 output 是残值，若让它参与，
-    //    会凭一个早已作废的数去削另一侧——拿冻结值当真值用。
+    // ② 比例限幅只统计在跑的组。停车组的 output_raw 已被置 0，本来也不会削到
+    //    另一侧；但下发必须 gate 住——停车组的电压归开环直写或 stop() 的刹车。
+    //
+    //    【未决】分母用的是"请求值"，而请求可以远超余量：kp 标起来之后 P 项能到
+    //    几十伏（error 大 × kp，I 反倒被抗饱和卡在 headroom 上）。超过余量的那部分
+    //    物理上做不到，但两侧的比例仍是控制器的意图，所以这里按意图等比缩、不夹请求
+    //    （往 output_raw 上夹 ±12 会让比例先失真）。待实车确认：若出现"单侧顶住 →
+    //    整车被拽偏"，说明虚构的 P 不该有话语权，那时再加夹幅。见 memory 2026-10-25。
     const bool run_l = !left_motors.is_stopped();
     const bool run_r = !right_motors.is_stopped();
     const float head_l = left_motors.headroom;
     const float head_r = right_motors.headroom;
     float s = 1.0f;
     if (run_l && head_l > 0.0f)
-        s = fmaxf(s, fabsf(left_motors.output) / head_l);
+        s = fmaxf(s, fabsf(left_motors.output_raw) / head_l);
     if (run_r && head_r > 0.0f)
-        s = fmaxf(s, fabsf(right_motors.output) / head_r);
+        s = fmaxf(s, fabsf(right_motors.output_raw) / head_r);
     volt_scale = s;
 
-    // ③ 下发。限幅系数当参数交给组，不回写它们的 output——output 始终是
-    //    calc_output 算出的请求值，谁也没改过它。停车组不碰（可能是开环直写的）。
+    // ③ 下发：把限幅后的值直接当参数传下去。不回写 output_raw——它永远是
+    //    "请求值"，所以监控里看到的是要多少，不是给了多少。
+    //    停车组不碰（可能是开环直写的）。
     if (run_l)
-        left_motors.apply_output(s);
+        left_motors.apply_output(left_motors.output_raw / s);
     if (run_r)
-        right_motors.apply_output(s);
+        right_motors.apply_output(right_motors.output_raw / s);
 }
 
 void Chassis::stop()

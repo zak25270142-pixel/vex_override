@@ -47,6 +47,13 @@ private:
     uint32_t stop_start_us = 0; // 本次停止起点，0 表示未计时/未开始
     uint32_t stop_time_us = 0;  // 本次停止时限（us）
 
+    // ---- 本拍时间：全机唯一的时钟源 ----
+    // 一个 tick 只取一次时钟，再由 refresh() 按需要往下传：要绝对时刻的给 now_us，
+    // 要积分步长的给 dt_us / dt_s。下层不再各自取钟、不再各自夹取、不再自己换算。
+    uint32_t previous_time_us = 0; // 上一拍时间戳，算 dt 用
+    uint32_t dt_us_now = 0;        // 本拍间隔，us，已夹到 [1ms, 20ms]
+    float dt_s_now = 0.0f;         // 同上，秒
+
     // 动作自然结束的统一收尾：停车、清指针、触发 move_end_callback。
     void action_finished();
 

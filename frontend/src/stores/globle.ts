@@ -7,12 +7,15 @@ import { serialClient } from '@/services/serialClient'
 import {
   loadPrefs,
   savePrefs,
+  type Prefs,
   RIGHT_WIDTH_DEFAULT,
   RIGHT_WIDTH_MAX,
   RIGHT_WIDTH_MIN,
 } from '@/services/persist'
 import {
   CmdGet,
+  CmdSpec,
+  cmdSpec,
   FrameParser,
   MONITOR_TAG_FAST,
   MONITOR_TAG_SUB,
@@ -238,6 +241,17 @@ export const tunableMap = reactive<Record<number, DirItem>>({})
 export const monitorMap = reactive<Record<number, DirItem>>({})
 /** 动作命令目录（key=命令字 0x80~0x9F），右侧下发表单按它渲染 */
 export const commandMap = reactive<Record<number, CmdDirItem>>({})
+
+/**
+ * 停车类特化命令（tag 的 SPEC 位 == Stop），按命令字排序。
+ * 桌面右栏底部与手机底部常驻停车条共用这一份——过滤规则写两遍迟早会长歪。
+ * 目录未到 / 固件没登记时是空数组，调用方一律 v-if 整条不渲染（不放按了没反应的假按钮）。
+ */
+export const stopCmds = computed<CmdDirItem[]>(() =>
+  Object.values(commandMap)
+    .filter((c) => cmdSpec(c.tag) === CmdSpec.Stop)
+    .sort((a, b) => a.index - b.index),
+)
 /** 已发出 SetTunable、尚未收到回显确认的调参项 index（右侧面板显示"等待确认"） */
 export const pendingTunable = reactive(new Set<number>())
 /** 参数表单击选中的调参项 index（右侧底部缩略卡据此编辑）；null=未选中 */
@@ -269,9 +283,11 @@ export const monitorLatest = reactive<Record<number, CellValue>>({})
 /* ===== 场地位姿（x/y 单位米，yaw 单位度、顺时针正、0°朝 X+） ===== */
 export const pose = reactive({ x: 0, y: 0, yaw: 0, valid: false })
 
-/* ===== 曲线：4 个通道，每通道至多 4 条追踪曲线 ===== */
-/** 每通道追踪槽上限（槽位颜色取 --channel-1~4） */
-export const TRACE_MAX = 4
+/* ===== 曲线：4 个通道，每通道至多 5 条追踪曲线 ===== */
+/** 每通道追踪槽上限（槽位颜色取 --channel-1~5，见 base.css）
+    4→5：手机曲线页是「单通道 × 5 轨迹」，与桌面共用同一份 channelTraces[0]，
+    不另开一套状态；槽位颜色由 ChartView 按序号解析，第 5 条用新增的 --channel-5 */
+export const TRACE_MAX = 5
 /** traces[ch]：该通道当前追踪的监控量 index，按槽位顺序排列 */
 export const channelTraces = reactive<number[][]>(CHANNELS.map(() => []))
 /** 当前在右栏配置 / 大图查看的通道，null=未选中 */
@@ -526,6 +542,18 @@ function expandStamp(raw: number): number {
 /** 最新样本的下位机时刻（秒）：曲线 x 轴与导出的"现在"以此为准，与 performance.now() 不同源 */
 export function getLatestT(): number {
   return stampMs / 1000
+}
+
+/**
+ * 采样时刻（秒）——所有时间序列缓冲统一用它存 t。
+ *
+ * ⚠️ 单位契约：缓冲里的 t、getLatestT()、FAST_PERIOD、导出的 t 列**全是秒**。
+ * expandStamp() 内部是毫秒（回绕展开按 16 位毫秒时钟算），出这个函数必须换算。
+ * 01813be 曾直接把 expandStamp() 的毫秒塞进 buf.t，导致曲线点 x = 毫秒 - 秒，
+ * 整条线跑到 x 轴可视区（[-windowS, 0]）外 → 通道加了曲线也不画；导出对齐 likewise。
+ */
+function stampSec(raw: number): number {
+  return expandStamp(raw) / 1000
 }
 
 /* ===== 实参缩略卡 5s 简易示波缓冲（仅当前选中的一个 monitor index，不强制提速） ===== */
@@ -801,7 +829,7 @@ function handleEvent(e: RxEvent): void {
     // 留历史的两类量：①被通道追踪的（画曲线/导出）②位姿 x/y/yaw（场地图/导出）。
     // t 存下位机采样时刻（秒，回绕已展开），显示/导出时换算成"距最新样本"，实现示波器式右对齐。
     // 每帧一个样本，跟随主控推送节拍（高速区 10ms 即 100Hz）。环形缓冲写满即覆盖最旧点
-    const t = expandStamp(e.tMs)
+    const t = stampSec(e.tMs)
     let buf = seriesBuf.get(index)
     if (!buf) {
       buf = { t: new Float64Array(TRACE_BUF_CAP), v: new Float64Array(TRACE_BUF_CAP), head: 0, len: 0 }
@@ -818,7 +846,7 @@ function handleEvent(e: RxEvent): void {
     else if (kind === MonitorKind.PosY) rawPose.y = e.value
     else if (kind === MonitorKind.Yaw) rawPose.yaw = e.value
     // 实参缩略卡的 5s 简图：只存当前选中的那一个量，不强制提速，独立于曲线通道
-    if (index === selectedMonitorIndex.value) miniPush(expandStamp(e.tMs), e.value)
+    if (index === selectedMonitorIndex.value) miniPush(stampSec(e.tMs), e.value)
   }
 }
 

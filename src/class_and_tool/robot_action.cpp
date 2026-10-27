@@ -206,15 +206,25 @@ void RobotAction::update_manual(uint32_t now)
 
 void RobotAction::refresh()
 {
-    // 周期统一时间戳（us）
-    uint32_t now = get_time_us();
+    // 全机唯一的一次取钟。夹取也只在这里做一次：dt 是"这一拍"的属性，
+    // 上层算好一份，下层谁要谁拿——两个环各自夹一次，就会夹出两个 dt。
+    const uint32_t now = get_time_us();
+    uint32_t gap = now - previous_time_us;
+    if (gap < 1000) // 首拍，或与某次同拍/亚毫秒重叠，防除零
+        gap = 1000;
+    else if (gap > 20000) // 掉帧：别把一整个卡顿算成 dt
+        gap = 20000;
+    previous_time_us = now;
+    dt_us_now = gap;
+    dt_s_now = static_cast<float>(gap) / 1000000.0f;
+
     // 先更新里程、速度和航向，再推进当前任务，最后跑速度环
-    chassis.update(now);
+    chassis.update(dt_us_now);
     // 指针为空即空闲。
     if (chassis_task_ptr != nullptr)
         (this->*chassis_task_ptr)(now);
-    chassis.speed_tick(); // 任务计算完下达完后，更新速度环
-    lift.refresh();       // 升降杆（与底盘同拍；数据恒刷，控制指令按挂载情况运行）
+    chassis.speed_tick(dt_us_now, dt_s_now); // 任务计算完下达完后，更新速度环
+    lift.refresh();                    // 升降杆（与底盘同拍；数据恒刷，控制指令按挂载情况运行）
 }
 
 void RobotAction::turn(float angle)

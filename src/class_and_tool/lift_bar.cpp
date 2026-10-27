@@ -259,7 +259,7 @@ void LiftBar::stall_stop()
 
 void LiftBar::set_volt(float v0, float v1, float v2, float v3)
 {
-    // 电压直给：指令存在各台 volt_output 里，写完立刻下发（同底盘 output_raw）
+    // 电压直给：指令存在各台 volt_output 里，写完立刻下发（同底盘 set_volt_raw）
     motor_group.motors[0].volt_output = v0;
     motor_group.motors[1].volt_output = v1;
     motor_group.motors[2].volt_output = v2;

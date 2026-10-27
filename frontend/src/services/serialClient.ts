@@ -251,11 +251,14 @@ class SerialClient {
     this.clearRetry()
     this.demo = on
     this.transport = on ? new MockTransport(this.cb) : new WebSerialTransport(this.cb)
-    if (!on && this.transport instanceof WebSerialTransport) {
+    if (on) {
+      // 演示传输无需选口/探测，直接连上即可开始推送模拟数据；
+      // 否则 connected 永远为 false，store 不会拉表、页面停在"未连接"空态。
+      await this.transport.connect(BAUD_CDC)
+    } else if (this.transport instanceof WebSerialTransport) {
       this.transport.setIdentity(loadPrefs().port)
       await this.transport.preselect()
     }
-    this.cb.onStatus('idle', on ? '演示模式（未连接）' : '未连接')
   }
 
   /**

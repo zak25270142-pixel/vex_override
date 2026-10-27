@@ -1,0 +1,654 @@
+/* ===== V5 上位机 · 手机版共享样式 =====
+   移植自 miniprogram 的 app.wxss 视觉规范（深色卡片行 / 档位徽标 / 连接点 / 分段 / 弹层），
+   并复用桌面端已定义的 CSS 变量（--surface-panel / --accent 等），保证两套 UI 同主题。
+   本文件为全局样式（非 scoped），供 mobile/ 下各组件共用。 */
+
+.m-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #12141a;
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  -webkit-text-size-adjust: 100%;
+  overflow: hidden;
+}
+
+/* ===== 顶栏 ===== */
+.m-topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 48px;
+  padding: 0 14px;
+  background: #1b1e26;
+  border-bottom: 1px solid var(--border-panel, #2a2e39);
+}
+/* 左：品牌区，固定占顶栏 1/3——队标图标 + 文字，整体可点开设置。
+   注意覆盖全局 button 的 padding/border/text-align，否则图标会被压偏（见上一版坑） */
+.m-topbar__brand {
+  flex: 0 0 33.3333%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  overflow: hidden;
+  text-align: left;
+  font: inherit;
+  color: var(--text-primary);
+}
+.m-topbar__brand:active {
+  background: var(--surface-hover, #23262f);
+}
+/* 队标图标：圆形裁切，固定 28px */
+.m-topbar__logo {
+  flex: none;
+  display: block;
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 50%;
+  pointer-events: none; /* 点击交给品牌区按钮 */
+}
+/* 品牌文字：单行省略，超出 1/3 区域自动截断 */
+.m-topbar__title {
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+/* 右：可横滑按键行——定宽按键、右对齐、占顶栏剩余约 2/3、超宽则左右拖动。
+   flex:1 1 0 吃下品牌区之外的全部宽度；justify-content:flex-end 让按键少时贴右、
+   按键多溢出时向左展开并可左滑露出 */
+.m-topbar__actions {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* 旧 Edge/IE */
+}
+.m-topbar__actions::-webkit-scrollbar {
+  display: none; /* WebKit：拖动时也不显示滚动条 */
+}
+
+/* ===== 内容区 ===== */
+.m-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ===== 任务分屏时的内容页适配 =====
+   任务面板弹起后工作区一分为二，内容区只剩一半高。此时把次要 UI 藏掉、
+   让主视图铺满这一半——否则两块挤在半屏里谁都看不清。
+   （选择器带 .m-body--split 前缀，优先级高于各页面 scoped 里的同名规则） */
+.m-body--split .m-field-page .m-field-readout {
+  display: none; /* 场地页：隐藏 x / y / yaw 卡片 */
+}
+.m-body--split .m-chart .m-chart__cfg {
+  display: none; /* 曲线页：隐藏通道配置 + 数值行 */
+}
+.m-body--split .m-chart .m-chart__canvas {
+  flex: 1 1 0; /* 曲线页：画布铺满整个上半屏 */
+}
+
+/* ===== 卡片行 ===== */
+.m-row-card {
+  background: #1b1e26;
+  border-radius: 12px;
+  margin: 8px 12px;
+  padding: 12px 14px;
+}
+
+/* ===== 分段控制 ===== */
+.m-seg {
+  display: flex;
+  margin: 10px 12px;
+  border: 1px solid var(--border-subtle, #2a2e39);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.m-seg button {
+  flex: 1;
+  height: 38px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.m-seg button.on {
+  color: var(--text-on-accent, #06141f);
+  background: var(--accent, #4fc3f7);
+  font-weight: 700;
+}
+
+/* ===== 列表行 ===== */
+.m-list {
+  display: flex;
+  flex-direction: column;
+}
+.m-list-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-subtle, #23262f);
+  cursor: pointer;
+}
+.m-list-row:active {
+  background: var(--surface-hover, #23262f);
+}
+.m-list-row__name {
+  flex: none;
+  max-width: 42%;
+  font-size: 14px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-list-row__value {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  color: var(--text-bright, #e8eaf0);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-unit {
+  margin-left: 4px;
+  font-family: inherit;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.m-list__empty {
+  padding: 40px 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.8;
+}
+
+/* ===== 连接状态点（与 miniprogram .dot 一致） ===== */
+.m-dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.m-dot--idle { background: #8a8f9c; }
+.m-dot--connecting { background: #f0c35a; }
+.m-dot--connected { background: #48bb78; }
+.m-dot--error { background: #c53030; }
+.m-dot--off { background: #2a2e39; }
+.m-dot--slow { background: #f0c35a; }
+.m-dot--fast { background: var(--accent, #4fc3f7); }
+
+/* ===== 档位徽标（低速/高速/未订） ===== */
+.m-badge {
+  flex: none;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 6px;
+  background: #2a2e39;
+  color: #8a8f9c;
+}
+.m-badge--slow { background: #4a3b1a; color: #f0c35a; }
+.m-badge--fast { background: #123a44; color: #4fc3f7; }
+
+/* ===== 按钮 ===== */
+.m-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 40px;
+  padding: 0 18px;
+  font-size: 14px;
+  font-family: inherit;
+  border-radius: 10px;
+  border: none;
+  cursor: pointer;
+}
+.m-btn--primary { background: #2b6cb0; color: #fff; font-weight: 700; }
+.m-btn--danger { background: #c53030; color: #fff; font-weight: 700; }
+.m-btn--plain { background: #2a2e39; color: #c8cdd6; }
+.m-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ===== 窗口快设 chip ===== */
+.m-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.m-chip {
+  min-width: 52px;
+  height: 34px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text-secondary);
+  background: #1b1e26;
+  border: 1px solid var(--border-subtle, #2a2e39);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.m-chip.on {
+  color: var(--text-on-accent, #06141f);
+  background: var(--accent, #4fc3f7);
+  border-color: var(--accent, #4fc3f7);
+  font-weight: 700;
+}
+
+/* ===== 底部 tab 栏 ===== */
+.m-tabbar {
+  flex: none;
+  display: flex;
+  height: 56px;
+  background: #1b1e26;
+  border-top: 1px solid var(--border-panel, #2a2e39);
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+.m-tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  font-size: 11px;
+  color: #8a8f9c;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.m-tab .m-tab__icon {
+  font-size: 18px;
+  line-height: 1;
+}
+.m-tab.on {
+  color: var(--accent, #4fc3f7);
+}
+
+/* ===== 底部上滑 sheet ===== */
+.m-sheet-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 50;
+}
+.m-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 51;
+  display: flex;
+  flex-direction: column;
+  background: #1b1e26;
+  border-radius: 16px 16px 0 0;
+  max-height: 90vh;
+  animation: m-sheet-up 0.22s ease;
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+.m-sheet--half { height: 50vh; }
+@keyframes m-sheet-up {
+  from { transform: translateY(100%); }
+  to { transform: none; }
+}
+.m-sheet__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border-subtle, #23262f);
+}
+.m-sheet__title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.m-sheet__back {
+  font-size: 22px;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+/* ===== 任务下发表（选命令列表 / 已下发提示） ===== */
+.m-task-list {
+  display: flex;
+  flex-direction: column;
+}
+.m-task-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 8px 4px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text-primary);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle, #23262f);
+  cursor: pointer;
+  text-align: left;
+}
+.m-task-item:active {
+  background: var(--surface-hover, #23262f);
+}
+.m-task-item__idx {
+  flex: none;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.m-task-item__name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-task-ok {
+  margin: 4px 0 14px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #48bb78;
+  background: #14331f;
+  border-radius: 8px;
+}
+.m-sheet__close {
+  font-size: 13px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.m-sheet__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px;
+}
+.m-sheet__foot {
+  flex: none;
+  padding: 10px 16px 14px;
+}
+
+/* ===== 表单字段 ===== */
+.m-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.m-field__label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.m-field__type {
+  font-style: normal;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px solid var(--border-subtle, #2a2e39);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.m-field__range {
+  color: var(--accent, #4fc3f7);
+  border-color: var(--accent, #4fc3f7);
+}
+.m-input,
+.m-select {
+  width: 100%;
+  height: 40px;
+  padding: 0 10px;
+  font-size: 15px;
+  font-family: inherit;
+  color: var(--text-primary);
+  background: #12141a;
+  border: 1px solid var(--border-input, #2a2e39);
+  border-radius: 10px;
+  outline: none;
+  box-sizing: border-box;
+}
+.m-input:focus,
+.m-select:focus {
+  border-color: var(--accent, #4fc3f7);
+}
+.m-input--mono {
+  font-family: var(--font-mono, monospace);
+}
+
+/* ===== 开关 ===== */
+.m-switch {
+  width: 46px;
+  height: 26px;
+  flex: none;
+  position: relative;
+  appearance: none;
+  background: #2a2e39;
+  border-radius: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+  margin-left: auto;
+}
+.m-switch:checked {
+  background: var(--accent, #4fc3f7);
+}
+.m-switch::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s;
+}
+.m-switch:checked::after {
+  transform: translateX(20px);
+}
+
+/* ===== 三态分段控件（未订/低速/高速；滑块灰→黄→绿） ===== */
+.m-seg3 {
+  position: relative;
+  flex: none;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  height: 28px;
+  margin-left: auto;
+  padding: 3px;
+  box-sizing: border-box;
+  background: #23262f;
+  border: 1px solid var(--border-panel, #2a2e39);
+  border-radius: 14px;
+}
+.m-seg3__thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: calc((100% - 6px) / 3);
+  height: calc(100% - 6px);
+  border-radius: 11px;
+  background: var(--status-offline, #657d91);
+  transition: transform 0.18s ease, background 0.18s ease;
+  pointer-events: none;
+}
+.m-seg3__thumb[data-state='1'] {
+  background: var(--status-waiting, #f9c75e);
+}
+.m-seg3__thumb[data-state='2'] {
+  background: #3ad17a;
+}
+.m-seg3__opt {
+  position: relative;
+  z-index: 1;
+  border: none;
+  background: transparent;
+  padding: 0 4px;
+  font-size: 11px;
+  color: var(--text-muted, #5f91ad);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.m-seg3__opt.is-on {
+  color: #11141a;
+  font-weight: 700;
+}
+
+/* ===== 场地三值标注 ===== */
+.m-field-readout {
+  display: flex;
+  justify-content: space-around;
+  padding: 12px;
+  gap: 8px;
+}
+.m-field-readout .rd {
+  flex: 1;
+  text-align: center;
+}
+.m-field-readout .rd__k {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.m-field-readout .rd__v {
+  font-family: var(--font-mono, monospace);
+  font-size: 16px;
+  color: var(--text-bright, #e8eaf0);
+  font-variant-numeric: tabular-nums;
+}
+
+.m-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+/* ===== 任务下发表：下半固定宽高比 1:0.8，上半内容区让位、可被压缩 =====
+   原来是 m-body 与 taskpane 各 flex:1 1 0 平分，键盘一顶起两者一起被压、任务页只剩约 1/4。
+   现在改为：taskpane 高度由 aspect-ratio 决定（宽:高 = 1:0.8），内容区 flex:1 吃剩余。
+   键盘/短屏时可视空间变小，被压缩的是上半内容区，任务面板尺寸稳定，始终可操作。
+   max-height 兜底：极端矮屏下不允许面板顶穿根容器；内部 overflow:hidden + 自身滚动。 */
+.m-taskpane {
+  flex: 0 0 auto;
+  aspect-ratio: 1 / 0.8;
+  max-height: 58%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #1b1e26;
+  border-top: 1px solid var(--border-panel, #2a2e39);
+  border-radius: 16px 16px 0 0;
+  overflow: hidden;
+  animation: m-pane-in 0.22s ease;
+}
+@keyframes m-pane-in {
+  from { transform: translateY(24px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.m-taskpane__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border-subtle, #23262f);
+}
+.m-taskpane__back {
+  flex: none;
+  font-size: 14px;
+  color: var(--accent, #4fc3f7);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px 0;
+}
+.m-taskpane__title {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-taskpane__close {
+  flex: none;
+  font-size: 13px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.m-taskpane__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px 16px;
+}
+.m-taskpane__foot {
+  flex: none;
+  padding: 10px 16px 14px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom, 0));
+}
+
+/* ===== 所有可拖动/滚动区域隐藏滚动条（手机端更干净，拖动时不露滚动条） ===== */
+.m-body,
+.m-sheet__body,
+.m-taskpane__body,
+.m-topbar__actions {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* 旧 Edge/IE */
+}
+.m-body::-webkit-scrollbar,
+.m-sheet__body::-webkit-scrollbar,
+.m-taskpane__body::-webkit-scrollbar,
+.m-topbar__actions::-webkit-scrollbar {
+  display: none; /* WebKit */
+}

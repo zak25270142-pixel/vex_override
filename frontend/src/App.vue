@@ -1,6 +1,7 @@
 <template>
-  <!-- 单一工作页：顶栏（接入+取表） + 主体（左视图 + 右标签工作区） -->
-  <div class="app-shell">
+  <!-- 手机端：独立 MobileShell UI 树；桌面端：原有工作台 -->
+  <MobileShell v-if="isMobileView" />
+  <div v-else class="app-shell">
     <AppHeader />
     <main class="workspace">
       <!-- 左：参数表/曲线/场地/视觉；右：标签分页工作区（宽度可拖拽，折叠收成竖条） -->
@@ -60,6 +61,7 @@ import AppHeader from '@/components/shell/AppHeader.vue'
 import AlertToasts from '@/components/common/AlertToasts.vue'
 import ViewStage from '@/components/stage/ViewStage.vue'
 import RightWorkbench from '@/components/shell/RightWorkbench.vue'
+import MobileShell from '@/components/mobile/MobileShell.vue'
 import {
   autoConnect,
   baud,
@@ -72,7 +74,22 @@ import {
 } from '@/stores/globle'
 import { serialClient } from '@/services/serialClient'
 
+const isMobileView = ref(false)
+function detectMobile(): void {
+  const params = new URLSearchParams(location.search)
+  if (params.get('mobile') !== null) {
+    isMobileView.value = true
+    return
+  }
+  isMobileView.value = window.innerWidth <= 820 && 'ontouchstart' in window
+}
+function onResize(): void {
+  detectMobile()
+}
+
 onMounted(() => {
+  detectMobile()
+  window.addEventListener('resize', onResize)
   window.addEventListener('beforeunload', onBeforeUnload)
   window.addEventListener('pointermove', onPointerMove)
   window.addEventListener('pointerup', onPointerUp)
@@ -80,12 +97,20 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
   window.removeEventListener('beforeunload', onBeforeUnload)
   window.removeEventListener('pointermove', onPointerMove)
   window.removeEventListener('pointerup', onPointerUp)
 })
 
 async function startup(): Promise<void> {
+  // 分享/发布链接带 ?demo 时，强制进入演示模式：打开即见"活"的模拟机器人，
+  // 评委/他人零硬件零后端也能直接看效果（?demo=0 或 =false 可显式关闭）
+  const demoParam = new URLSearchParams(location.search).get('demo')
+  if (demoParam !== null && demoParam !== '0' && demoParam !== 'false') {
+    await setDemoMode(true)
+    return
+  }
   // 沿用上次的演示模式；实机模式下按开关自动连接已授权设备
   if (demoMode.value) {
     await setDemoMode(true)

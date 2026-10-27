@@ -81,9 +81,8 @@ import MonitorMiniList from '@/components/params/MonitorMiniList.vue'
 import MonitorDetail from '@/components/params/MonitorDetail.vue'
 import TunableCard from '@/components/params/TunableCard.vue'
 import MonitorCard from '@/components/params/MonitorCard.vue'
-import { CmdSpec, cmdSpec, type CmdDirItem } from '@/services/protocol'
+import { type CmdDirItem } from '@/services/protocol'
 import {
-  commandMap,
   connected,
   focusCh,
   paramTable,
@@ -91,6 +90,7 @@ import {
   selectedMonitorIndex,
   selectedTunableIndex,
   sendCommand,
+  stopCmds,
   view,
   type RightTab,
 } from '@/stores/globle'
@@ -162,14 +162,9 @@ const showDock = computed(
     (selectedTunableIndex.value !== null || selectedMonitorIndex.value !== null),
 )
 
-/** 停车类特化命令（tag SPEC=Stop）：下位机命令目录里可能登记多条（不同机构各自停车），
-    按命令字排序。按钮文案直接用目录里的中文名——不硬编码，固件改名即跟随；
-    目录未到/固件没登记时整条不渲染（v-if），不放一个按了没反应的假按钮 */
-const stopCmds = computed<CmdDirItem[]>(() =>
-  Object.values(commandMap)
-    .filter((c) => cmdSpec(c.tag) === CmdSpec.Stop)
-    .sort((a, b) => a.index - b.index),
-)
+/** 停车类特化命令取自 globle 的 stopCmds（手机端常驻停车条共用同一份，
+    避免两处各写一遍过滤规则）。文案直接用目录里的中文名——不硬编码，固件改名即跟随；
+    目录未到/固件没登记时是空数组，整条不渲染（v-if），不放一个按了没反应的假按钮 */
 
 /** 一键停车：直发对应的停车特化命令（无参）；不依赖任何标签页的选中项 */
 async function onStop(cmd: CmdDirItem): Promise<void> {

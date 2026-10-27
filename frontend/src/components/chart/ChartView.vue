@@ -91,7 +91,7 @@ const sepCharts: (ECharts | null)[] = [null, null, null, null]
 const sepEls: HTMLDivElement[] = []
 let timer: ReturnType<typeof setInterval> | null = null
 
-const SLOTS = [0, 1, 2, 3]
+const SLOTS = [0, 1, 2, 3, 4] // 与 TRACE_MAX 一致（5 条追踪曲线）
 
 /** 大图小卡片提示：仅在大图无曲线数据时显示；已有曲线绝不遮挡 */
 const hint = computed(() => {
@@ -337,7 +337,8 @@ onMounted(() => {
   chartTheme.title = styles.getPropertyValue('--text-bright').trim()
   chartTheme.legend = styles.getPropertyValue('--text-secondary').trim()
   chartTheme.grid = styles.getPropertyValue('--chart-grid-line').trim()
-  chartTheme.channels = CHANNELS.map((ch) => resolveCssColor(ch.color, styles))
+  // 槽位色按序号取 --channel-1..5（TRACE_MAX=5）；不复用 CHANNELS（那是 4 个通道的配色）
+  chartTheme.channels = SLOTS.map((i) => resolveCssColor(`var(--channel-${i + 1})`, styles))
 
   // 图实例由 fitCharts 在容器首次有尺寸时延迟创建；20fps 节拍同时负责尺寸对齐
   timer = setInterval(refresh, PLOT_REFRESH_MS)

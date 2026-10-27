@@ -44,7 +44,7 @@ const struct MENU_ITEM menu_item[] =
         {"R_vf2", type_float, &right_motor_list[2].volt_factor, "右2电压系数", ""},
         {"L_odz", type_float, &left_motors.target_deadzone, "左速度死区", "pct"},
         {"R_odz", type_float, &right_motors.target_deadzone, "右速度死区", "pct"},
-        // 绑的是标定值 slow/fast（基类 slew_boost/slew_release 是每拍被状态覆盖的生效值，
+        // 绑的是标定值 slow/fast（slew_rise/slew_fall 是每拍被状态覆盖的生效值，
         // 绑那里等于调了立刻被盖掉）。常规态下 slow=升压上限、fast=撤压上限。
         {"L_slewB", type_float, &left_motors.slew_slow, "左升压斜率", "V/s"},
         {"R_slewB", type_float, &right_motors.slew_slow, "右升压斜率", "V/s"},

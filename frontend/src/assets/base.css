@@ -47,11 +47,13 @@
   --danger-soft: rgba(255, 83, 61, 0.14);
   --danger-border: rgba(255, 111, 90, 0.5);
 
-  /* ===== 数据通道色（与 1.py 一致：红/青/蓝/绿） ===== */
+  /* ===== 数据通道色（与 1.py 一致：红/青/蓝/绿，第5条紫色为手机5轨迹补的） =====
+     曲线槽位颜色按序号取 --channel-1..5，上限见 globle.ts 的 TRACE_MAX */
   --channel-1: #ff6b6b;
   --channel-2: #4ecdc4;
   --channel-3: #45b7d1;
   --channel-4: #96ceb4;
+  --channel-5: #c792ea;
 
   /* ===== 示波器（ECharts 画布读变量解析） ===== */
   --chart-grid-line: rgba(120, 160, 190, 0.15);

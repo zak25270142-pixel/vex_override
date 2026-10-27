@@ -160,7 +160,7 @@ public:
 
     // 电压直控：逐台电压（V）直通下发——不加死区垫底、不经 volt_factor，
     // 直控的目的就是测出真实启动电压与阻力，任何垫底都会污染测量。
-    // 指令直接写各台 volt_output 再下发（同底盘 MotorGroup::output_raw），只按满幅夹幅。
+    // 指令直接写各台 volt_output 再下发（同底盘 MotorGroup::set_volt_raw），只按满幅夹幅。
     void set_volt(float v0, float v1, float v2, float v3);
 
     // 速度环目标：pct。挂载 control_speed。

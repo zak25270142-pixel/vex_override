@@ -4,6 +4,12 @@
 #include "my_motor_group.h" // MotorGroup / MyMotor
 
 // ============================================================
+// 计时累加器的"还没开始计"哨兵。用 0xFFFFFFFF 而不是 0：计数器本身就是从 0 起的，
+// 拿 0 当未开始，就分不清"刚进场、这一拍先不记"和"记了 0 us"。
+// 它的用法是**显式赋值**，不靠回绕：值等于它 → 本拍置 0（不计），否则正常累加。
+constexpr uint32_t elapsed_idle = 0xFFFFFFFFu;
+
+// ============================================================
 // 底盘电机组 ChassisMotorGroup：MotorGroup 的派生层，叠一轮式专属状态机
 // （本类与 Chassis 同属"底盘"，故与它同文件；实现见 chassis.cpp。升降杆等
 //   其它机构不共用本类，它们直接用 MotorGroup 或另行派生。）
@@ -24,8 +30,9 @@
 //   在编译期就绑到本类；基类那份不会被误调到，也不需要 vtable 与间接跳转。
 //   代价：不能通过 MotorGroup* 调到本层语义——本工程已无此需求（联合体已拆掉）。
 //   基类的 stop()/set_target() 被遮蔽但仍可用，遮蔽版开头显式调用它们；
-//   refresh()/calc_output() 是基类提供的前后半段（采样+前置 / 基础计算），
-//   本层在中间插状态机，并在其后接管积分策略（抗饱和、缩放）。
+//   基类提供 refresh()（采样+前置+算输出）与 apply_output()（映射下发），
+//   本层在中间插状态机，并在其后接管积分策略（抗饱和、缩放）；
+//   压摆窗口也在本层（apply_output 遮蔽版）：先按 slew_rise/fall 收口，再交给基类。
 // ============================================================
 class ChassisMotorGroup : public MotorGroup
 {
@@ -57,15 +64,29 @@ public:
 
     // ---- Transit 起步观察窗 ----
     uint32_t transit_freeze_us = 20000; // 冻结时长，避免起步误进 Track
-    uint32_t transit_start_us = 0;      // 进入 Transit 的时刻
-    uint32_t stall_since_us = 0;        // "给满+轮速低"开始成立的时刻；不成立为 0
+    // 进了 Transit 之后"真正计入"的时长，us。**累加出来的**，不是"现在时刻 − 进入时刻"：
+    // 状态机要的是"过了多久"这个时长，那就该由每拍的 dt 累加得到。一旦写成两个绝对
+    // 时刻相减，就逼着"进入 Transit"那一刻（在 set_target 里、甚至来自上位机命令）
+    // 去取一次时钟，凭空多出一个时间源。
+    // 初值 elapsed_idle = "还没开始计"：进场那一拍只把它置 0、不加 dt——
+    // 因为命令往往落在两拍之间，那一整拍 dt 并不属于新状态。
+    uint32_t transit_elapsed_us = elapsed_idle;
+    // 同上：给满 + 轮速低 已经持续了多久，us。条件不成立时退回 elapsed_idle。
+    uint32_t stall_elapsed_us = elapsed_idle;
 
-    // ---- 压摆标定值：只有"慢/快"两个，不是"升/降"两个 ----
+    // ---- 压摆标定值：当前策略只用"慢/快"两档，不是"升/降"两个方向 ----
     // 常规运行升压慢（护齿箱、防打滑）、撤压快（别拖着不松劲）；Stall 反过来用。
     // 所以按快/慢命名，哪一方向用哪个由 slew_policy() 按状态决定。
-    // 调参表绑这两个（不是基类的 slew_boost / slew_release——那两个是每拍被覆盖的生效值）。
+    // 调参表绑这两个（不是 slew_rise / slew_fall——那两个是每拍被状态覆盖的生效值）。
+    // 两档只是当前状态机的需要，不是结构限制：将来要按状态细分，加字段 + 改 slew_policy()
+    // 即可，apply_output 收的仍是"一份速率"，不用动。
     float slew_slow = 25.0f;  // 慢斜率，V/s
     float slew_fast = 200.0f; // 快斜率，V/s
+
+    // 本拍生效值，由 slew_policy() 每拍改写。初值取"不限速"：没走过策略就不该凭空限速，
+    // 与基类"不认识压摆"的口径一致（基类压根不限速）。
+    float slew_rise = INFINITY; // 幅值增大方向，V/s
+    float slew_fall = INFINITY; // 幅值减小方向，V/s
 
     ChassisMotorGroup(MyMotor *motor_list, uint8_t count,
                       const Vec2f *kf_node, uint8_t kf_num,
@@ -74,10 +95,17 @@ public:
     // 存储目标后，按状态机决定起步 / 换向 / 大跳是否进 Transit
     void set_target(float t);
 
-    // 六态机版速度环：refresh（采样+前置）→ 状态机① → 基础计算 → 积分策略
-    //   → 状态机② → 压摆。
-    // 只算本组可调电压，不执行、不限幅。停车态也采样（监控要看真转速），但不控。
-    void calc_output();
+    // 六态机版速度环：基类 refresh（采样+前置+算 output_raw）→ 状态机①
+    //   → 积分策略 → 状态机② → 压摆。
+    // 只算 output_raw，不执行、不限幅。Stopped 整个不进来（一行都不走），
+    // 残留由 stop() 一次清干净。
+    // dt_us / dt_s 是同一个量的两种单位，由调用者一次算好；本层不取钟。
+    // 状态机计时只用"累加"，所以既不需要绝对时刻，也就不需要时钟源。
+    void refresh(uint32_t dt_us, float dt_s);
+
+    // 执行：把 request 收进压摆窗口（锚点 = output_applied）后交给基类映射下发。
+    // 压摆是策略——"该多快"按状态判——所以留在本层；基类只认算好的可调电压。
+    void apply_output(float request);
 
     // 停机：清状态机状态，再调基类清积分与输出
     void stop();
@@ -86,9 +114,10 @@ public:
     // 只在派生层有这个概念，基类不再声明同名的假实现。
     bool is_stopped() const { return spin_state == Stopped; }
 
-    // 按当前状态把压摆策略写进基类的 slew_boost / slew_release（每拍一次）：
-    //   Stopped 0/0（电压钉死）、Recover 无穷/无穷（不限速）、Stall 快/慢（顶住快松劲慢）、
-    //   其余 慢/快（常规）。数值即策略，基类不认识枚举。
+    // 按当前状态算出本拍生效的两个速率（slew_rise / slew_fall），每拍一次：
+    //   Recover 无穷/无穷（不限速）、Stall 快/慢（顶住快松劲慢）、其余 慢/快（常规）。
+    //   Stopped 走不到这里（refresh 提前返回，apply_output 也不被调）。
+    //   数值即策略，基类不认识枚举。
     void slew_policy();
 };
 
@@ -113,9 +142,6 @@ private:
     vex::rotation &forward_tracking_sensor;
     vex::rotation &left_tracking_sensor;
     vex::inertial &inertial_sensor;
-
-    // 上一次 update() 的系统时间戳，单位 ms。
-    uint32_t previous_time = 0;
 
     // begin_segment() 时起始航向正余弦
     float cos_i = 1.0f; // 起始航向的余弦
@@ -187,14 +213,16 @@ public:
             vex::inertial &inertial);
 
     void init();
-    bool is_ready();           // init是否完成
-    void finish_init();        // init完成后的收尾
-    void update(uint32_t now); // 更新传感器读数与运动状态
-    void begin_segment();      // 以当前状态为段起点快照，前置条件：本周期已调用过 update()
-    void reset(uint32_t now);  // 没update场景的开启新任务段的组合调用
+    bool is_ready();              // init是否完成
+    void finish_init();           // init完成后的收尾
+    void update(uint32_t dt_us);  // 更新传感器读数与运动状态；dt_us 由调用者（RobotAction）给
+    void begin_segment();         // 以当前状态为段起点快照，前置条件：本周期已调用过 update()
+    void reset(uint32_t dt_us);   // 没update场景的开启新任务段的组合调用
     // 速度环唯一目标入口，允许输入超过 100 的叠加值，按两侧最大值同比例缩回
     void output(float left_output, float right_output);
-    void speed_tick(); // 速度环每轮推进：算电压 → 横向限幅 → 下发
+    // 速度环每轮推进：算电压 → 横向限幅 → 下发。
+    // 时间参数只是转交给两组（状态机计时与 PID/压摆都只要步长），本层自己不用。
+    void speed_tick(uint32_t dt_us, float dt_s);
     void stop();
 };
 

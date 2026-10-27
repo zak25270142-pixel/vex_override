@@ -1,6 +1,6 @@
 #include "robot_and_control.h"
 #include "key_set.h"       // 手柄摇杆对象在本层注入，工具类不直接引用全局
-#include "communication.h"       // CMD_ITEM
+#include "communication.h" // CMD_ITEM
 
 // PC 下发过位置环任务（turn/move/goto）即置位，不清零：掉线 failsafe 在 is_busy 时据此收车。
 // 开环命令（set_volt/set_spin）不建任务、is_busy 为假，由基础规则收车，无需置标记。
@@ -179,7 +179,7 @@ static uint8_t cmd_group_volt(const uint8_t *p)
     // is_busy() 挡掉了；剩下唯一能进来的矛盾是"上位机先下过目标速度、再下开环电压"——
     // 两条命令都是上位机自己发的，谁后发谁生效、被速度环覆盖也由上位机担责，
     // 固件不替它决定该停哪一个（这里越权去 stop() 反而会静默清掉它的速度目标）。
-    raw_groups[group]->output_raw(volt);
+    raw_groups[group]->set_volt(volt);
     return CMD_RET_OK;
 }
 

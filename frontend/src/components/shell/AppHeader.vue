@@ -1,7 +1,7 @@
 <template>
   <header class="app-header">
     <div class="brand">
-      <span class="brand__mark">V5</span>
+      <img class="brand__mark" :src="logoUrl" alt="HDU VEX" />
       <div class="brand__text">
         <strong>VEX V5 调试平台</strong>
         <small>USB SERIAL CONSOLE</small>
@@ -112,6 +112,8 @@ import {
   toggleConnect,
 } from '@/stores/globle'
 import DiagnosticsDialog from '@/components/shell/DiagnosticsDialog.vue'
+import logoUrl from '@/assets/hdu-vex-logo.jpg'
+
 
 function onDemoChange(e: Event): void {
   void setDemoMode((e.target as HTMLInputElement).checked)
@@ -147,15 +149,11 @@ function onAutoConnectChange(e: Event): void {
 }
 
 .brand__mark {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 32px;
   height: 32px;
-  font-size: 13px;
-  font-weight: 800;
-  color: var(--text-on-accent);
-  background: var(--accent);
-  border-radius: var(--radius);
+  object-fit: cover;
+  border-radius: 50%;
   box-shadow: var(--glow-accent);
 }
 
