@@ -1,21 +1,80 @@
 /**
- * WebSocket 传输：对接本机 Python backend（ws://127.0.0.1:8000/ws）
+ * WebSocket 传输：对接 Python backend
  * 与 WebSerialTransport / MockTransport 实现同一契约，serialClient 可直接切换。
+ *
+ * 地址来源（不再写死 127.0.0.1——手机端打开时它指手机自己，永远连不上）：
+ *   1. prefs.backendUrl 有值 → 用它（设置页手填，应对"前端与 backend 不同机"）
+ *   2. 否则按页面来源推导：前端从哪台机器加载，就连那台机器的 backend，端口固定 8000
+ * 地址在每次 connect 时才读取，所以改完设置点「连接」即生效，不必重建传输实例。
  *
  * 数据约定：
  *   - 后端 → 浏览器：ArrayBuffer 原样协议帧（进 FrameParser，store 零改动）
  *                   文本 JSON：连接状态 {"op":"status",...} + 固件回执异常
  *                   {"op":"alert",...}（后端待确认表的拒绝/放弃结论，见 transport.FwAlert）
+ *                   + 脚本推荐的曲线配置 {"op":"chart_suggest",...}（见 transport.ChartSuggestion）
  *   - 浏览器 → 后端：ArrayBuffer 原样协议帧
  *
  * OPEN 之前发出的帧进入待发队列，连接一建立按序 flush，避免「连接中点击/自动拉表」丢命令。
  */
 
 import type { ConnState, PortProbe, SerialTransport, TransportCallbacks } from './transport'
+import { loadPrefs } from './persist'
 
-const DEFAULT_URL = 'ws://127.0.0.1:8000/ws'
-const API_BASE = 'http://127.0.0.1:8000'
 const CONNECT_TIMEOUT_MS = 5000
+
+/** 按页面来源推导：http 页面 → ws://，https 页面 → wss://。
+ *  https 页面拿到的是 wss://，而局域网 backend 通常没配 TLS，那种场景要在设置页
+ *  手动填 ws://<局域网IP>:8000/ws（能否放行见 openWs 的说明）。 */
+export function defaultWsUrl(): string {
+  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${scheme}//${location.hostname}:8000/ws`
+}
+
+/** 当前生效的后端 WS 地址：持久化覆盖值优先，否则推导 */
+export function currentWsUrl(): string {
+  return loadPrefs().backendUrl ?? defaultWsUrl()
+}
+
+/** 手填简写 → 完整 URL：允许只填 host[:port]，首尾自动补 `ws://` 与 `/ws`，
+ *  端口缺省 8000。已带 `ws(s)://` 的按原样保留——wss 只能显式写出来。 */
+export function normalizeBackendUrl(input: string): string {
+  const s = input.trim()
+  if (s === '') return ''
+  if (/^wss?:\/\//i.test(s)) return s
+  const host = s.replace(/\/+$/, '') // 容忍手滑多敲的尾斜杠
+  return `ws://${host.includes(':') ? host : `${host}:8000`}/ws`
+}
+
+/** 完整 URL → 输入框里的简写。仅标准形态（ws://host:port/ws）才简化成 host:port，
+ *  其余（wss、自定义路径）原样返回，免得把用户显式写的东西悄悄改掉 */
+export function shortBackendUrl(url: string): string {
+  const m = /^ws:\/\/([^/?#]+)\/ws\/?$/i.exec(url)
+  return m ? m[1] : url
+}
+
+/** WS 地址 → HTTP base（同 host，ws→http / wss→https），供 /api/* 使用 */
+function apiBaseOf(wsUrl: string): string {
+  try {
+    const u = new URL(wsUrl)
+    return `${u.protocol === 'wss:' ? 'https:' : 'http:'}//${u.host}`
+  } catch {
+    return ''
+  }
+}
+
+/** 建 WS。https 页面发 ws:// 属 mixed content，Chrome 154+ 可以靠
+ *  `targetAddressSpace:'local'` 经 Local Network Access 授权放行；老浏览器不接受
+ *  该 options（个别实现会抛），故退回无参构造，失败信息由 onerror 正常上报。 */
+function openWs(url: string): WebSocket {
+  if (location.protocol === 'https:' && url.startsWith('ws://')) {
+    try {
+      return new WebSocket(url, { targetAddressSpace: 'local' } as unknown as string)
+    } catch {
+      /* 退回下面的无参构造 */
+    }
+  }
+  return new WebSocket(url)
+}
 
 export class WsTransport implements SerialTransport {
   readonly kind = 'ws' as const
@@ -35,13 +94,13 @@ export class WsTransport implements SerialTransport {
   }
 
   get portLabel(): string {
-    return DEFAULT_URL
+    return currentWsUrl()
   }
 
   /** 让 Backend 去连下位机；串口探测阻塞交给后端重连线程，前端不等结果 */
-  private async askBackendConnect(): Promise<void> {
+  private async askBackendConnect(wsUrl: string): Promise<void> {
     try {
-      await fetch(`${API_BASE}/api/connect`, { method: 'POST' })
+      await fetch(`${apiBaseOf(wsUrl)}/api/connect`, { method: 'POST' })
     } catch {
       // 后端还没起来/网络闪断时静默，WS 建链失败会走正常 error 上报
     }
@@ -49,10 +108,11 @@ export class WsTransport implements SerialTransport {
 
   async connect(_baudRate: number, _probe?: PortProbe): Promise<void> {
     if (this.ws?.readyState === WebSocket.OPEN) return
-    this.cb.onStatus('connecting', `连接后端 ${DEFAULT_URL} …`)
-    await this.askBackendConnect()
+    const url = currentWsUrl()
+    this.cb.onStatus('connecting', `连接后端 ${url} …`)
+    await this.askBackendConnect(url)
     await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(DEFAULT_URL)
+      const ws = openWs(url)
       ws.binaryType = 'arraybuffer'
       let settled = false
       const timer = window.setTimeout(() => {
@@ -60,7 +120,7 @@ export class WsTransport implements SerialTransport {
         settled = true
         ws.onopen = ws.onerror = null
         ws.close()
-        reject(new Error('连接后端超时（确认 uvicorn 已启动）'))
+        reject(new Error(`连接后端超时：${url}（确认 uvicorn 已启动、手机与电脑同网段）`))
       }, CONNECT_TIMEOUT_MS)
 
       ws.onopen = () => {
@@ -71,7 +131,7 @@ export class WsTransport implements SerialTransport {
         // 连接建立前积压的请求（自动拉目录等）一次性按序补发
         for (const f of this.pending) ws.send(this.toBuffer(f))
         this.pending = []
-        this.cb.onStatus('connected', `已连接后端 ${DEFAULT_URL}`)
+        this.cb.onStatus('connected', `已连接后端 ${url}`)
         resolve()
       }
       ws.onerror = () => {
@@ -79,7 +139,7 @@ export class WsTransport implements SerialTransport {
         if (settled) return
         settled = true
         window.clearTimeout(timer)
-        reject(new Error('后端连接错误（uvicorn 未启动或地址不对）'))
+        reject(new Error(`后端连接错误：${url}（uvicorn 未启动或地址不对）`))
       }
       ws.onclose = () => {
         this.ws = null
@@ -111,6 +171,14 @@ export class WsTransport implements SerialTransport {
                 cmd: obj.cmd,
                 name: obj.name,
                 text: obj.text,
+              })
+            } else if (obj.op === 'chart_suggest') {
+              // Python 脚本推荐的曲线配置：交给 store 弹建议条（桌面端左下角）
+              this.cb.onChartSuggest?.({
+                id: obj.id,
+                groups: obj.groups ?? [],
+                source: obj.source ?? '',
+                note: obj.note ?? '',
               })
             }
           } catch {

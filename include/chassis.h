@@ -1,18 +1,13 @@
 #ifndef CHASSIS_H_
 #define CHASSIS_H_
 
-#include "my_motor_group.h" // MotorGroup / MyMotor
-
-// ============================================================
-// 计时累加器的"还没开始计"哨兵。用 0xFFFFFFFF 而不是 0：计数器本身就是从 0 起的，
-// 拿 0 当未开始，就分不清"刚进场、这一拍先不记"和"记了 0 us"。
-// 它的用法是**显式赋值**，不靠回绕：值等于它 → 本拍置 0（不计），否则正常累加。
-constexpr uint32_t elapsed_idle = 0xFFFFFFFFu;
+#include "my_motor_group.h"
 
 // ============================================================
 // 底盘电机组 ChassisMotorGroup：MotorGroup 的派生层，叠一轮式专属状态机
-// （本类与 Chassis 同属"底盘"，故与它同文件；实现见 chassis.cpp。升降杆等
-//   其它机构不共用本类，它们直接用 MotorGroup 或另行派生。）
+// （本类与 Chassis 同声明于 chassis.h，但实现独立成 chassis_motor_group.cpp，
+//   遵循"一个 .cpp 只服务一个类"。升降杆等其它机构不共用本类，它们直接用
+//   MotorGroup 或另行派生。）
 //
 // 【本层做什么】按"误差是谁造成的"分类，决定 I 项是否工作、积分是否清零、压摆策略：
 //     Stopped 停车（0V+刹车，环休眠）
@@ -47,6 +42,12 @@ public:
         Stall
     };
     SpinState spin_state = Stopped;
+private:
+    // 计时累加器的"还没开始计"哨兵
+    static constexpr uint32_t dur_unstart = 0xFFFFFFFFu;
+    void set_spin_state(ChassisMotorGroup::SpinState s);
+
+public:
 
     // ---- 目标跳变：纯命令事件，只看"这次指令比上次变了多少" ----
     // 放这一层而不是基类：它带阈值，是个判断。基类只算量、不下结论。
@@ -55,7 +56,7 @@ public:
     // ---- 状态判据（沿用实车标定值）----
     float speed_stable = 50.0f;   // Transit→Track 加速度阈值，pct/s；兼 Recover/Stall 最小加速度门槛
     float err_in_dead = 2.0f;     // Track→Stable 误差死区，pct
-    float err_out_dead = 3.0f;    // Stable→Track 误差死区，pct；另被 set_target 复用为"小目标跳过 Transit"
+    float err_out_dead = 3.0f;    // Stable→Track 误差死区，pct；另被 set_target() 起步唤醒复用为"小目标/0 直接 Track"
     float i_stable_k = 0.5f;      // Stable 下新增积分的缩放系数
     float error_for_i = 8.0f;     // 误差小于它（或加速度小于 speed_stable）→ I 开始工作；兼 Recover 退出条件
     float recover_accel = 200.0f; // 车速被外力带离目标时的加速度门槛，pct/s
@@ -68,31 +69,37 @@ public:
     // 状态机要的是"过了多久"这个时长，那就该由每拍的 dt 累加得到。一旦写成两个绝对
     // 时刻相减，就逼着"进入 Transit"那一刻（在 set_target 里、甚至来自上位机命令）
     // 去取一次时钟，凭空多出一个时间源。
-    // 初值 elapsed_idle = "还没开始计"：进场那一拍只把它置 0、不加 dt——
+    // 初值 dur_unstart = "还没开始计"：进场那一拍只把它置 0、不加 dt——
     // 因为命令往往落在两拍之间，那一整拍 dt 并不属于新状态。
-    uint32_t transit_elapsed_us = elapsed_idle;
-    // 同上：给满 + 轮速低 已经持续了多久，us。条件不成立时退回 elapsed_idle。
-    uint32_t stall_elapsed_us = elapsed_idle;
+    uint32_t transit_dur_us = dur_unstart;
+    // 同上：给满 + 轮速低 已经持续了多久，us。条件不成立时退回 dur_unstart。
+    uint32_t stall_dur_us = dur_unstart;
 
     // ---- 压摆标定值：当前策略只用"慢/快"两档，不是"升/降"两个方向 ----
     // 常规运行升压慢（护齿箱、防打滑）、撤压快（别拖着不松劲）；Stall 反过来用。
-    // 所以按快/慢命名，哪一方向用哪个由 slew_policy() 按状态决定。
-    // 调参表绑这两个（不是 slew_rise / slew_fall——那两个是每拍被状态覆盖的生效值）。
-    // 两档只是当前状态机的需要，不是结构限制：将来要按状态细分，加字段 + 改 slew_policy()
+    // 所以按快/慢命名，哪一方向用哪个由 set_spin_state() 按状态决定。
+    // 调参表绑这两个（不是 slew_rise / slew_fall——那两个是翻转时被状态写好的生效值）。
+    // 两档只是当前状态机的需要，不是结构限制：将来要按状态细分，加字段 + 改 set_spin_state()
     // 即可，apply_output 收的仍是"一份速率"，不用动。
     float slew_slow = 25.0f;  // 慢斜率，V/s
     float slew_fast = 200.0f; // 快斜率，V/s
 
-    // 本拍生效值，由 slew_policy() 每拍改写。初值取"不限速"：没走过策略就不该凭空限速，
-    // 与基类"不认识压摆"的口径一致（基类压根不限速）。
+    // 本拍生效值，由 set_spin_state() 在状态翻转时一并写好（不是每帧重算）。
+    // 初值取"不限速"：没经历过任何翻转就不该凭空限速，与基类"不认识压摆"的口径一致。
     float slew_rise = INFINITY; // 幅值增大方向，V/s
     float slew_fall = INFINITY; // 幅值减小方向，V/s
+
+    // 积分增益：仅 Stable 打折（i_stable_k）防抖，其余态满增益（1.0f）。
+    // 同 slew，由 set_spin_state() 在状态翻转时一并写好，不是每帧重算。
+    float i_scale = 1.0f;
 
     ChassisMotorGroup(MyMotor *motor_list, uint8_t count,
                       const Vec2f *kf_node, uint8_t kf_num,
                       float p, float i, float d);
 
-    // 存储目标后，按状态机决定起步 / 换向 / 大跳是否进 Transit
+    // 目标入口兼驾驶会话入口：Stopped 收到任何目标（含 0）都唤醒起步
+    // （小目标直接 Track 钉住，大目标 Transit），运行中判换向 / 大跳是否进 Transit。
+    // 底盘同启同停由 Chassis::output() 两侧同调保证。
     void set_target(float t);
 
     // 六态机版速度环：基类 refresh（采样+前置+算 output_raw）→ 状态机①
@@ -109,16 +116,6 @@ public:
 
     // 停机：清状态机状态，再调基类清积分与输出
     void stop();
-
-    // 停车态查询：底盘的"停"由状态机定义（Stopped 态环休眠）。
-    // 只在派生层有这个概念，基类不再声明同名的假实现。
-    bool is_stopped() const { return spin_state == Stopped; }
-
-    // 按当前状态算出本拍生效的两个速率（slew_rise / slew_fall），每拍一次：
-    //   Recover 无穷/无穷（不限速）、Stall 快/慢（顶住快松劲慢）、其余 慢/快（常规）。
-    //   Stopped 走不到这里（refresh 提前返回，apply_output 也不被调）。
-    //   数值即策略，基类不认识枚举。
-    void slew_policy();
 };
 
 // ============================================================
@@ -218,9 +215,10 @@ public:
     void update(uint32_t dt_us);  // 更新传感器读数与运动状态；dt_us 由调用者（RobotAction）给
     void begin_segment();         // 以当前状态为段起点快照，前置条件：本周期已调用过 update()
     void reset(uint32_t dt_us);   // 没update场景的开启新任务段的组合调用
-    // 速度环唯一目标入口，允许输入超过 100 的叠加值，按两侧最大值同比例缩回
+    // 速度环唯一目标入口，允许输入超过 100 的叠加值，按两侧最大值同比例缩回。
+    // 兼驾驶会话入口：Stopped 组收到目标（含 0）即唤醒钉住；停车/放手走 stop()（brake + 休眠）。
     void output(float left_output, float right_output);
-    // 速度环每轮推进：算电压 → 横向限幅 → 下发。
+    // 速度环每轮推进：算电压 → 横向限幅 → 下发。两组同启同停，停着整拍直接返回。
     // 时间参数只是转交给两组（状态机计时与 PID/压摆都只要步长），本层自己不用。
     void speed_tick(uint32_t dt_us, float dt_s);
     void stop();

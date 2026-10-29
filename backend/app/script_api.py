@@ -236,6 +236,22 @@ class VexScript:
             {"index_or_name": index_or_name, "type": type, "on": False},
         )
 
+    def suggest_chart(self, groups, note: str = "", source: str = "") -> dict:
+        """推荐一套曲线配置：桌面端上位机左下角弹建议条，5 秒内可应用/忽略，超时自消。
+
+        groups: [[名字或 index, ...], ...]，第 i 组 = 第 i 个通道的追踪项；
+                最多 4 组、每组最多 4 项，空组表示该通道清空。前端是**整份覆盖**：
+                给了几组就改几个通道，其余通道一并清空。
+        note:   一句话说明，显示在建议条上（"这档建议看电流"之类）
+
+        后端只中继不留存：页面刷新后看不到，所以要在推的时候让上位机开着。
+        返回体带解析后的 index，脚本可自检有没有订错槽（目录重名时会挑 fast 槽）。
+        """
+        return self._post(
+            "/api/chart/suggest",
+            {"groups": [_as_list(g) for g in groups], "note": note, "source": source},
+        )
+
     def refresh_dirs(self) -> dict:
         """清空后端目录缓存并重新向车拉三张表（怀疑缓存过期/半表时用）。"""
         return self._post("/api/dirs/refresh")
@@ -522,6 +538,16 @@ class BackendLink:
         """退订/取消登记。取消 log 登记不会顺带关掉下位机推送，不影响上位机。"""
         for idx in self.resolve(names):
             self.v.unsub(idx, type)
+
+    def suggest_chart(self, groups, note: str = "") -> dict:
+        """推荐一套曲线配置（语义见 VexScript.suggest_chart）。
+
+        名字先在本机目录解析成 index 再发（与 sub 同口径：重名取 fast 槽），
+        后端收到的是 index，不会有"订到另一个同名槽"的歧义。
+        """
+        return self.v.suggest_chart(
+            [self.resolve(g) for g in groups], note=note, source=self._token
+        )
 
     def clear_subs(self) -> None:
         """清掉 script 侧全部订阅意图，不动上位机正在看的那些项。"""

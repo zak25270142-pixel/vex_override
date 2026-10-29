@@ -1,4 +1,4 @@
-/** 串口客户端单例：在 Web Serial 与演示传输之间切换，业务组件只与本对象打交道 */
+/** 串口客户端单例：在 Web Serial / Python backend / 演示传输之间切换，业务组件只与本对象打交道 */
 
 import type { ConnState, PortProbe, SerialTransport, TransportCallbacks } from './transport'
 import { ConnectError, WebSerialTransport } from './webSerialTransport'
@@ -6,6 +6,9 @@ import { WsTransport } from './wsTransport'
 import { MockTransport } from './mockTransport'
 import { loadPrefs, savePrefs } from './persist'
 import { BAUD_CDC, FRAME_HEAD, ping } from './protocol'
+
+/** 接入方式：Web Serial 实机 / Python backend 中转 / 演示数据源 */
+export type AccessMode = 'serial' | 'backend' | 'demo'
 
 /** 口能打开但收不到 Pong 时的重试间隔：设备在、只是用户程序还没起来，尽快接住 */
 const RETRY_MS = 1500
@@ -46,6 +49,8 @@ class SerialClient {
   onData: TransportCallbacks['onData'] | null = null
   /** 由 store 注册：后端推来的固件回执异常（仅后端中转模式会收到） */
   onAlert: TransportCallbacks['onAlert'] | null = null
+  /** 由 store 注册：后端转发的脚本曲线配置建议（仅后端中转模式会收到） */
+  onChartSuggest: TransportCallbacks['onChartSuggest'] | null = null
 
   state: ConnState = 'idle'
   private transport: SerialTransport | null = null
@@ -132,6 +137,7 @@ class SerialClient {
     },
     onData: (data) => this.onData?.(data),
     onAlert: (alert) => this.onAlert?.(alert),
+    onChartSuggest: (s) => this.onChartSuggest?.(s),
   }
 
   /** 应用启动：按持久化接入方式预选传输（直连串口预选已授权设备，后端模式无需选口） */
@@ -259,6 +265,46 @@ class SerialClient {
       this.transport.setIdentity(loadPrefs().port)
       await this.transport.preselect()
     }
+  }
+
+  /** 接入方式：Web Serial 实机 / Python backend 中转 / 演示数据源 */
+  get access(): AccessMode {
+    return this.demo ? 'demo' : this.backend ? 'backend' : 'serial'
+  }
+
+  /**
+   * 一次切到目标接入方式。
+   * 不能拆成"先撤演示再定后端"两步——那会各自重建一次 transport
+   * （串口档还带 preselect 枚举端口），点一下按钮重建两遍，顶栏明显卡顿。
+   */
+  async setAccessMode(mode: AccessMode): Promise<void> {
+    if (this.access === mode) return
+    if (this.connected) await this.disconnect()
+    this.wantConnected = false
+    this.gestureBlocked = false
+    this.clearRetry()
+    this.backend = mode === 'backend'
+    this.demo = mode === 'demo'
+    if (mode === 'demo') {
+      // 演示传输无需选口/探测，连上即可开始推送模拟数据。
+      // 但要尊重「自动连接」开关：没勾就停在未连接，由用户点「连接」开始，
+      // 否则开关对演示模式形同虚设（当初无条件直连是为了避免停在空态，
+      // 代价是开关语义不一致）。
+      this.transport = new MockTransport(this.cb)
+      if (this.autoConnectEnabled) await this.transport.connect(BAUD_CDC)
+      else this.cb.onStatus('idle', '演示模式（未连接）')
+      return
+    }
+    if (mode === 'backend') {
+      this.transport = new WsTransport(this.cb)
+      this.cb.onStatus('idle', '后端模式（未连接）')
+      return
+    }
+    const t = new WebSerialTransport(this.cb)
+    this.transport = t
+    t.setIdentity(loadPrefs().port)
+    await t.preselect()
+    this.cb.onStatus('idle', '未连接')
   }
 
   /**

@@ -50,8 +50,11 @@
       </div>
     </main>
 
-    <!-- 固件回执异常 toast（拒绝/补发/放弃）：Teleport 到 body，右下角堆叠 -->
+    <!-- 固件回执异常 toast（拒绝/补发/放弃）：Teleport 到 body，左下角堆叠 -->
     <AlertToasts />
+    <!-- 脚本推荐的曲线配置：左下角浮出，5s 内可应用/忽略。
+         只在桌面端挂：手机曲线页是单通道，4 组建议没有落点 -->
+    <ChartSuggestBar />
   </div>
 </template>
 
@@ -59,15 +62,18 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import AppHeader from '@/components/shell/AppHeader.vue'
 import AlertToasts from '@/components/common/AlertToasts.vue'
+import ChartSuggestBar from '@/components/common/ChartSuggestBar.vue'
 import ViewStage from '@/components/stage/ViewStage.vue'
 import RightWorkbench from '@/components/shell/RightWorkbench.vue'
 import MobileShell from '@/components/mobile/MobileShell.vue'
 import {
+  accessMode,
   autoConnect,
   baud,
   demoMode,
   rightCollapsed,
   rightWidthPct,
+  setAccessMode,
   setDemoMode,
   RIGHT_WIDTH_MAX,
   RIGHT_WIDTH_MIN,
@@ -117,6 +123,9 @@ async function startup(): Promise<void> {
     return
   }
   await serialClient.init()
+  // 手机没有 Web Serial：持久化若落在「实机」档，归一到后端，
+  // 否则点「连接」会走进选口分支（选不了口）而连不上
+  if (isMobileView.value && accessMode.value === 'serial') await setAccessMode('backend')
   if (autoConnect.value) await serialClient.autoConnect(baud)
 }
 

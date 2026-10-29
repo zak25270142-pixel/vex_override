@@ -2,7 +2,8 @@
   <!-- 固件回执异常 toast：左下角堆叠、自动消失、点击关闭。
        级别与后端 AlertLevel 对齐：reject 拒绝 / retry 补发中 / giveup 放弃 -->
   <Teleport to="body">
-    <div v-if="uiAlerts.length" class="toasts">
+    <!-- 曲线建议条同在左下角（更靠下，因为要操作），此时整体上移让位 -->
+    <div v-if="uiAlerts.length" class="toasts" :class="{ 'toasts--raised': !!chartSuggestion }">
       <div
         v-for="a in uiAlerts"
         :key="a.id"
@@ -19,7 +20,7 @@
 </template>
 
 <script setup lang="ts">
-import { dismissAlert, uiAlerts, type UiAlert } from '@/stores/globle'
+import { chartSuggestion, dismissAlert, uiAlerts, type UiAlert } from '@/stores/globle'
 
 const LEVEL_TAG: Record<UiAlert['level'], string> = {
   reject: '拒绝',
@@ -41,6 +42,12 @@ const LEVEL_TAG: Record<UiAlert['level'], string> = {
   align-items: flex-start;
   /* 容器本身不吃鼠标事件，命中只由单条 toast 自己收 */
   pointer-events: none;
+}
+
+/* 建议条最高约 180px（4 组 + 备注），留 16px 间距抬到它上面。
+   叠在一起时 toast 会盖住"应用"按钮，所以宁可抬得宽一点 */
+.toasts--raised {
+  bottom: 196px;
 }
 
 .toast {

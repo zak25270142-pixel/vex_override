@@ -7,6 +7,7 @@
         <div class="m-sheet__head">
           <span v-if="$slots['head-left']" class="m-sheet__head-left"><slot name="head-left" /></span>
           <span class="m-sheet__title">{{ title }}</span>
+          <span v-if="$slots['head-right']" class="m-sheet__head-right"><slot name="head-right" /></span>
           <button class="m-sheet__close" @click="close">关闭</button>
         </div>
         <div class="m-sheet__body">
@@ -76,6 +77,12 @@ function close(): void {
 }
 .m-sheet__head-left {
   flex: none;
+}
+.m-sheet__head-right {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .m-sheet__title {
   flex: 1;

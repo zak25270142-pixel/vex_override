@@ -113,6 +113,8 @@ _MOCK_MONITORS = [
     {"index": 11, "type": _VT.Float, "tag": _TAG_SUB | _TAG_FAST, "name": "电池电压", "unit": "V"},
     {"index": 12, "type": _VT.Float, "tag": _TAG_SUB, "name": "CPU占用", "unit": "%"},  # 低速（80ms 轮转）
     {"index": 13, "type": _VT.Int16, "tag": _TAG_SUB, "name": "错误码", "unit": ""},  # 低速
+    # 新增：V5 主控电池电量（与真机 monitor_menu_item 同名同义；低速推送）
+    {"index": 14, "type": _VT.Float, "tag": _TAG_SUB | _TAG_GETTER, "name": "电池电量", "unit": "%"},
 ]
 
 _MOCK_COMMANDS = [
@@ -500,6 +502,9 @@ class _MockV5Core:
             return int(t / 10) % 100
         if name == "电池电压":
             return round((7.6 + 0.2 * math.sin(t / 9)) * 100) / 100
+        if name == "电池电量":
+            # 缓慢起伏的剩余电量（74~82%），演示用
+            return round((78 + 4 * math.sin(t / 25)) * 10) / 10
         if name in ("左0电压", "右0电压"):
             return round(self.motor_v[0 if name == "左0电压" else 3] * 100) / 100
         # 左/右 0~2 转速

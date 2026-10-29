@@ -6,16 +6,16 @@ RobotAction::RobotAction(Chassis &chassis_ref,
                          int32_t *move,
                          int32_t *turn)
     : move_axis(move),
-      turn_axis(turn),
-      chassis(chassis_ref),
-      lift(lift_ref),
-      // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
-      // ki、kd 按秒计（kp 无量纲）：(kp, ki, kd[, output_limit])
-      distance_pid(130.0f, 35.0f, 18.0f),
-      heading_pid(1.10f, 0.1f, 0.04f, 25.0f),
-      turn_pid(0.75f, 0.1f, 0.06f),
-      // 误差与实际速度连续满足条件 180 ms 后才结束当前步骤，避免刚经过目标就切换。
-      stable_judge(180)
+    turn_axis(turn),
+    chassis(chassis_ref),
+    lift(lift_ref),
+    // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
+    // ki、kd 按秒计（kp 无量纲）：(kp, ki, kd[, output_limit])
+    distance_pid(130.0f, 35.0f, 18.0f),
+    heading_pid(1.10f, 0.1f, 0.04f, 25.0f),
+    turn_pid(0.75f, 0.1f, 0.06f),
+    // 误差与实际速度连续满足条件 180 ms 后才结束当前步骤，避免刚经过目标就切换。
+    stable_judge(180)
 {
 }
 
@@ -190,13 +190,17 @@ void RobotAction::update_manual(uint32_t now)
         float right_cmd = mv - k * tn;
 
         // 杆量→外侧轮速度：杆量² 从死区到 127² 线性映射（小值压低，低速更可控）
-        float speed = (mv2tn2 - manual_deadzone) / (127.0f * 127.0f - manual_deadzone) * 100.0f;
+        // 满程端点取左右上限的较小者：手动域对称（手感不歪），且天然 ≤ 双侧上限，
+        // 不会再被 spd_scale 缩回——限幅器退回去只管位置环。
+        float manual_full = fminf(chassis.left_motors.max_speed, chassis.right_motors.max_speed);
+        float speed = (mv2tn2 - manual_deadzone) / (127.0f * 127.0f - manual_deadzone) * manual_full;
         float scale = speed / fmaxf(fabsf(left_cmd), fabsf(right_cmd));
         chassis.output(left_cmd * scale, right_cmd * scale);
         return;
     }
     // 两侧都停了就直接待命，不必再走停止通道
-    if (chassis.left_motors.is_stopped() && chassis.right_motors.is_stopped())
+    if (chassis.left_motors.spin_state == ChassisMotorGroup::SpinState::Stopped &&
+        chassis.right_motors.spin_state == ChassisMotorGroup::SpinState::Stopped)
         return;
     // 松杆：走停止通道（0V 减速→转速低于阈值或到 manual_stop_delay 硬刹），刹完留在 manual 待命
     if (stop_start_us == 0)
@@ -280,15 +284,19 @@ void RobotAction::stop_tick(uint32_t now)
     }
     // 双判据先到先刹：两组实际转速都低于阈值（近零才刹，不点头），或时限到（兜底）
     if ((fabsf(chassis.left_motors.pre_v) <= stop_speed_th &&
-         fabsf(chassis.right_motors.pre_v) <= stop_speed_th) ||
+        fabsf(chassis.right_motors.pre_v) <= stop_speed_th) ||
         now - stop_start_us >= stop_time_us)
     {
+        // 刹车段：brake + 休眠，此后不再下发任何目标——output(0,0) 会把刚睡下的组
+        // 立刻摇醒（唤醒语义：驾驶中的 0 是目标），刹车就被顶掉了。
         chassis.stop();
         stop_start_us = 0;
         if (chassis_task_ptr == &RobotAction::stop_tick)
             chassis_task_ptr = nullptr;
+        return;
     }
-    chassis.output(0, 0); // 0V：target=0 时前馈与摩擦垫都归零，P 项即主动制动力；刹完那拍是 no-op（drive 0pct 守卫）
+    // 减速段：0V 目标，P 项即主动制动力（target=0 时前馈与摩擦垫都归零）
+    chassis.output(0, 0);
 }
 
 void RobotAction::action_finished()

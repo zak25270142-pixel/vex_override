@@ -11,8 +11,7 @@ vex::brain Brain;
 CycleTimer main_timer(10); // 暂定10ms  生成主循环周期 类
 
 // 通信拆成两个任务：rx 阻塞在 /dev/serial1 的 read() 上等字节；tx 每 10ms 一拍（与主循环同线程）。
-static vex::event comm_rx_event([]
-                                { comm.rx_task(); }); // 内部死循环，不会返回
+static vex::event comm_rx_event([] { comm.rx_task(); }); // 内部死循环，不会返回
 
 static void screen_refresh_task()
 {

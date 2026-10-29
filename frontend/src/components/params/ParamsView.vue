@@ -34,12 +34,12 @@
       <div v-if="visibleRows.length === 0" class="empty">
         <template v-if="!connected">尚未连接 V5，请在标题栏选口并连接（或勾选“演示”）</template>
         <template v-else-if="paramTable === 'monitor'">
-          实参表为空，请点击标题栏「获取实参表」
+          实参表为空，请点击导航栏「刷新」
         </template>
-        <template v-else>调参表为空，请点击标题栏「获取调参表」</template>
+        <template v-else>调参表为空，请点击导航栏「刷新」</template>
       </div>
 
-      <table v-else class="ptable">
+      <table v-else class="ptable" :class="{ 'ptable--sub': paramTable === 'monitor' }">
         <thead>
           <tr>
             <th class="c-idx">#</th>
@@ -256,12 +256,19 @@ async function onUnsub(index: number): Promise<void> {
 
 .ptable {
   width: 100%;
-  /* 面板过窄时横向滚动，而不是把列挤瘪 */
-  min-width: 740px;
+  /* 面板过窄时横向滚动，而不是把列挤瘪。
+     下限 = 固定列合计 + 名称列最低 ~196px；实参表多一列订阅，单独给更大的下限 */
+  min-width: 570px;
   border-collapse: collapse;
   font-size: 14px;
   /* 固定布局：列宽由下面的 width 决定，数值刷新时列不会左右晃 */
   table-layout: fixed;
+}
+
+/* 实参表（带订阅列）：固定列 64+100+210+240=614，名称列最窄 126px。
+   下限别超过典型左面板宽（1200 窗口 ≈ 800px），否则内容明明放得下也出滚动条 */
+.ptable--sub {
+  min-width: 740px;
 }
 
 .ptable thead th {
@@ -324,15 +331,18 @@ async function onUnsub(index: number): Promise<void> {
 }
 
 .c-type {
-  width: 160px;
+  /* 最长 uint16/double 6 字符（mono 12.5px ≈ 45px）+ 单元格左右 padding 40 */
+  width: 100px;
   color: var(--text-secondary);
   font-family: var(--font-mono);
   font-size: 12.5px;
 }
 
-/* 值列定宽：数值位数来回变也不影响其它列 */
+/* 值列定宽：数值位数来回变也不影响其它列。
+   内容上限是最长 int64 全数字 20 位（mono 14px ≈ 168px），180 会溢出单元格
+   造成幻影横向滚动条 + 右缘遮挡 */
 .c-value {
-  width: 280px;
+  width: 210px;
   font-family: var(--font-mono);
 }
 
@@ -353,7 +363,9 @@ async function onUnsub(index: number): Promise<void> {
 }
 
 .c-sub {
-  width: 235px;
+  /* 最宽状态「未订阅」：徽标52 + 订阅低速66 + 订阅高速66 + 间距12 = 196，
+     210 时内容溢出 26px —— 单元格溢出既产生幻影滚动条又在右缘裁掉按钮 */
+  width: 240px;
 }
 
 /* 状态徽标 + 两个按钮同一行排开 */

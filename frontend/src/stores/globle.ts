@@ -3,7 +3,8 @@
  * 串口字节流 → FrameParser 解帧 → 写本文件的数据；组件只读这里自行视图化。
  */
 import { computed, reactive, ref, watch } from 'vue'
-import { serialClient } from '@/services/serialClient'
+import { serialClient, type AccessMode } from '@/services/serialClient'
+import { currentWsUrl, normalizeBackendUrl, shortBackendUrl } from '@/services/wsTransport'
 import {
   loadPrefs,
   savePrefs,
@@ -43,6 +44,7 @@ import {
   BAUD_CDC,
 } from '@/services/protocol'
 import { CHANNELS, FAST_PERIOD, PLOT_WINDOW_S, TRACE_BUF_CAP } from '@/config/workspace'
+import type { ChartSuggestion } from '@/services/transport'
 import type { WorkView } from '@/config/workspace'
 
 /* ===== 连接 ===== */
@@ -51,6 +53,10 @@ export const serialSupported = ref(serialClient.supported)
 export const demoMode = ref(loadPrefs().demo)
 /** 后端模式：经本机 Python backend 中转，可与测试脚本共存（持久化） */
 export const backendMode = ref(loadPrefs().backend)
+/** 后端 WS 地址（持久化覆盖值优先，否则按页面来源推导）。改完要重新连接才生效 */
+export const backendUrl = ref(loadPrefs().backendUrl ?? currentWsUrl())
+/** 地址在输入框里的简写形态：ws://host:port/ws → host:port，省得手打首尾 */
+export const backendUrlShort = computed(() => shortBackendUrl(backendUrl.value))
 export const connState = ref(serialClient.state)
 export const connected = computed(() => connState.value === 'connected')
 export const statusText = ref(
@@ -280,6 +286,25 @@ const SET_ACK_TIMEOUT_MS = 2000
 /** 监控量最新值，由 50ms 定时刷新从高频原始缓冲搬运（避免 100Hz 直接触发响应式） */
 export const monitorLatest = reactive<Record<number, CellValue>>({})
 
+/* ===== 电池电量（V5 Brain.Battery.capacity()，低速推送）=====
+   按中文名"电池电量"在 monitorMap 里定位，不依赖 index：真机/演示同名同义，
+   且 index 随表增删变动；前端只展示，协议层无需为它新增字段。 */
+const BATTERY_NAME = '电池电量'
+export const batteryItem = computed<DirItem | null>(() => {
+  for (const it of Object.values(monitorMap)) {
+    if (it.name === BATTERY_NAME) return it
+  }
+  return null
+})
+export const batteryLevel = computed<number | null>(() => {
+  const it = batteryItem.value
+  // 断线必须判空：monitorLatest 停推后留着最后一次读数，继续显示会伪装成"电量正常"。
+  // 宁可显示"未知"（徽标画叉），也不要拿旧值骗人——安全相关的量尤其不能冻结。
+  if (!it || !connected.value) return null
+  const v = monitorLatest[it.index]
+  return typeof v === 'number' ? v : null
+})
+
 /* ===== 场地位姿（x/y 单位米，yaw 单位度、顺时针正、0°朝 X+） ===== */
 export const pose = reactive({ x: 0, y: 0, yaw: 0, valid: false })
 
@@ -389,6 +414,57 @@ function syncTraceSubs(before: Set<number>, after: Set<number>): void {
     traceOrigSubs.delete(idx)
     if (orig && !(orig.sub && orig.fast)) void sendSubscribe(idx, orig.sub, orig.fast)
   }
+}
+
+/* ===== 脚本推荐的曲线配置（backend op="chart_suggest"） =====
+   只留最新一条：新建议直接顶掉旧的并重新计时——脚本在循环里每档都推时，
+   堆成一摞既看不清也没意义。后端同样不留存，前后一致。 */
+export const chartSuggestion = ref<ChartSuggestion | null>(null)
+/** 建议条存在时长：超时即等价于"忽略"（提示是快照，不做账本） */
+export const SUGGEST_TTL_MS = 5000
+let suggestTimer: number | null = null
+
+/** 收到一条新建议：顶掉旧建议并重新计时 */
+export function pushChartSuggestion(s: ChartSuggestion): void {
+  chartSuggestion.value = s
+  if (suggestTimer !== null) window.clearTimeout(suggestTimer)
+  suggestTimer = window.setTimeout(() => {
+    suggestTimer = null
+    chartSuggestion.value = null
+  }, SUGGEST_TTL_MS)
+}
+
+/** 关闭建议条（忽略 / 应用后都走这里） */
+export function dismissChartSuggestion(): void {
+  if (suggestTimer !== null) window.clearTimeout(suggestTimer)
+  suggestTimer = null
+  chartSuggestion.value = null
+}
+
+/**
+ * 应用建议：整份覆盖——先清空所有通道，再按 groups 逐通道写入（空组=该通道清空）。
+ *
+ * 必须用 syncTraceSubs 收尾：新进追踪的量要提速到 fast 才有 100Hz 数据，
+ * 被顶掉的量要还原原挡位。直接改数组会得到几条永远不来的空曲线。
+ * 写入走 push 而非 pickTrace：pickTrace 单次只改一个槽，覆盖语义下逐槽调用
+ * 会触发多次订阅 diff，push 完统一 diff 一次更干净。
+ */
+export function applyChartSuggestion(): void {
+  const s = chartSuggestion.value
+  if (!s) return
+  const before = tracedIndices()
+  for (const list of channelTraces) list.splice(0)
+  s.groups.forEach((group, ch) => {
+    const list = channelTraces[ch]
+    if (!list) return
+    for (const item of group) {
+      if (list.length >= TRACE_MAX) break
+      if (list.includes(item.index)) continue
+      list.push(item.index)
+    }
+  })
+  syncTraceSubs(before, tracedIndices())
+  dismissChartSuggestion()
 }
 
 /** 记录用户原挡位（只记一次）：优先取持久化意向，其次主控当前挡位 */
@@ -918,6 +994,13 @@ serialClient.onAlert = (a) => {
   pushDiag('ERR', `${a.name}：${a.text}`)
   pushAlert(a.level, `${a.name}：${a.text}`)
 }
+// 脚本推荐的曲线配置：只递给桌面端建议条，手机端不显示（手机曲线页是单通道，
+// 4 组建议没有落点）。诊断日志留一行，便于事后回看脚本推过什么
+serialClient.onChartSuggest = (s) => {
+  const desc = s.groups.map((g) => g.map((it) => it.name).join('、') || '空').join(' | ')
+  pushDiag('EVT', `脚本推荐曲线配置（${s.source || '未知来源'}）：${desc}`)
+  pushChartSuggestion(s)
+}
 
 /* ===== 动作：连接 / 演示 ===== */
 export async function pickPort(): Promise<void> {
@@ -963,6 +1046,35 @@ export async function setBackendMode(on: boolean): Promise<void> {
   connState.value = serialClient.state
   savePrefs({ backend: serialClient.isBackend, demo: serialClient.isDemo })
   if (on && autoConnect.value) void serialClient.autoConnect(baud)
+}
+
+/** 接入方式三选一，由 demoMode、backendMode 两个已持久化的布尔派生，不额外存第三份状态 */
+export type { AccessMode }
+export const accessMode = computed<AccessMode>(() =>
+  demoMode.value ? 'demo' : backendMode.value ? 'backend' : 'serial',
+)
+
+/** 切接入方式。先同步更新 ref 让分段滑块立刻跟上点击，再异步重建 transport——
+ *  反过来（等 transport 切完再更新 ref）会让人觉得点下去卡了几百毫秒才有反应。
+ *  transport 重建交给 serialClient 一次到位，避免"先撤演示再定后端"重建两遍。 */
+export async function setAccessMode(m: AccessMode): Promise<void> {
+  if (accessMode.value === m) return
+  demoMode.value = m === 'demo'
+  backendMode.value = m === 'backend'
+  savePrefs({ demo: m === 'demo', backend: m === 'backend' })
+  await serialClient.setAccessMode(m)
+  connState.value = serialClient.state
+  if (m === 'backend' && autoConnect.value) void serialClient.autoConnect(baud)
+}
+
+/** 设置页改后端地址：空串=清除覆盖、回到按页面来源推导。
+ *  只落盘 + 同步 ref，不断开当前连接——WsTransport 每次 connect 才读地址，
+ *  所以下一次点「连接」即生效。 */
+export function setBackendUrl(url: string): void {
+  const s = normalizeBackendUrl(url)
+  const cleared = s === ''
+  backendUrl.value = cleared ? currentWsUrl() : s
+  savePrefs({ backendUrl: cleared ? null : s })
 }
 
 /** 顶栏"自动连接"开关：落盘并联动串口客户端的重连开关 */
@@ -1011,6 +1123,18 @@ export async function fetchCommands(): Promise<void> {
   for (const k of Object.keys(commandMap)) delete commandMap[Number(k)]
   statusText.value = '已发送命令表请求，等待主控回传…'
   await sendFrame(requestCommand(), '请求命令表')
+}
+
+/** 一键刷新：清空并重新拉取三张目录表（调参/实参/命令）。
+    连接成功后本来会自动拉，这里供导航栏「刷新」手动重拉；未连接直接提示。 */
+export async function refreshAll(): Promise<void> {
+  if (!connected.value) {
+    statusText.value = '尚未连接，无法刷新'
+    return
+  }
+  await fetchTunable()
+  await fetchMonitor()
+  await fetchCommands()
 }
 
 /**

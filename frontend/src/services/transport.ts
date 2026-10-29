@@ -19,6 +19,26 @@ export interface FwAlert {
   text: string
 }
 
+/**
+ * 后端 WS 推送的曲线配置建议（文本 JSON，op="chart_suggest"），来自 Python 脚本。
+ * groups[ch] 是第 ch 个通道的追踪项；空组表示该通道清空。后端只中继不留存，
+ * 所以页面刷新后收不到——建议的有效期就是弹出来那几秒。
+ */
+export interface ChartSuggestItem {
+  /** 监控项 index（后端已把中文名解析成 index，目录重名也不会订错槽） */
+  index: number
+  name: string
+  unit: string
+}
+export interface ChartSuggestion {
+  id: string
+  groups: ChartSuggestItem[][]
+  /** 来源标识（脚本 token），显示在建议条上便于溯源 */
+  source: string
+  /** 脚本给的一句话说明 */
+  note: string
+}
+
 export interface TransportCallbacks {
   /** 连接状态变化（含人类可读的说明文本） */
   onStatus: (state: ConnState, message: string) => void
@@ -26,6 +46,8 @@ export interface TransportCallbacks {
   onData: (data: Uint8Array) => void
   /** 后端推来的固件回执异常（仅后端中转模式；直连串口无此消息） */
   onAlert?: (alert: FwAlert) => void
+  /** 后端转发的脚本曲线配置建议（仅后端中转模式） */
+  onChartSuggest?: (suggestion: ChartSuggestion) => void
 }
 
 /**

@@ -11,7 +11,7 @@
         <!-- 空态 -->
         <div v-if="commands.length === 0" class="empty">
           <template v-if="!connected">连接后自动获取命令表</template>
-          <template v-else>命令表为空，请点标题栏重新获取</template>
+          <template v-else>命令表为空，请点导航栏「刷新」</template>
         </div>
 
         <template v-else>

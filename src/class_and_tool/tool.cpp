@@ -1,4 +1,5 @@
 #include "tool.h"
+#include <cmath>
 
 void list_copy(char *list1, const char *list2, uint16_t len)
 {
@@ -99,4 +100,21 @@ uint64_t ten_xx_num(int8_t num)
         ans *= 10;
     }
     return ans;
+}
+
+// 压摆窗口：把 req 收到"以 prev 为锚、按速率张开"的区间里，返回收好之后的值。
+// rise / fall 是"离 0 / 朝 0"的速率，不是"正 / 负"方向的速率——所以过零那一拍要把
+// 这一拍的额度拆成两段：先用 fall 撤到 0，剩下的时间用 rise 往反向张开。
+// 不换向时窗口对称，两条边各张 step；step 取哪条速率取决于这拍幅值在增大还是减小。
+float slew_step(float req, float prev, float rise, float fall, float dt)
+{
+    if (req * prev < 0.0f) // 换向
+    {
+        const float t_zero = fabsf(prev) / fall; // 撤到 0 要花的时间
+        if (t_zero >= dt)                        // 本拍撤不完，窗口缩成一个点
+            return prev - copysignf(fall * dt, prev);
+        return copysignf(fminf(fabsf(req), rise * (dt - t_zero)), req);
+    }
+    const float step = (fabsf(req) > fabsf(prev) ? rise : fall) * dt;
+    return fminf(fmaxf(req, prev - step), prev + step);
 }

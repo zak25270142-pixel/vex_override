@@ -29,3 +29,6 @@ backend/.venv/
 backend/**/__pycache__/
 backend/pytest/log_*
 backend/.idea/
+
+# WorkBuddy published-app marker (local tool state: absolute paths + appId, auto-regenerated)
+.wbapp_*.genie

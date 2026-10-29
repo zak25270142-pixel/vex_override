@@ -138,6 +138,14 @@ class OkResult:
 
 
 @dataclass
+class ChartSuggestResult:
+    """/api/chart/suggest 返回体：已广播的建议（groups 回显解析后的 index，便于脚本自检）。"""
+    ok: bool = True
+    id: str = ""
+    groups: list[list[int]] = field(default_factory=list)
+
+
+@dataclass
 class MonitorReading:
     """监控项当前值 + 新鲜度（/api/value 一项）。"""
     index: int
@@ -315,10 +323,20 @@ class ConnectResult:
     snapshot: Snapshot
 
 
+class WsOp(str, Enum):
+    """WS 文本帧的 op 取值（前端按它分流；str 子类，json.dumps 直接出 "status" 这类值）。
+
+    Status 连接状态 / Alert 固件回执异常 / ChartSuggest 脚本推荐的曲线配置。
+    """
+    Status = "status"
+    Alert = "alert"
+    ChartSuggest = "chart_suggest"
+
+
 @dataclass
 class StatusMessage:
     """WS 文本通道推给前端的连接状态消息（前端按 op=="status" 处理）。"""
-    op: str
+    op: WsOp
     state: str
     message: str
 
@@ -341,8 +359,31 @@ class AlertMessage:
     只有后端待确认表知道——前端没有原帧长度和重试预算，推不过来。
     name 是命令中文名（目录/内置命令表/回显下标解析得来），text 是一句人话。
     """
-    op: str
+    op: WsOp
     level: AlertLevel
     cmd: int   # 回显的命令字（动作命令 0x80~0x9F 或内置命令字）
     name: str  # 命令中文名描述，如 动作命令「直行」
     text: str  # 结局说明，如 补发 3 次仍无固件确认，已放弃
+
+
+@dataclass
+class ChartSuggestItem:
+    """建议里的一项：已解析成 index，前端直接按 index 写通道（目录有重名也不会订错槽）。"""
+    index: int
+    name: str   # 目录中文名（目录还没到时为 str(index)）
+    unit: str = ""
+
+
+@dataclass
+class ChartSuggestMessage:
+    """WS 文本通道推给前端的曲线配置建议（前端按 op=="chart_suggest" 弹建议条）。
+
+    groups[ch] = 第 ch 个通道的追踪项；空组表示"该通道清空"。
+    后端只中继、不留存：推完即忘，页面刷新后看不到（脚本要提示就在推的时候开着页面）。
+    """
+    op: WsOp
+    id: str                          # 建议号（前端只用于去重与计时，不必回传）
+    groups: list[list[ChartSuggestItem]]
+    source: str                      # 来源标识（脚本自带 token，便于溯源是谁弹的）
+    note: str                        # 脚本给的一句话说明，可为空
+    ts: float                        # 后端生成时刻（time.time()，仅展示用）

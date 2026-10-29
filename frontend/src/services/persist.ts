@@ -47,6 +47,8 @@ export interface Prefs {
   demo: boolean
   /** 后端模式：经本机 Python backend(ws://127.0.0.1:8000) 中转，与 demo 互斥 */
   backend: boolean
+  /** 后端 WS 地址覆盖值；null = 按页面来源推导（见 wsTransport.defaultWsUrl） */
+  backendUrl: string | null
   port: PortIdentity | null
   /** monitor index → 订阅档位（含退订，用于对抗主控默认订阅位） */
   subs: Record<number, SubEntry>
@@ -77,6 +79,7 @@ function defaultPrefs(): Prefs {
     autoConnect: true,
     demo: false,
     backend: false,
+    backendUrl: null,
     port: null,
     subs: {},
     chart: defaultChart(),
@@ -92,6 +95,13 @@ function asBool(v: unknown, fallback: boolean): boolean {
 
 function validIdx(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0
+}
+
+/** 后端 WS 地址：必须是 ws:// 或 wss:// 开头的非空串，其余一律回落 null（=用推导值） */
+function readBackendUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const s = raw.trim()
+  return /^wss?:\/\/\S+$/.test(s) ? s : null
 }
 
 function readPort(raw: unknown): PortIdentity | null {
@@ -182,6 +192,7 @@ function readPrefs(): Prefs {
     autoConnect: asBool(raw.autoConnect, def.autoConnect),
     demo: asBool(raw.demo, def.demo),
     backend: asBool(raw.backend, def.backend),
+    backendUrl: readBackendUrl(raw.backendUrl),
     port: readPort(raw.port),
     subs: readSubs(raw.subs),
     chart: readChart(raw.chart),

@@ -25,7 +25,14 @@ from fastapi.middleware.cors import CORSMiddleware # CORS 中间件（允许跨�
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field 
 
-from .dataclass import CalcResult, ConnectResult, LeaseResult, OkResult, ValueSnapshot
+from .dataclass import (
+    CalcResult,
+    ChartSuggestResult,
+    ConnectResult,
+    LeaseResult,
+    OkResult,
+    ValueSnapshot,
+)
 from .hub import SCRIPT_LEASE_TTL_S, Hub
 
 logging.basicConfig(
@@ -38,6 +45,11 @@ logger = logging.getLogger("vex.main")
 V5_PORT = os.environ.get("V5_PORT")  # 例如 COM3 / /dev/ttyACM0；不设则 Ping 探测
 V5_BAUD = int(os.environ.get("V5_BAUD", "115200"))  # CDC 虚拟口，波特率仅占位（USB 全速跑）
 AUTO_CONNECT = os.environ.get("V5_AUTO_CONNECT", "1") not in ("0", "false", "False")
+# 传输通道：serial=USB 直连（默认），udp=WiFi 下位机（Hi3861 等，对端自动发现）。
+# 两者互斥——现阶段只连一个 client，不支持多设备并存。
+V5_TRANSPORT = os.environ.get("V5_TRANSPORT", "serial").lower()  # serial | udp
+UDP_BIND_HOST = os.environ.get("V5_UDP_HOST", "0.0.0.0")
+UDP_BIND_PORT = int(os.environ.get("V5_UDP_PORT", "8888"))
 # 演示模式：没有真车/真固件时，用 mock_v5.MockV5Bridge 顶替串口后面的那台 V5。
 # 小程序/网页连 WS 的行为与真机完全一致（目录 burst、100Hz 推送、回执、心跳），
 # 区别只在数据是本地模拟的
@@ -51,6 +63,16 @@ if V5_MOCK:
     from .mock_v5 import MockV5Bridge
 
     _bridge_factory = MockV5Bridge
+elif V5_TRANSPORT == "udp":
+    from .udp_bridge import UdpBridge
+
+    def _udp_factory(**kw):
+        """Hub 统一传 port/baud，UDP 用不上，剥掉后按监听地址构造。"""
+        kw.pop("port", None)
+        kw.pop("baud", None)
+        return UdpBridge(bind_host=UDP_BIND_HOST, bind_port=UDP_BIND_PORT, **kw)
+
+    _bridge_factory = _udp_factory
 
 hub = Hub(port=V5_PORT, baud=V5_BAUD, bridge_factory=_bridge_factory)
 
@@ -67,9 +89,9 @@ async def lifespan(app: FastAPI):
     # 否则首批串口事件推不出去。
     hub.set_loop(asyncio_get_loop())
     logger.info(
-        "启动 Hub, port=%s baud=%s auto=%s mock=%s",
+        "启动 Hub, transport=%s port=%s auto=%s mock=%s",
+        "udp@%s:%d" % (UDP_BIND_HOST, UDP_BIND_PORT) if V5_TRANSPORT == "udp" else "serial",
         V5_PORT or "自动探测",
-        V5_BAUD,
         AUTO_CONNECT,
         V5_MOCK,
     )
@@ -158,6 +180,17 @@ class SubBody(BaseModel):
     fast: bool | None = None   # None 时跟随 on（订阅即高速，退订即关）
 
     model_config = {"populate_by_name": True}  # 允许请求体里写 kind 或 type 都行
+
+
+class ChartSuggestBody(BaseModel):
+    """/api/chart/suggest 请求体：脚本推荐的一套曲线配置（最多 4 组、每组最多 4 项）。
+
+    groups[i] = 第 i 个通道的追踪项（中文名或 index 均可）；空组表示该通道清空。
+    前端整份覆盖应用：给了几组就改几个通道，其余通道一并清空。
+    """
+    groups: list[list[Any]]
+    note: str = ""    # 一句话说明（"这档建议看电流"之类），显示在建议条上
+    source: str = ""  # 来源标识（BackendLink 自动填自己的脚本 token）
 
 
 class CmdBody(BaseModel):
@@ -266,6 +299,25 @@ def api_sub(body: SubBody):
         return hub.sub(body.index_or_name, body.kind, on=body.on, fast=body.fast)
     except KeyError as e:
         raise HTTPException(404, str(e))
+
+
+@app.post("/api/chart/suggest")
+def api_chart_suggest(body: ChartSuggestBody) -> ChartSuggestResult:
+    """脚本推荐一套曲线配置：广播给所有上位机，桌面端左下角弹条（5s 内可应用/忽略）。
+
+    body: ChartSuggestBody（groups + note + source）
+    返回: ChartSuggestResult（回显解析后的 index，便于脚本自检有没有订错槽）
+    越界 → 400；名字不在监控目录 → 404
+
+    不纳入脚本写权互斥：它不改车的行为，只是给操作者递个建议；纯分析脚本（不 claim
+    写权）也该能推。防骚扰靠 source 显示在建议条上，能溯源是谁弹的。
+    """
+    try:
+        return hub.suggest_chart(body.groups, note=body.note, source=body.source)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/stop")

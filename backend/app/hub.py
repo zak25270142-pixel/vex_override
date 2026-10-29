@@ -11,6 +11,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime
@@ -51,6 +52,9 @@ from .dataclass import (
     AlertLevel,
     AlertMessage,
     CalcResult,
+    ChartSuggestItem,
+    ChartSuggestMessage,
+    ChartSuggestResult,
     CmdDirItem,
     CmdField,
     CmdResult,
@@ -73,6 +77,7 @@ from .dataclass import (
     StatusMessage,
     StopResult,
     SubResult,
+    WsOp,
 )
 from .serial_bridge import PortInfo, SerialBridge, Status
 
@@ -123,6 +128,12 @@ ACK_MAX_RETRIES = 3  # 超时/需补发的重发上限；用尽后放弃并记�
 # 目录"对照→补发"外循环的轮次上限。每个补发帧自带 ACK_MAX_RETRIES 次重发，
 # 但外循环每轮发的都是新帧、预算永远烧不完——不单独数轮次会滚雪球。
 DIR_MAX_ROUNDS = 3
+
+# ---------- 曲线配置建议（脚本 → 上位机）----------
+# 上限是脚本侧的业务约定，不是前端容量（前端 4 通道 × 5 槽）：组数=通道数，
+# 每组留 1 槽空余，好让操作者自己再补一条对比曲线。
+CHART_SUGGEST_MAX_GROUPS = 4
+CHART_SUGGEST_MAX_ITEMS = 4
 
 # 内置下行命令的中文名（Response 回显/alert 提示用）。动作命令名不在表里——
 # 查 cmd_dir（下位机命令目录发的中文名），见 Hub._cmd_label。
@@ -915,7 +926,7 @@ class Hub:
         没有客户端时 _broadcast_json 自己空转，这里不判断。
         """
         self._broadcast_json(
-            AlertMessage(op="alert", level=level, cmd=cmd, name=name, text=text)
+            AlertMessage(op=WsOp.Alert, level=level, cmd=cmd, name=name, text=text)
         )
 
     def _handle_response(self, p: bytes) -> None:
@@ -1122,7 +1133,7 @@ class Hub:
             self._ws_clients.add(ws)
         # 只推连接状态；目录由前端连上后自己发请求（与直连串口行为一致）
         await ws.send_json(
-            asdict(StatusMessage(op="status", state=self.status.value, message=self.status_msg))
+            asdict(StatusMessage(op=WsOp.Status, state=self.status.value, message=self.status_msg))
         )
         try:
             while True:
@@ -1553,6 +1564,56 @@ class Hub:
             result.log = on
 
         return result
+
+    def suggest_chart(self, groups, note: str = "", source: str = "") -> ChartSuggestResult:
+        """把脚本推荐的曲线配置广播给所有上位机（只中继，不留存、不判过期）。
+
+        groups: [[index_or_name, ...], ...]，第 i 组 = 第 i 个通道的追踪项；空组=该通道清空
+        note/source: 脚本自带的一句话说明与来源标识，原样透传给前端展示
+        返回: ChartSuggestResult（回显解析后的 index，便于脚本自检有没有订错槽）
+        抛错: ValueError 组数/项数超限或整份为空；KeyError 名字不在监控目录里
+
+        为什么不留存最后一条：建议的有效期就是弹出来那几秒，页面刷新后补推一条
+        几分钟前的建议只会误导。脚本要提示就在推的时候让页面开着。
+        """
+        if not isinstance(groups, (list, tuple)):
+            raise ValueError(f"groups 必须是列表的列表，收到 {type(groups).__name__}")
+        if len(groups) > CHART_SUGGEST_MAX_GROUPS:
+            raise ValueError(f"最多 {CHART_SUGGEST_MAX_GROUPS} 组，收到 {len(groups)} 组")
+        parsed: list[list[ChartSuggestItem]] = []
+        for g in groups:
+            if not isinstance(g, (list, tuple)):
+                raise ValueError(f"每组必须是列表，收到 {type(g).__name__}")
+            if len(g) > CHART_SUGGEST_MAX_ITEMS:
+                raise ValueError(f"每组最多 {CHART_SUGGEST_MAX_ITEMS} 项，收到 {len(g)} 项")
+            row = []
+            for item in g:
+                idx = self.resolve_monitor(item)
+                entry = self.monitor_dir.get(idx)
+                row.append(
+                    ChartSuggestItem(
+                        index=idx,
+                        name=entry.item.name if entry else str(idx),
+                        unit=entry.item.unit if entry else "",
+                    )
+                )
+            parsed.append(row)
+        if not any(parsed):
+            raise ValueError("空建议（所有组都是空的）不推：那只会把上位机的曲线清光")
+
+        sug_id = uuid.uuid4().hex[:8]
+        self._broadcast_json(
+            ChartSuggestMessage(
+                op=WsOp.ChartSuggest,
+                id=sug_id,
+                groups=parsed,
+                source=source,
+                note=note,
+                ts=time.time(),
+            )
+        )
+        logger.info("推曲线建议 %s：%d 组（source=%s）", sug_id, len(parsed), source or "-")
+        return ChartSuggestResult(id=sug_id, groups=[[it.index for it in row] for row in parsed])
 
     def emergency_stop(self) -> StopResult:
         """最高优先级停车：发停车帧、清脚本队列、置 abort 打断脚本。

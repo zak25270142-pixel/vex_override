@@ -11,29 +11,19 @@
     <!-- 接入方式 -->
     <div
       class="access"
-      :class="demoMode || backendMode ? 'access--demo' : 'access--real'"
+      :class="accessMode === 'serial' ? 'access--real' : 'access--demo'"
       title="当前数据接入方式"
     >
       <span class="access__dot" />
-      {{
-        demoMode
+      <span class="access__label">{{
+        accessMode === 'demo'
           ? '演示数据源'
-          : backendMode
+          : accessMode === 'backend'
             ? 'PYTHON 后端'
             : serialSupported
               ? 'WEB SERIAL 实机'
               : '串口不可用'
-      }}
-    </div>
-
-    <!-- 取表请求：连上才可用，随时点可重新拉取 -->
-    <div class="fetch-group">
-      <button class="btn btn--ghost" :disabled="!connected" title="请求可调参数表" @click="fetchTunable">
-        获取调参表
-      </button>
-      <button class="btn btn--ghost" :disabled="!connected" title="请求实时监视量目录并开始推送" @click="fetchMonitor">
-        获取实参表
-      </button>
+      }}</span>
     </div>
 
     <div class="status">
@@ -51,17 +41,24 @@
     <button class="btn btn--ghost" title="查看通信链路诊断" @click="diagOpen = true">诊断</button>
     <DiagnosticsDialog />
 
-    <!-- 演示开关 -->
-    <label class="demo-switch" title="无硬件时用模拟数据源走通全链路">
-      <input type="checkbox" :checked="demoMode" @change="onDemoChange" />
-      <span>演示</span>
-    </label>
-
-    <!-- 后端开关：经本机 Python backend(ws://127.0.0.1:8000) 中转，可与测试脚本共存 -->
-    <label class="demo-switch" title="连接本机 Python backend：脚本可同时跑，停车始终优先">
-      <input type="checkbox" :checked="backendMode" @change="onBackendChange" />
-      <span>后端</span>
-    </label>
+    <!-- 接入方式三选一：Web Serial 实机 / Python backend 中转 / 演示数据源。
+         浏览器不支持 Web Serial 时「实机」档禁用（点到也不切换） -->
+    <Segmented
+      :model-value="accessIndex"
+      :options="accessOptions"
+      aria-label="接入方式"
+      @update:model-value="onAccessChange"
+    />
+    <input
+      v-if="accessMode === 'backend'"
+      class="backend-url"
+      type="text"
+      :value="backendUrlShort"
+      placeholder="192.168.1.5:8000"
+      spellcheck="false"
+      title="后端地址，只填 IP:端口 即可（首尾自动补）；改完点「连接」生效，清空恢复默认"
+      @change="onBackendUrlChange"
+    />
 
     <!-- 自动连接：打开页面 / 断线后自动重连已授权的串口设备 -->
     <label class="demo-switch" title="打开页面或断线后自动重连已授权串口（首次需手动选口授权）">
@@ -72,7 +69,7 @@
     <!-- 连接链路：未选口时可先选口，再连接；已连接可断开 -->
     <div class="conn-group">
       <button
-        v-if="!demoMode && !backendMode"
+        v-if="accessMode === 'serial'"
         class="btn btn--ghost"
         :disabled="connected || connState === 'connecting'"
         title="选择 V5 User 口对应的串口"
@@ -83,7 +80,7 @@
       <button
         class="btn"
         :class="connected ? 'btn--danger' : 'btn--accent'"
-        :disabled="connState === 'connecting' || (!demoMode && !backendMode && !serialSupported)"
+        :disabled="connState === 'connecting' || (accessMode === 'serial' && !serialSupported)"
         @click="toggleConnect"
       >
         {{ connState === 'connecting' ? '连接中…' : connected ? '断开' : '连接' }}
@@ -93,34 +90,50 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import {
+  accessMode,
   autoConnect,
-  backendMode,
+  backendUrlShort,
   commStats,
   connState,
   connected,
-  demoMode,
   diagOpen,
-  fetchMonitor,
-  fetchTunable,
   pickPort,
   serialSupported,
+  setAccessMode,
   setAutoConnect,
-  setBackendMode,
-  setDemoMode,
+  setBackendUrl,
   statusText,
   toggleConnect,
 } from '@/stores/globle'
 import DiagnosticsDialog from '@/components/shell/DiagnosticsDialog.vue'
+import Segmented from '@/components/common/Segmented.vue'
 import logoUrl from '@/assets/hdu-vex-logo.jpg'
 
+const ACCESS_MODES = ['serial', 'backend', 'demo'] as const
+const accessOptions = computed(() => [
+  {
+    label: '实机',
+    value: 'serial',
+    disabled: !serialSupported.value,
+    title: serialSupported.value
+      ? 'Web Serial 直连 V5 User 口'
+      : '当前浏览器不支持 Web Serial，请用 Chrome / Edge',
+  },
+  { label: '后端', value: 'backend', title: '经 Python backend 中转，可与测试脚本共存' },
+  { label: '演示', value: 'demo', title: '无硬件时用内置模拟数据源走通全链路' },
+])
+const accessIndex = computed(() =>
+  accessMode.value === 'demo' ? 2 : accessMode.value === 'backend' ? 1 : 0,
+)
 
-function onDemoChange(e: Event): void {
-  void setDemoMode((e.target as HTMLInputElement).checked)
+function onAccessChange(i: number): void {
+  void setAccessMode(ACCESS_MODES[i])
 }
 
-function onBackendChange(e: Event): void {
-  void setBackendMode((e.target as HTMLInputElement).checked)
+function onBackendUrlChange(e: Event): void {
+  setBackendUrl((e.target as HTMLInputElement).value)
 }
 
 function onAutoConnectChange(e: Event): void {
@@ -146,6 +159,7 @@ function onAutoConnectChange(e: Event): void {
   gap: 9px;
   padding-right: 12px;
   border-right: var(--border-subtle);
+  min-width: 0; /* 允许整块收缩，标题改单行截断而非换行 */
 }
 
 .brand__mark {
@@ -155,12 +169,22 @@ function onAutoConnectChange(e: Event): void {
   object-fit: cover;
   border-radius: 50%;
   box-shadow: var(--glow-accent);
+  flex-shrink: 0;
 }
 
 .brand__text {
   display: flex;
   flex-direction: column;
   line-height: 1.2;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.brand__text strong,
+.brand__text small {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .brand__text strong {
@@ -228,7 +252,6 @@ function onAutoConnectChange(e: Event): void {
   box-shadow: var(--shadow-focus);
 }
 
-.fetch-group,
 .conn-group {
   display: flex;
   gap: 6px;
@@ -245,6 +268,14 @@ function onAutoConnectChange(e: Event): void {
   font-weight: 700;
   letter-spacing: 0.04em;
   border: 1px solid;
+  min-width: 0; /* 允许收缩，文字单行截断 */
+  overflow: hidden;
+}
+
+.access__label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .access--demo {
@@ -265,6 +296,15 @@ function onAutoConnectChange(e: Event): void {
   border-radius: 50%;
   background: currentColor;
   box-shadow: 0 0 6px currentColor;
+  flex-shrink: 0;
+}
+
+/* 窄窗口：链路计数让位给数据源徽标——.status 空间不足时 nowrap 的计数会向左
+   溢出盖住左侧接入徽标；计数属次要诊断（诊断弹窗里有完整版），窄屏隐藏 */
+@media (max-width: 1024px) {
+  .mini-stat {
+    display: none;
+  }
 }
 
 .status {
@@ -341,5 +381,32 @@ function onAutoConnectChange(e: Event): void {
 .demo-switch input {
   accent-color: var(--accent);
   cursor: pointer;
+}
+
+/* 后端地址输入框：默认按页面来源推导，只有跨机/手机场景才需要手填 */
+.backend-url {
+  width: 170px;
+  height: 26px;
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: var(--border-subtle);
+  border-radius: var(--radius);
+  flex-shrink: 0;
+}
+
+.backend-url:focus {
+  outline: none;
+  border-color: var(--accent-border);
+  color: var(--text-primary);
+}
+
+/* 窄窗口让位：顶栏空间优先给状态与连接按钮，地址在手机设置页改即可 */
+@media (max-width: 1366px) {
+  .backend-url {
+    display: none;
+  }
 }
 </style>
