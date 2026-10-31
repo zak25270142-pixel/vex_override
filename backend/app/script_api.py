@@ -175,23 +175,29 @@ class VexScript:
     def stop(self) -> dict:
         """紧急停车：最高优先级，清脚本队列并置 abort（也会打断其他在跑的脚本）。
 
+        固件把停车拆成了两条命令（停底盘 / 停升降杆），这里两条都发——紧急停车的
+        语义是"停一切"，只停一边会留下另一边继续出力。
+
         与 BackendLink.stop_move() 的区别：
             stop()       上位机语义，置 abort，中断所有脚本
-            stop_move()  只发 0x80 停车帧，不置 abort（脚本自己还要继续跑时用）
+            stop_move()  只发 0x80 停车帧（停底盘），不置 abort（脚本自己还要继续跑时用）
         """
         return self._post("/api/stop")
 
     def stop_move(self) -> dict:
-        """0x80 停止运动：只发停车帧，不置 abort（脚本自己还要继续跑时用）。
+        """0x80 停止底盘：只发停车帧，不置 abort（脚本自己还要继续跑时用）。
 
         所有实车脚本开头都该调它交出底盘——boot 默认手柄控车（manual() 使 is_busy
         恒真），期间 0x84/0x85 被固件静默拒绝，表现为"命令发了没反应"。
+
+        注意只停底盘：升降杆要走「停止升降杆」那条命令（固件已拆成两条），
+        本方法不碰它。
 
         与 stop() 的区别：
             stop()       上位机语义，置 abort，中断所有脚本
             stop_move()  只发停车帧，不置 abort
         """
-        return self.cmd("停止运动")
+        return self.cmd("停止底盘")
 
     def clear_abort(self) -> dict:
         """停车后继续跑新脚本前先清 abort。"""
@@ -671,13 +677,15 @@ class BackendLink:
         return self.v.cmd(name, *args)
 
     def stop_move(self) -> dict:
-        """0x80 停止运动：只发停车帧，不置 abort（不同于上位机停车按钮）。
+        """0x80 停止底盘：只发停车帧，不置 abort（不同于上位机停车按钮）。
 
         用在"脚本自己要收车但还想继续跑后续步骤"的场景，
         比如扫参每一档之间停一下。
+
+        只停底盘：升降杆要走「停止升降杆」那条命令（固件已拆成两条），本方法不碰它。
         """
         r = self.v.stop_move()
-        # 固件这一下把所有电机电压归零，影子跟着清（保持分组形状，长度不变）
+        # 固件这一下把底盘所有电机电压归零，影子跟着清（保持分组形状，长度不变）
         self._volt = [[0.0] * len(g) for g in self._volt]
         return r
 

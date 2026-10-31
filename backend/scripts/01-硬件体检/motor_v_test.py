@@ -27,7 +27,7 @@ volt_min / volt_factor 的标定走 02-电机组固有属性/cal_motor_intrinsic
 
 启动电压接近或超过 1.6V 时用 --up-max 2.0 重跑，保证 up 段有持续运动点。
 
-注意：脚本开头先发「停止运动」交出底盘——boot 默认手柄控车(is_busy)，
+注意：脚本开头先发「停止底盘」交出底盘——boot 默认手柄控车(is_busy)，
 0x84 在 is_busy 期间被固件静默拒绝，不停车会全录到 0。
 
 先启动后端：cd backend && uvicorn app.main:app --host 127.0.0.1 --port 8000

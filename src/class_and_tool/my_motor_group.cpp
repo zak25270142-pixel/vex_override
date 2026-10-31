@@ -1,4 +1,5 @@
 #include "my_motor_group.h"
+#include "tool.h" // linear_at
 
 MotorGroup::MotorGroup(MyMotor *motor_list, uint8_t count,
                        const Vec2f *kf_node, uint8_t kf_num,
@@ -17,20 +18,10 @@ MotorGroup::MotorGroup(MyMotor *motor_list, uint8_t count,
 }
 
 // 前馈插值：带符号 target 落在哪两节点之间就按距离加权。
-// 表的 x 覆盖 -100..100（对称机构填成奇对称），因此上升与下降可以给出
+// 表的 x 覆盖 -100..100（对称机构填成奇对称），因此上升与下降可以给出。算法见 linear_at。
 float MotorGroup::kf_at(float target) const
 {
-    if (target <= kf_node[0].x)
-        return kf_node[0].y;
-    for (uint8_t i = 1; i < kf_num; i++)
-    {
-        if (target <= kf_node[i].x)
-        {
-            const float t = (target - kf_node[i - 1].x) / (kf_node[i].x - kf_node[i - 1].x);
-            return kf_node[i - 1].y + (kf_node[i].y - kf_node[i - 1].y) * t;
-        }
-    }
-    return kf_node[kf_num - 1].y;
+    return linear_at(kf_node, kf_num, target);
 }
 
 void MotorGroup::setStopping(vex::brakeType brake)
@@ -57,7 +48,7 @@ void MotorGroup::set_target(float t)
 }
 
 // 每拍刷新：采样 + PID 前置 + 算 output_raw。写 now_v/now_a/error/derivative/
-// base_volt/feedforward/headroom/output_raw，并把本拍采样提交为 pre_v/pre_a（"上一拍"）。
+// base_volt/feedforward/volt_floor/output_raw，并把本拍采样提交为 pre_v/pre_a（"上一拍"）。
 // 任何读数的地方只在这一个函数里——状态判定与控制律因此必然用同一个采样点，
 // 不会出现"判据读一次编码器、控制律再读一次"的两个样本（这种错只看代码看不出来）。
 // dt_s 由调用者给：全机只取一次时钟、只夹取一次，本函数不再自己算。
@@ -76,10 +67,13 @@ void MotorGroup::refresh(float dt_s)
     derivative = (error - previous_error) / dt_s;
     previous_error = error; // 谁读它算 D，谁就写它——都在本函数里，不跨函数
 
-    // 组级垫底：摩擦（静→动指数过渡，|target| 越大越靠近 dynamic）+ 上层静态偏置
-    base_volt = dynamic_deadzone + (static_deadzone - dynamic_deadzone) * expf(-fabs_target / 3.0f) + base_bias;
+    // 组级垫底：摩擦（静→动指数过渡，|target| 越大越靠近 dynamic）。
+    // base_bias 不并进来——它方向恒定，只有摩擦才沿指令方向给。
+    base_volt = dynamic_deadzone + (static_deadzone - dynamic_deadzone) * expf(-fabs_target / 3.0f);
     feedforward = kf_at(target); // V，已含符号（表覆盖负半轴）
-    headroom = full_volt - base_volt - volt_min_max;
+    // 已承诺的非可调地板：电机电压 = volt_floor + output_raw·factor。有符号——偏置把
+    // 可调段窗口整体平移，不能当对称余量（旧 headroom 在 lift 偏置下会掐掉反向权限）。
+    volt_floor = base_bias + static_cast<float>(target_sign) * (base_volt + volt_min_max);
 
     // 原始输出值
     output_raw = feedforward + kp * error + ki * integral + kd * derivative;
@@ -95,7 +89,8 @@ void MotorGroup::apply_output(float volt_adjust)
     const float pad = static_cast<float>(target_sign) * base_volt;
     for (uint8_t i = 0; i < motor_count; i++)
     {
-        const float volt = pad + static_cast<float>(target_sign) * motors[i].volt_min + volt_adjust * motors[i].volt_factor;
+        // base_bias 不乘 target_sign：它补的是恒定方向的外力，方向不随指令翻
+        const float volt = base_bias + pad + static_cast<float>(target_sign) * motors[i].volt_min + volt_adjust * motors[i].volt_factor;
         motors[i].volt_output = volt;
         motors[i].motor->spin(vex::directionType::fwd, volt, vex::voltageUnits::volt);
     }

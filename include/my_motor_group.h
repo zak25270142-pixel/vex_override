@@ -53,9 +53,10 @@ public:
     float feedforward = 0.0f;        // 本拍前馈输出，V。监控/标定表时直接看它
     float kf_at(float target) const; // 按带符号 target 分段线性插值
 
-    float base_bias = 0.0f; // 上层注入的组级静态偏置V，意思是需要的额外的电压补偿。
-    float base_volt = 0.0f; // 本拍摩擦垫底 + base_bias，V
-    float headroom = 0.0f;  // 本拍可调电压的物理余量
+    // 上层注入的组级静态偏置，V。**不随指令方向翻转**：它补的是恒定方向的外力
+    float base_bias = 0.0f;
+    float base_volt = 0.0f; // 本拍摩擦垫底，V（不含 base_bias）
+    float volt_floor = 0.0f; // 本拍已承诺的非可调地板电压（含恒定偏置），V。电机电压 = volt_floor + output_raw·factor
 
     // --- 速度环参数（V 量纲）---
     float kp; // V / pct
@@ -91,15 +92,17 @@ public:
     // 只在这一处读编码器 —— 状态判据与 PID 因此必然用同一个采样点，不会出现
     // "判据读一次编码器、控制律再读一次"的两个样本。
     // 顺手把控制律要用的一切前置算好存字段：error / derivative / base_volt /
-    // feedforward / headroom。它们都只是 (target, now_v, 参数) 的函数，没有代价，
+    // feedforward / volt_floor。它们都只是 (target, now_v, 参数) 的函数，没有代价，
     // 也不该由使用方各算一遍——同一件事算两遍，迟早算出两个值。
     // dt_s 由调用者给（全机一个时间戳、一次夹取），本类既不取钟也不夹取。
-    // pre_v / pre_a 是"上一拍采样"的历史，跟着采样一起提交；停车不进来（派生层早退），
-    // 那两份残值由 stop() 清 0。
+    // pre_v / pre_a 是"上一拍采样"的历史，跟着采样一起提交。停车态也调本函数（派生层
+    // 早退前先调它，否则开环扫压时 now_v 冻住看不到转速），所以两份历史在停车期间仍然
+    // 连续；只有 stop() 才清 0（断电、开环切回闭环这类断点）。
     void refresh(float dt_s);
 
     // ---------- 执行：一份算好的可调电压 → 各台电压并下发 ----------
-    // 只做映射 volt_i = sign × (base_volt + volt_min_i) + 可调 × volt_factor_i，不做限速。
+    // 只做映射 volt_i = base_bias + sign × (base_volt + volt_min_i) + 可调 × volt_factor_i，
+    // 不做限速。base_bias 不乘 sign：它补的是恒定方向的外力（如重力）。
     // 压摆是策略（"该多快"要按状态判），归派生层；本层只认"给我多少就给多少"。
     void apply_output(float volt_adjust);
 

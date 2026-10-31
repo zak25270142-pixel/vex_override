@@ -232,6 +232,11 @@ class Hub:
             on_raw=self._on_serial_raw, # 串口原始数据回调
         )
         '''串口桥：本 Hub 独占，收发的唯一落点（连接/探测/心跳都由它管）'''
+        # UDP 桥带 on_locked 钩子（鸭子判断，串口/演示桥没有）：Ping/Pong 锁定后
+        # 下行才真正可用，目录请求等这一刻再发。锁定前 send() 静默丢弃，
+        # _auto_connect 启动路径里那次请求本来就送不到 WiFi 板子。
+        if hasattr(self.bridge, "on_locked"):
+            self.bridge.on_locked = self._resync_link
         self.pytest_dir = Path(pytest_dir) if pytest_dir else DEFAULT_PYTEST_DIR
         '''print_log 不传 path 时的默认落盘目录；构造时确保存在'''
         self.pytest_dir.mkdir(parents=True, exist_ok=True)
@@ -409,8 +414,12 @@ class Hub:
 
         # 停车命令的 index。从命令目录 tag 的 SPEC=Stop 位认出来（_on_frame），
         # 固件改了命令表顺序也不怕；目录没到时兜底用 0x80（见 _stop_index）。
+        # 固件把停车拆成了两条（停底盘 0x80 / 停升降杆 0x89），所以这里记两笔：
+        # 全部给 emergency_stop 连发，第一条给状态上报与脚本 stop_move。
+        self._stop_cmd_indices: list[int] = []
+        '''全部停车命令 index（SPEC=Stop 认出，按目录顺序）；空=目录未到'''
         self._stop_cmd_index: int | None = None
-        '''停车命令 index：命令目录 tag 的 SPEC=Stop 自动认出；None=目录未到（兜底 0x80）'''
+        '''第一条停车命令 index（=停底盘）：状态上报用；None=目录未到（兜底 0x80）'''
 
         # ---------- 脚本会话互斥（一次只允许一个脚本写） ----------
 
@@ -510,21 +519,29 @@ class Hub:
         while self._want_connected and not self.bridge.connected:
             if self.bridge.connect():
                 self.bridge.start_heartbeat(0.08)
-                # 重连后目录可能已变：缓存和解析表都清掉重新拉
-                self.tunable_dir.clear()
-                self.monitor_dir.clear()
-                self.cmd_dir.clear()
-                self._name_to_mon.clear()
-                self._name_to_tun.clear()
-                self._name_to_cmd.clear()
-                # 旧链路的在途帧永远等不到响应了：待确认表作废，重拉从头计时
-                self._pending_acks.clear()
-                self._dir_rounds.clear()
-                self._request_all_dirs()
-                # 把聚合后的订阅意图补发给下位机（重连不丢订阅）
-                self._restore_subscriptions()
+                self._resync_link()
                 return
             time.sleep(RECONNECT_INTERVAL_S)
+
+    def _resync_link(self) -> None:
+        """链路（重新）确立后的同步：清目录缓存 + 重拉三张表 + 补发订阅。
+
+        下位机重启后目录内容可能变了，且它的订阅表是空的。串口重连与 UDP
+        Ping/Pong 锁定（含失联后板子回来重新握手）都走这里，行为保持一致。
+        """
+        # 重连后目录可能已变：缓存和解析表都清掉重新拉
+        self.tunable_dir.clear()
+        self.monitor_dir.clear()
+        self.cmd_dir.clear()
+        self._name_to_mon.clear()
+        self._name_to_tun.clear()
+        self._name_to_cmd.clear()
+        # 旧链路的在途帧永远等不到响应了：待确认表作废，重拉从头计时
+        self._pending_acks.clear()
+        self._dir_rounds.clear()
+        self._request_all_dirs()
+        # 把聚合后的订阅意图补发给下位机（重连不丢订阅）
+        self._restore_subscriptions()
 
     def _restore_subscriptions(self) -> None:
         """重连后按聚合意图补发订阅。
@@ -788,7 +805,13 @@ class Hub:
             # 停车命令的字号不固定写死，而是从命令目录的 tag SPEC 位认出来。
             # 这样固件改了命令表顺序，后端也能自动找到正确的停车命令。
             if cmd_spec(tag) == CmdSpec.Stop:
-                self._stop_cmd_index = index
+                # 目录会被反复重拉（连上/refresh_dirs），所以去重追加，不能盲 append
+                if index not in self._stop_cmd_indices:
+                    self._stop_cmd_indices.append(index)
+                # 只认第一条（停底盘）。后到的"停升降杆"若覆盖它，紧急停车就变成
+                # "只收杆、车照跑"——这正是拆分停车命令后最容易踩的坑。
+                if self._stop_cmd_index is None:
+                    self._stop_cmd_index = index
 
         elif cmd == CmdPost.MonitorValue:
             # [payloadlen][time 2B]([index][值])×N：类型查监控目录；
@@ -1289,7 +1312,7 @@ class Hub:
     def _stop_index(self) -> int:
         """停车命令用的 index：有目录以目录认出的为准，没到则兜底 0x80。
 
-        返回: 停车命令字（命令目录 tag SPEC=Stop 认出的 index，或目录未到时的硬编码 0x80）
+        返回: 第一条停车命令字（=停底盘）。紧急停车要连发全部，用 _stop_cmd_indices。
         """
         # 目录未到时的兜底：本车停车固定是命令表第一项 0x80。
         # 有了目录后以目录为准（从 tag SPEC=Stop 认出来），硬编码只在早期生效。
@@ -1622,7 +1645,7 @@ class Hub:
           1. 置 abort → 脚本在 cmd()/sleep() 处立即中断（不发新命令了）
           2. 清队列里所有 PRI_SCRIPT 帧 → 已排队但还没发的命令全部作废
              （保留 PRI_UI，上位机自己的请求/订阅不该被停车波及）
-          3. 以 PRI_STOP 插队发停车帧 → 排在所有帧之前
+          3. 以 PRI_STOP 插队发全部停车帧（停底盘 + 停升降杆）→ 排在所有帧之前
         """
         self.abort_event.set()
         with self._tx_cv:
@@ -1630,8 +1653,11 @@ class Hub:
             self._tx_q = deque(x for x in self._tx_q if x[0] < PRI_SCRIPT)
             self._tx_cv.notify()
 
+        # 两条停车命令都发：固件把"停底盘"和"停升降杆"拆成了两条，而紧急停车的语义
+        # 仍是"停一切"——只发停底盘会让杆继续保压顶着重力，只发停杆则车还在跑。
         idx = self._stop_index()
-        self._send_tracked(build_frame(idx, b""), PRI_STOP)  # 停车帧也要确认：收不到必须重发
+        for stop_idx in (self._stop_cmd_indices or [idx]):
+            self._send_tracked(build_frame(stop_idx, b""), PRI_STOP)  # 停车帧也要确认：收不到必须重发
         return StopResult(ok=True, cmd_index=idx)
 
     def clear_abort(self) -> None:

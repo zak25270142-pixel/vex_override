@@ -47,17 +47,19 @@ void ChassisMotorGroup::refresh(uint32_t dt_us, float dt_s)
     const float delta = error * dt_s * i_scale;
 
     const float candidate = output_raw + ki * delta;
-    if (spin_state != Transit && (candidate <= headroom || error <= 0.0f) && (candidate >= -headroom || error >= 0.0f))
+    const float volt_want = volt_floor + candidate; // 无限幅时想要的电压
+    if (spin_state != Transit && (volt_want <= full_volt || error <= 0.0f) && (volt_want >= -full_volt || error >= 0.0f))
     {
         integral += delta;
         output_raw = candidate;
     }
 
     // ---------- 状态判定 2：非预期运动 / 堵转（要用本拍 output_raw，故排在最后）----------
-    // "已给到上限"必须按 headroom 判，不能按 0.99×12V：抗饱和把积分卡在 headroom 上
-    // （≈10.6V），12V 那个门槛在低速重载时永远够不着，Stall 就永远进不去。
+    // "已给到上限"按实际电机电压（volt_floor + output_raw）判，不能拿 0.99×12V 当裸
+    // output_raw 门槛：抗饱和把积分卡在投影 ±full_volt，output_raw 本身到不了 12，
+    // 低速重载时永远够不着，Stall 就永远进不去。
     // 又一处"两个天花板必须同一个数"。
-    const bool giving_max = fabsf(output_raw) >= headroom * 0.99f;                               // 输出是否已顶到上限
+    const bool giving_max = fabsf(volt_floor + output_raw) >= full_volt * 0.99f;                  // 输出是否已顶到上限（投影电机电压）
     const bool wheel_low = fabsf(now_v) <= stall_speed;                                          // 轮是否基本没在转
     const bool pulled_away = (target > 0.0f && now_a < 0.0f) || (target < 0.0f && now_a > 0.0f); // 目标与加速度反向
 

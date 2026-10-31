@@ -3,7 +3,7 @@
 
 #include "chassis.h"
 #include "pid.h"
-#include "robot_upper.h" // LiftBar：上位机构（与底盘同级，构造时注入）
+#include "robot_upper.h" // LiftBar：升降杆机构（位置环 + 四态机）
 
 class Remote_Control; // 前置声明：手动控制只借用摇杆指针，不依赖 Control_func.h
 
@@ -25,7 +25,7 @@ private:
     GOTO_LOCAL_TARGET goto_target = {};
 
     // 任务接力指针：nullptr 为空闲；start_xxx 首轮结束接力到对应 update_xxx。
-    void (RobotAction::*chassis_task_ptr)(uint32_t now) = nullptr;
+    void (RobotAction:: *chassis_task_ptr)(uint32_t now) = nullptr;
 
     // start_xxx：发起后第一轮，建段+PID reset+首轮输出；update_xxx：后续轮推进与完成判定。
     void start_turn(uint32_t now);
@@ -61,10 +61,10 @@ public:
     // 底盘实例由 .cpp 用本车硬件构造后传入。
     Chassis &chassis;
 
-    // 升降杆实例由 .cpp 用本车硬件构造后传入（与底盘平级的上位机构）。
-    // 控制核心在 LiftBar 自身（升降杆电机组：电压直控 / 速度环），
-    // 本层只负责驱动节拍与命令入口。
-    LiftBar &lift;
+    // 升降杆机构由 .cpp 用本车硬件构造后传入（与底盘平级）。
+    // 它的位置环 + 四态机在 LiftBar 内部，闭环命令由命令层直接下发，本层只推进节拍
+    // （refresh 里 lift_tick）。将来加机构就在这里加引用、逐个 tick。
+    LiftBar &lift_bar;
 
     // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
     // distance：直行/goto 的纵向推进；heading：直行段差速纠偏；turn：原地/goto 转向。
@@ -82,7 +82,7 @@ public:
     float angular_speed_tolerance = 5.0f; // deg/s
 
     // 底盘与手柄摇杆数值均在构造时注入：底盘来自本车硬件，摇杆来自装配层。
-    RobotAction(Chassis &chassis, LiftBar &lift, int32_t *move, int32_t *turn);
+    RobotAction(Chassis &chassis, LiftBar &lift_ref, int32_t *move, int32_t *turn);
 
     // ---- 整机生命周期：main 在主循环前调用 ----
     void init();
@@ -131,16 +131,6 @@ public:
     // 每轮重新瞄准目标点，距离 PID 与转向 PID 同时输出；点与最终朝向均已达标按完成处理。
     void goto_local(float x, float y, float heading);
 
-    // ---- 上位机构：升降杆（薄转发，状态机与控制核心在 LiftBar）----
-    // 电压直控：逐台电压（V），顺序同 lift_motor_list。Stall 锁死中忽略。
-    void lift_volt(float v0, float v1, float v2, float v3);
-
-    // 速度环目标：pct（上升为正）。Stall 锁死中忽略。
-    void lift_speed(float pct);
-
-    // 停止：0V+brake，兼作 Stall 解锁。由命令层 cmd_stop 调用（停止一切）；
-    // 故意不进 stop_move()——那个被掉线 failsafe 复用，见 robot_and_control.cpp。
-    void lift_stop();
 };
 
 #endif

@@ -8,7 +8,7 @@ RobotAction::RobotAction(Chassis &chassis_ref,
     : move_axis(move),
     turn_axis(turn),
     chassis(chassis_ref),
-    lift(lift_ref),
+    lift_bar(lift_ref),
     // 直线段同时使用距离 PID 推进、航向 PID 差速纠偏；转向段只使用 turn_pid。
     // ki、kd 按秒计（kp 无量纲）：(kp, ki, kd[, output_limit])
     distance_pid(130.0f, 35.0f, 18.0f),
@@ -22,7 +22,7 @@ RobotAction::RobotAction(Chassis &chassis_ref,
 void RobotAction::init()
 {
     chassis.init();
-    lift.init();
+    lift_bar.init();
 }
 
 bool RobotAction::is_ready()
@@ -228,7 +228,7 @@ void RobotAction::refresh()
     if (chassis_task_ptr != nullptr)
         (this->*chassis_task_ptr)(now);
     chassis.speed_tick(dt_us_now, dt_s_now); // 任务计算完下达完后，更新速度环
-    lift.refresh();                    // 升降杆（与底盘同拍；数据恒刷，控制指令按挂载情况运行）
+    lift_bar.lift_tick(dt_us_now, dt_s_now); // 升降杆（与底盘同拍；数据恒刷，Stoped 不下发）
 }
 
 void RobotAction::turn(float angle)
@@ -330,18 +330,3 @@ void RobotAction::manual()
     stop_start_us = 0;
 }
 
-// ---- 上位机构：升降杆（薄转发，判据与状态机在 LiftBar）----
-void RobotAction::lift_volt(float v0, float v1, float v2, float v3)
-{
-    lift.set_volt(v0, v1, v2, v3);
-}
-
-void RobotAction::lift_speed(float pct)
-{
-    lift.set_speed(pct);
-}
-
-void RobotAction::lift_stop()
-{
-    lift.stop();
-}

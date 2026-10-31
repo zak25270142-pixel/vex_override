@@ -231,9 +231,12 @@ private:
     // 心跳看门狗（上位机每80ms发Ping）：
     //   ping_seen    本个300ms巡视周期(LINK_PATROL_TICKS拍)内收到过Ping，收到即置true
     //   link_ok      链路是否被认可；false时monitor_tick停推监控值（目录仍可正常发）
+    //                初值必须 false：掉线回调只在"上周期认可、本周期没见Ping"的边沿触发，
+    //                初值给 true 会让上电后第一个巡视周期（300ms）必然误触发一次——
+    //                现在被手动档挡住看不出来，自动任务流一开机不在手动档就会被误收一次。
     //   pong_pending 收到Ping后置true，由tx_tick下一拍发Pong（写串口只能在tx任务）
     bool ping_seen = false;
-    bool link_ok = true;
+    bool link_ok = false;
     bool pong_pending = false;
 
     static constexpr uint8_t LINK_PATROL_TICKS = 30; // 掉线巡视周期：30拍(300ms)没见Ping即断链

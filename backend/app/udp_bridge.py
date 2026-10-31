@@ -14,10 +14,17 @@ MockV5Bridge 也是同样的套路（继承 + 覆盖设备层），改通道照�
 
 对端发现（不硬编码 IP，换网络不用重新编译固件）：
     板子上电后向网关（PC 开热点时网关就是 PC）或广播地址发上行帧。本桥收到第一个
-    上行包把它当作【候选】peer，只有收到来自该 peer 的 Pong 才【锁定】。
+    上行包把它当作【候选】peer，只有收到"回应我们 Ping"的 Pong 才【锁定】
+    （板子主动送上门的 Pong 不算，否则反向不通也会被误判成已连接）。
     为什么必须等 Pong：收到上行只证明单向可达（板子 → PC），PC → 板子方向可能因
     NAT / 防火墙 / 不对称路由而不通。Ping/Pong 握手是唯一能验证双向的手段，
     单靠"收到第一个包就连"会在反向不通时卡住并误报已连接。
+
+掉线语义与串口不同（重要）：
+    UDP 无连接，socket 与 rx 线程在"对端失联"时都是好的，心跳超时只意味着 peer 死了。
+    所以 _lost() 只清 peer 回到发现态 + 重启心跳，不关 socket、不报 disconnected。
+    父类那套 close / reopen 是串口语义，套过来会造出 WinError 10038 竞态，且
+    Hub 的自动重连依赖 _want_connected（启动路径没置 True），端口会一直空着起不来。
 
 单 client 约束（当前明确不做多设备）：
     只维护一个 peer，锁定后其他源地址一律丢弃并告警。要支持多设备得把 Hub 的目录
@@ -28,6 +35,7 @@ import logging
 import socket
 import threading
 import time
+from typing import Callable
 
 from .dataclass import PortInfo
 from .protocol import CmdPost, ping
@@ -89,7 +97,7 @@ class UdpBridge(SerialBridge):
         '''监听端口'''
 
         self._sock: socket.socket | None = None
-        '''UDP socket；connect() 里创建，disconnect/_lost 里关闭'''
+        '''UDP socket；connect() 里创建，disconnect 里关闭'''
 
         self._peer: tuple[str, int] | None = None
         '''当前对端（候选或已锁定）的 (ip, port)；None=还没见过任何上行包'''
@@ -101,11 +109,19 @@ class UdpBridge(SerialBridge):
         '''当前候选 peer 的起始时刻，用于候选超时换人'''
 
         self._ping_sent = False
-        '''是否已发出过 Ping。只有"我们发了 Ping 才收到的 Pong"能证明双向可达——
-           板子主动送上门的 Pong 不算，否则单向不通也会被误判成已连接'''
+        '''是否已向当前 peer 发出过 Ping。只有"我们发了 Ping 才收到的 Pong"能证明
+           双向可达——板子主动送上门的 Pong 不算，否则单向不通也会被误判成已连接'''
 
         self._strangers: set[tuple[str, int]] = set()
         '''已告警过的陌生源地址，避免每包都打日志'''
+
+        self.on_locked: Callable[[], None] | None = None
+        '''Ping/Pong 握手【锁定成功】后的回调（Hub 注入，重拉目录+补订阅）。
+
+        为什么必须有：Hub 只在启动/重连时拉目录，而 UDP 锁定前 send() 静默丢弃，
+        启动时那次请求根本送不到板子。锁定（含失联后板子回来重新握手）才是
+        下行真正可用的时刻，目录请求必须等这一刻再发——用户口径：
+        "目录肯定是 ping/pong 确认后再由 backend 发送"。'''
 
     # ---------- 状态 ----------
 
@@ -114,8 +130,9 @@ class UdpBridge(SerialBridge):
         """socket 已 bind 且 rx 线程在跑。
 
         注意这里【不要求】peer 已锁定——UDP 无连接，bind 成功就算通道就绪；
-        peer 未锁定时 send() 静默丢弃（此时心跳的 Ping 自然发不出去），
-        且 _last_pong 恒为 0，不会触发 PONG 超时判定。三个状态天然自洽。
+        peer 为空时 send() 静默丢弃（此时心跳的 Ping 自然发不出去）。
+        已知边界：候选态若板子只发数据、既不回 Ping 也不主动发 Pong，
+        _last_pong 恒 0，PONG 超时判定不会触发，可能停在候选态（待办）。
         """
         return self._connected and self._sock is not None
 
@@ -152,9 +169,21 @@ class UdpBridge(SerialBridge):
         if self.connected:
             return True
 
+        # 兜底：若真有遗留 socket（异常路径），先关，保证这次 bind 不撞旧句柄
+        if self._sock is not None:
+            self._close_socket()
+
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Windows：对端端口不可达时 ICMP 会让下次 recvfrom 抛 WSAECONNRESET(10054)。
+            # 板子重启/断电期间我们仍在发 Ping，极易触发——UDP 本就该容忍对端暂时消失，
+            # 关掉这个通知；非 Windows 无此常量，hasattr 保护。
+            if hasattr(socket, "SIO_UDP_CONNRESET"):
+                try:
+                    sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+                except OSError:
+                    pass
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SO_RCVBUF_BYTES)
             except OSError:
@@ -192,9 +221,19 @@ class UdpBridge(SerialBridge):
         self.on_status(Status.idle, "UDP 已断开")
 
     def _lost(self, message: str) -> None:
-        """掉线善后：与父类同流程，额外清掉 peer（下位机换 IP 后要重新发现）。"""
+        """心跳超时：只清 peer 回到发现态，socket / rx 线程保持不动。
+
+        不调父类 _lost()：那套 close / reopen 是串口语义，套到 UDP 上会造出
+        WinError 10038 竞态，且 Hub 的自动重连依赖启动路径没置 True 的
+        _want_connected，端口会一直空着。重启心跳是为了板子回来时有 Ping 可回。
+        """
+        logger.warning("UDP 链路失联，回到发现态：%s", message)
         self._reset_peer()
-        super()._lost(message)
+        self.start_heartbeat(0.08)
+        self.on_status(
+            Status.connected,
+            f"UDP 监听 {self.bind_host}:{self.bind_port}，等待下位机上行帧…",
+        )
 
     def _close_socket(self) -> None:
         if self._sock is not None:
@@ -230,6 +269,11 @@ class UdpBridge(SerialBridge):
                 sock.sendto(data, peer)
             except OSError as e:
                 logger.warning("UDP 发送失败: %s", e)
+                return
+        # 只有"我们主动发出的 Ping"才能当作双向可达的凭据；板子自己送上门的
+        # Pong 不算（反向可能根本不通）。父类心跳每拍 send(ping())，按内容识别。
+        if data == ping():
+            self._ping_sent = True
 
     def _rx_loop(self) -> None:
         """收数线程：recvfrom 循环，按 peer 过滤后广播原样字节 + 喂 FrameParser。
@@ -245,10 +289,15 @@ class UdpBridge(SerialBridge):
             except socket.timeout:
                 continue  # 让 _stop 有机会生效
             except OSError as e:
-                if not self._stop.is_set():
-                    logger.error("UDP 读异常: %s", e)
-                    self._lost(f"UDP 读取异常: {e}")
-                break
+                if self._stop.is_set():
+                    break
+                # Windows 上 sendto 到已消失的对端会收到 WSAECONNRESET(10054)，
+                # 那只是"上次发送的目标不可达"的迟到通知，socket 本身没坏。
+                # UDP 无连接，不能因为它拆掉整条链路；由心跳超时去判失联并软重置。
+                # 真错误也先继续试，短暂 sleep 防止异常时 CPU 空转。
+                logger.debug("UDP recv 异常（忽略继续收包）: %s", e)
+                time.sleep(0.05)
+                continue
 
             if not data:
                 continue
@@ -291,15 +340,24 @@ class UdpBridge(SerialBridge):
             self._peer = addr
             self._peer_since = time.monotonic()
             self._last_pong = 0.0
+            self._ping_sent = False
         return addr == self._peer
 
     def _on_frame(self, cmd: int, payload: bytes) -> None:
         """解析器出一帧：Pong 兼作"锁定"凭据，再交给父类做时间戳截获与转发。"""
-        if cmd == CmdPost.Pong and not self._peer_locked and self._peer is not None:
+        if (
+            cmd == CmdPost.Pong
+            and not self._peer_locked
+            and self._peer is not None
+            and self._ping_sent
+        ):
             self._peer_locked = True
             logger.info("对端已确认 %s:%d（Ping/Pong 握手通过）", self._peer[0], self._peer[1])
             self.on_status(
                 Status.connected,
                 f"已连接 WiFi 下位机 {self._peer[0]}:{self._peer[1]}",
             )
+            # 锁定=下行首次真正可用：此刻拉目录才送得到板子（失败静默丢弃没有意义）
+            if self.on_locked is not None:
+                self.on_locked()
         super()._on_frame(cmd, payload)

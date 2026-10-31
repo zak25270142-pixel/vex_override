@@ -118,3 +118,22 @@ float slew_step(float req, float prev, float rise, float fall, float dt)
     const float step = (fabsf(req) > fabsf(prev) ? rise : fall) * dt;
     return fminf(fmaxf(req, prev - step), prev + step);
 }
+
+// 升序 x 的分段线性插值：target 落在 [x0,xn] 内按距离加权，越界取端点 y。
+// kf 前馈表与升降杆重力偏置表共用。表为 nullptr/空时返 0。
+float linear_at(const Vec2f *node, uint8_t n, float target)
+{
+    if (node == nullptr || n == 0)
+        return 0.0f;
+    if (target <= node[0].x)
+        return node[0].y;
+    for (uint8_t i = 1; i < n; i++)
+    {
+        if (target <= node[i].x)
+        {
+            const float t = (target - node[i - 1].x) / (node[i].x - node[i - 1].x);
+            return node[i - 1].y + (node[i].y - node[i - 1].y) * t;
+        }
+    }
+    return node[n - 1].y;
+}

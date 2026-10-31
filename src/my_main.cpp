@@ -38,14 +38,18 @@ static void ai_vision_task()
 static vex::event ai_vision_event(ai_vision_task);
 
 // 心跳掉线 failsafe（回调注入 comm，检测与处置解耦）：
-// 开环/空闲态（!is_busy：跑电压、速度环直控）必须收车；PC 位置环任务在跑也收车；
-// 手柄控车不打断。失联后控制权不在上位机，它下发/直控的任务一律收回。
+// 手柄控车不打断；PC 下发过任务才收，且底盘与升降杆一起收，两个机构共用一个标记。
+// 开环直控不建任务、不置标记，掉线不收（它是场外维护手段，见命令处注释）。
 static void comm_link_lost_handler()
 {
     if (robot_action.is_manual()) // 手柄控车，不打断
         return;
-    if (!robot_action.is_busy() || pc_took_control)
+    // 已经 stop 了再收一次是幂等的：在底部就再断一次电，被开环顶起过则启动回落。
+    if (pc_took_control)
+    {
         robot_action.stop_move(100000); // 缓停收车，不急刹
+        lift_bar.stop();                // 升降杆受控回落，到底才断电
+    }
 }
 
 void my_Init()

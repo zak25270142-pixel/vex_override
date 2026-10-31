@@ -179,8 +179,14 @@ void Chassis::speed_tick(uint32_t dt_us, float dt_s)
     // 两组 is_stopped 恒等，查一侧即可。睡着时整拍不下发——0V 也是一条指令，
     // 会覆盖开环直写（扫压）与 stop() 留下的刹车；"停"的语义由 stop() 那一次
     // motor->stop()（按 setStopping 的刹车）表达，不需要每秒重复声明 100 次。
+    // 睡着时也刷一次数据：now_v 等派生量只在 refresh 里更新，不刷则开环扫压看不到转速。
+    // 调基类那份——派生类的 refresh 带状态机与积分，停着跑会偷偷累积误差积分。
     if (left_motors.spin_state == ChassisMotorGroup::SpinState::Stopped)
+    {
+        left_motors.MotorGroup::refresh(dt_s);
+        right_motors.MotorGroup::refresh(dt_s);
         return;
+    }
 
     // ① 算本拍请求的可调电压。两组都收到同一个 dt：左右就不会各自夹出一个来。
     left_motors.refresh(dt_us, dt_s);
@@ -188,15 +194,27 @@ void Chassis::speed_tick(uint32_t dt_us, float dt_s)
 
     // ② 比例限幅。
     //    【未决】分母用的是"请求值"，而请求可以远超余量：kp 标起来之后 P 项能到
-    //    几十伏（error 大 × kp，I 反倒被抗饱和卡在 headroom 上）。超过余量的那部分
+    //    几十伏（error 大 × kp，I 反倒被抗饱和卡在 ±full_volt 的投影上）。超过余量的那部分
     //    物理上做不到，但两侧的比例仍是控制器的意图，所以这里按意图等比缩、不夹请求
     //    （往 output_raw 上夹 ±12 会让比例先失真）。待实车确认：若出现"单侧顶住 →
     //    整车被拽偏"，说明虚构的 P 不该有话语权，那时再加夹幅。见 memory 2026-10-25。
-    // headroom 恒为正：它 = 12 − 死区/偏置 − 最小电压，要 ≤0 得凑满 12V，
-    // 那等价于满电压车也动不了（车的物理事故），正常调参到不了，无需除零守卫。
+    // 缩放分母 full_volt ± volt_floor 恒为正：volt_floor 量级（偏置 + 垫底 + 最小电压）
+    // 远小于 12；真要 ≥12 等价于满电压车也动不了，正常调参到不了，无需除零守卫。
     volt_scale = 1.0f;
-    volt_scale = fmaxf(volt_scale, fabsf(left_motors.output_raw) / left_motors.headroom);
-    volt_scale = fmaxf(volt_scale, fabsf(right_motors.output_raw) / right_motors.headroom);
+    // 缩放只缩可调段 output_raw，承诺地板 volt_floor 不缩放；
+    // 按"投影电机电压 volt_floor + output_raw 落回 ±full_volt"反推每侧所需缩放。
+    {
+        const float a = left_motors.output_raw;
+        const float k = a > 0.0f ? a / (full_volt - left_motors.volt_floor)
+                                 : (a < 0.0f ? (-a) / (full_volt + left_motors.volt_floor) : 0.0f);
+        volt_scale = fmaxf(volt_scale, k);
+    }
+    {
+        const float a = right_motors.output_raw;
+        const float k = a > 0.0f ? a / (full_volt - right_motors.volt_floor)
+                                 : (a < 0.0f ? (-a) / (full_volt + right_motors.volt_floor) : 0.0f);
+        volt_scale = fmaxf(volt_scale, k);
+    }
 
     // ③ 下发：把限幅后的值直接当参数传下去。不回写 output_raw——它永远是
     //    "请求值"，所以监控里看到的是要多少，不是给了多少。
