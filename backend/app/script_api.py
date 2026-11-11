@@ -22,12 +22,12 @@
         v.cmd("直行", 0.1)
         v.sleep(0.1)           # 可被上位机停车打断
     v.end_log()
-    v.print_log("pytest/run.json")   # 后缀决定格式：json / csv / png / jpg（无后缀默认 json）
+    v.print_log("pytest/run")        # path 是基名，默认出 run.csv
     v.stop()
 
-取整段标量（一段 = 一次 start_log → end_log，window 时间是"相对本段零点的 ms"）：
+取整段标量（一段 = 一次 start_log → end_log）：
     v.calc("x", agg="mean")              # 后端只保留 mean/sum 两个聚合，聚合成标量
-    v.print_log("run.csv")               # 整段原始点落盘（后缀决定 csv/png/json）
+    v.print_log("run")                   # 整段原始点落盘（默认 csv）
 
 【分析的正路】print_log 落 csv → pandas 回读。派生量、滤波、分位、布尔过滤、
 "超差时间占比"这类指标都在脚本侧算，不要指望后端加功能——后端只保证数据忠实。
@@ -40,10 +40,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-try:
-    import requests
-except ImportError:  # pragma: no cover
-    requests = None  # type: ignore
+import requests
 
 
 def _as_list(v) -> list:
@@ -51,7 +48,7 @@ def _as_list(v) -> list:
 
     空列表要显式转成 None 的原因：requests 对 [] 的处理是不带这个参数，
     后端就收不到 index_or_name，语义变成"查全部"而不是"什么都不查"——
-    这两者在 print_log() 里差别很大。
+    这两者在按 names 挑项的接口里差别很大。
     """
     if v is None:
         return []
@@ -67,16 +64,13 @@ class VexScript:
 
         token 是脚本会话标识，给了就随每个请求带上（X-Script-Token 头）——后端靠它
         判断"这次写的人是不是当前持有写权的那个"。
-
-        requests 是可选依赖：没装也能 import 本模块，只是所有调用会抛错。
-        这样 IDE 补全和静态检查不会因为缺个库就全线飘红。
         """
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.token = token
         # 复用连接：100Hz 轮询要是每拍新建 TCP，端口很快会被 TIME_WAIT 吃光
-        self._sess = requests.Session() if requests is not None else None
-        if self._sess is not None and token:
+        self._sess = requests.Session()
+        if token:
             # 挂在 session 默认头上：后续每个请求自动带，不用每处手动传
             self._sess.headers["X-Script-Token"] = token
 
@@ -84,8 +78,6 @@ class VexScript:
 
     def _get(self, path: str, **params):
         """发 GET 取 JSON；HTTP >=400 抛 RuntimeError（带路径与响应体，便于定位）。"""
-        if self._sess is None:
-            raise RuntimeError("请先 pip install requests")
         r = self._sess.get(f"{self.base}{path}", params=params, timeout=self.timeout)
         if r.status_code >= 400:
             raise RuntimeError(f"{path} -> {r.status_code}: {r.text}")
@@ -122,7 +114,7 @@ class VexScript:
             time.sleep(0.3)
         return False
 
-    def wait_dirs(self, timeout: float = 5.0) -> bool:
+    def wait_tables(self, timeout: float = 5.0) -> bool:
         """等到监控表或命令表到位。"""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -132,12 +124,12 @@ class VexScript:
             time.sleep(0.2)
         return False
 
-    def get_column(self, type: str = "monitor") -> list[dict]:
-        """拉目录：type = monitor(实参) | tunable(调参) | cmd(命令)，JSON。"""
-        return self._get("/api/column", type=type)
+    def get_column(self, table_kind: str = "monitor") -> list[dict | None]:
+        """拉一张表：列表，位置 i 即 index（cmd 表是 0x80+i），缺项为 None。"""
+        return self._get("/api/column", type=table_kind)
 
     def values(self) -> list[dict]:
-        """全部监控项的当前值快照列表（结构同 ValueSnapshot；不含新鲜度）。"""
+        """全部监控项的当前值快照列表（{index, name, value, unit}；不含新鲜度）。"""
         return self._get("/api/values")
 
     def read(self, *index_or_name):
@@ -149,7 +141,7 @@ class VexScript:
         前提：该项已 sub(..., "push"/"log"/"both")，值才会持续更新。
         ⚠️ 读到的是后端缓存的最新值，推送断了以后会一直返回旧值。
         做看门狗时务必用 read_item() 看 lag_ms（落后最新帧 >300ms 或 None 即旧），
-        否则"值正常"可能是假象；age_s 只是到达新近度，恒定传输延迟下会骗人。
+        否则"值正常"可能是假象。
         """
         if not index_or_name:
             raise ValueError("read 至少给一个 index 或名字")
@@ -160,8 +152,8 @@ class VexScript:
         return {it["name"]: it["value"] for it in items}
 
     def read_item(self, index_or_name) -> dict:
-        """读单项完整信息：{index,name,value,unit,age_s,lag_ms}。
-        看门狗主判 lag_ms（None 或 >300ms 即旧）；age_s 仅诊断 PC/传输侧抖动。"""
+        """读单项完整信息：{index,name,value,unit,lag_ms}。
+        看门狗主判 lag_ms（None 或 >300ms 即旧）。"""
         return self._get("/api/value", index_or_name=index_or_name)[0]
 
     def read_many(self, keys: list[Any], missing_ok: bool = False) -> list[dict]:
@@ -172,32 +164,25 @@ class VexScript:
 
     # ---------- 停车 / 中止 ----------
 
-    def stop(self) -> dict:
-        """紧急停车：最高优先级，清脚本队列并置 abort（也会打断其他在跑的脚本）。
+    def stop(self, index_or_name="停止底盘") -> dict:
+        """脚本侧停车：只发指定的那一条（默认「停止底盘」）。
 
-        固件把停车拆成了两条命令（停底盘 / 停升降杆），这里两条都发——紧急停车的
-        语义是"停一切"，只停一边会留下另一边继续出力。
-
-        与 BackendLink.stop_move() 的区别：
-            stop()       上位机语义，置 abort，中断所有脚本
-            stop_move()  只发 0x80 停车帧（停底盘），不置 abort（脚本自己还要继续跑时用）
+        各管各的：不置 abort、不清脚本队列、不连发其余停车命令。
+        "停一切"是上位机停车按钮的语义（脚本在跑时它会先杀脚本再全量停车），
+        脚本入口不走那条。
         """
-        return self._post("/api/stop")
+        return self.cmd(index_or_name)
 
     def stop_move(self) -> dict:
-        """0x80 停止底盘：只发停车帧，不置 abort（脚本自己还要继续跑时用）。
+        """只发「停止底盘」这一条，不置 abort（脚本自己还要继续跑时用）。
 
         所有实车脚本开头都该调它交出底盘——boot 默认手柄控车（manual() 使 is_busy
         恒真），期间 0x84/0x85 被固件静默拒绝，表现为"命令发了没反应"。
 
         注意只停底盘：升降杆要走「停止升降杆」那条命令（固件已拆成两条），
         本方法不碰它。
-
-        与 stop() 的区别：
-            stop()       上位机语义，置 abort，中断所有脚本
-            stop_move()  只发停车帧，不置 abort
         """
-        return self.cmd("停止底盘")
+        return self.stop()
 
     def clear_abort(self) -> dict:
         """停车后继续跑新脚本前先清 abort。"""
@@ -225,7 +210,7 @@ class VexScript:
         """
         return self._post(
             "/api/sub",
-            {"index_or_name": index_or_name, "type": type, "on": True, "fast": fast},
+            {"index_or_name": index_or_name, "kind": type, "on": True, "fast": fast},
         )
 
     def unsub(self, index_or_name, type: str = "both") -> dict:
@@ -239,7 +224,7 @@ class VexScript:
         """
         return self._post(
             "/api/sub",
-            {"index_or_name": index_or_name, "type": type, "on": False},
+            {"index_or_name": index_or_name, "kind": type, "on": False},
         )
 
     def suggest_chart(self, groups, note: str = "", source: str = "") -> dict:
@@ -251,15 +236,15 @@ class VexScript:
         note:   一句话说明，显示在建议条上（"这档建议看电流"之类）
 
         后端只中继不留存：页面刷新后看不到，所以要在推的时候让上位机开着。
-        返回体带解析后的 index，脚本可自检有没有订错槽（目录重名时会挑 fast 槽）。
+        返回 {"id": 建议号}；groups 由脚本自己给，后端不回读。
         """
         return self._post(
             "/api/chart/suggest",
             {"groups": [_as_list(g) for g in groups], "note": note, "source": source},
         )
 
-    def refresh_dirs(self) -> dict:
-        """清空后端目录缓存并重新向车拉三张表（怀疑缓存过期/半表时用）。"""
+    def refresh_tables(self) -> dict:
+        """清空后端目录缓存并重新向车拉四张表（怀疑缓存过期/半表时用）。"""
         return self._post("/api/dirs/refresh")
 
     def clear_script_subs(self) -> dict:
@@ -279,6 +264,14 @@ class VexScript:
             {"index_or_name": index_or_name, "args": list(args)},
         )
 
+    def key(self, index_or_name, state: int) -> dict:
+        """虚拟按键：给按键目录里的一项发一条 0x05 事件（state 是期望电平：1=按下 0=抬起）。
+
+        电平语义、幂等：同一电平重复下发不产生新边沿。与 cmd 同等待遇登记回执，
+        固件不回 Response 时后端会自动重发原帧（重发安全）。
+        """
+        return self._post("/api/key", {"index_or_name": index_or_name, "state": state})
+
     def set_tunable(self, index_or_name, value) -> dict:
         """写调参项（下位机回显后上位机表格自会更新）。"""
         return self._post(
@@ -294,53 +287,56 @@ class VexScript:
     def end_log(self) -> dict:
         return self._post("/api/log/end")
 
-    def claim_script(self, steal: bool = False, ttl_s: float = 60.0) -> dict:
-        """领脚本写权（BackendLink.connect 里自动调，一般不用自己管）。
-
-        steal=True 抢占别人：后端会给被抢的那个置 abort，让它在下一次 cmd()/sleep()
-        处停下，而不是继续往串口塞命令。
-        """
-        return self._post("/api/script/claim",
-                          {"token": self.token or "", "steal": steal, "ttl_s": ttl_s})
+    def claim_script(self) -> dict:
+        """领脚本写权（BackendLink.connect 里自动调，一般不用自己管）。"""
+        return self._post("/api/script/claim", {"token": self.token or ""})
 
     def release_script(self) -> dict:
         """还写权，让下一个脚本能立刻接管（BackendLink.close 里自动调）。"""
         return self._post("/api/script/release", {"token": self.token or ""})
 
-    def print_log(self, path: str | None = None, names=None) -> dict:
-        """导出记录并在本机打印摘要 JSON。格式由 path 后缀决定：
-        .json（无后缀默认）/ .csv（宽表）/ .png|.jpg（位图）/ .pdf|.svg（矢量）。
+    def print_log(self, path: str | None = None, names=None,
+                  csv: bool = True, meta: bool = False, plot: bool = False) -> dict:
+        """导出记录并在本机打印摘要。path 是**基名**，不带后缀。
 
+        产物按开关组合：<基名>.csv / <基名>.meta.json / <基名>.png，共 5 种合法组合：
+
+            v.print_log("probe_data/a")                          # csv
+            v.print_log("probe_data/a", meta=True)               # csv + 语义 json 头
+            v.print_log("probe_data/a", csv=False, plot=True)    # png
+            v.print_log("probe_data/a", plot=True)               # png + csv
+            v.print_log("probe_data/a", plot=True, meta=True)    # 三份
+
+        meta 只能跟 csv 一起；三个开关全 False / meta 脱离 csv 都抛 ValueError。
         names 指定只导出这几项（中文名或 index，可混），不给=全部已登记项。
-        记录缓冲在 end_log 之后仍在（下次 start_log 才清），所以可以换组合反复导出：
-
-            v.print_log("probe_data/a.csv")                       # 全部项
-            v.print_log("probe_data/v.png", ["左0转速", "左0实际电压"])
-
-        path 里带子目录会自动创建；不传则默认落后端 pytest/probe_data/log_<时间戳>.json。
-        返回体带 columns（csv 列名）与 missing（每列空单元格数=丢包数）。
+        记录缓冲在 end_log 之后仍在（下次 start_log 才清），可以换组合反复导出。
+        不传 path 则默认落后端 pytest/probe_data/log_<时间戳>。
+        返回体带 files（各产物绝对路径）、columns（csv 列名）、missing（每列空单元格数）。
         """
         # names 为 None 必须原样传 None（=全部）：_as_list(None) 得到 []，
         # 后端会当成"零项"导出空文件
         info = self._post(
             "/api/log/print",
-            {"path": path, "names": None if names is None else _as_list(names)},
+            {
+                "path": path,
+                "names": None if names is None else _as_list(names),
+                "csv": csv, "meta": meta, "plot": plot,
+            },
         )
         print(json.dumps(info, ensure_ascii=False, indent=2))
         return info
 
-    def calc(self, expr: str, agg: str = "", window=None) -> dict:
+    def calc(self, expr: str, agg: str = "") -> dict:
         """对本段记录做表达式计算并聚合成标量（agg 只支持 mean/sum）。
 
         expr：如 "左0电流 - 左1电流"、"(左0电流 + 左1电流 + 左2电流) / 3"
         agg ：mean / sum（必填）
-        window：可选 [t0_ms, t1_ms]，只算这段时间内的点
 
         复杂分析（滤波/分位/布尔过滤/派生指标/画图）不要在这里加功能——
         用 print_log 导 csv 后 pandas 回读，那才是数据出口。
         """
         return self._post("/api/log/calc",
-                          {"expr": expr, "agg": agg, "window": window})
+                          {"expr": expr, "agg": agg})
 
     # ---------- 时序 ----------
 
@@ -362,7 +358,7 @@ class VexScript:
 
         顺手还写权：也靠 close 兜底，忘了 Release 的脚本不会把机器锁死。
         """
-        # 还租约失败不能挡住关连接（后端可能已经重启了）
+        # 还写权失败不能挡住关连接（后端可能已经重启了）
         if self.token:
             try:
                 self.release_script()
@@ -373,13 +369,8 @@ class VexScript:
 
 
 # 监控 tag 的 fast 位（bit6 = 0x40）
-# fetch_dirs 用它挑高速那个槽，避免订到 80ms 才更新一次的陈旧值。
+# fetch_tables 用它挑高速那个槽，避免订到 80ms 才更新一次的陈旧值。
 _TAG_FAST = 0x40
-
-# 写权续期间隔：必须远小于后端 SCRIPT_LEASE_TTL_S（60s）。
-# 采数脚本有大段时间只等着不动手（等稳态、等冷却），不续租就会被判成"崩了"。
-_LEASE_REFRESH_S = 15.0
-
 
 # motor_id 的编号约定：每 3 台一组（0~2 左、3~5 右）。这是**脚本接口的编号规则**，
 # 与固件里组的实际台数是两回事——所以只出现在"全局编号 → (组, 组内下标)"这一处换算里。
@@ -401,8 +392,8 @@ class BackendLink:
             bl.sleep(0.4)
             bl.end_log()
             rpm = bl.calc("左0转速", agg="mean")["value"]  # 本段均值（标量捷径）
-            bl.print_log("seg.csv")              # 本段原始点落盘（结论的底稿）
-        bl.print_log("pytest/motor_v.csv")       # 后缀决定格式：csv/json/png/jpg
+            bl.print_log("seg")                  # 本段原始点落盘（结论的底稿）
+        bl.print_log("pytest/motor_v")           # 默认 csv；加 meta=True / plot=True 可叠加
         bl.close()                               # 收车 + 退订 + 关连接（也可整个包进 with）
 
     复杂分析（派生量/滤波/分位/布尔过滤/画图）不在 calc 里加功能：
@@ -416,15 +407,12 @@ class BackendLink:
         base: str = "http://127.0.0.1:8000",
         connect: bool = True,
         timeout: float = 5.0,
-        steal: bool = False,
     ) -> None:
         # 会话标识：后端靠它认"这次写的人是不是持有写权的那个"，一次只允许一个。
         # 自动生成是为了让脚本作者什么都不用写——想要这个保护就得让"什么都不做"就是对的。
         self._token = uuid.uuid4().hex[:8]
-        self._steal = steal
-        self._lease_at = 0.0              # 上次续租时刻（sleep 里按 _LEASE_REFRESH_S 续）
         self.v = VexScript(base, timeout=timeout, token=self._token)
-        self.mon_dir: dict[str, int] = {}      # 中文名 -> index（重名保留 fast 槽）
+        self.monitor_table: dict[str, int] = {}      # 中文名 -> index（重名保留 fast 槽）
         # 逐台电压影子，形状 = 命令的形状：外层是组，内层是该组各台电压。
         # 固件只有"组开环电压"，一次给齐一组，set_volt 用它把同组另外几台的当前值
         # 补上，才有"只改一台"的语义。按组存而不是拉平成一维：
@@ -434,11 +422,11 @@ class BackendLink:
         # stop_move() 里清零——那一下固件把所有电机电压归零，影子必须跟着走。
         self._volt: list[list[float]] = [[0.0] * _MOTOR_ID_PER_GROUP,
                                          [0.0] * _MOTOR_ID_PER_GROUP]
-        self.tun_dir: dict[str, tuple] = {}    # 中文名 -> (index, 当前值)
+        self.tunable_table: dict[str, tuple] = {}    # 中文名 -> (index, 当前值)
         self._mon_fast: dict[str, bool] = {}
         # 看门狗用的本地缓存：一轮里问 x/y/yaw 三项，只发一次 HTTP 请求
         self._watch: set[int] = set()          # 最近问过值的项（批量取回的名单）
-        self._vals: dict[int, dict] = {}       # index -> {index,name,value,unit,age_s}
+        self._vals: dict[int, dict] = {}       # index -> read_item 的完整信息（含 lag_ms）
         self._vals_at = 0.0                    # 上次批量刷新的时刻
         self._ttl = 0.02                       # 当前值缓存 20ms：一轮问多项只发一次请求
         # abort 只 100ms 查一次：停车是罕见事件，但 sleep(0.05) 一拍就要判一次，
@@ -462,61 +450,57 @@ class BackendLink:
 
     # ---------- 连接 / 目录 ----------
 
-    def connect(self, wait_connected: float = 10.0, wait_dirs: float = 5.0) -> None:
+    def connect(self, wait_connected: float = 10.0, wait_tables: float = 5.0) -> None:
         """等后端连上下位机 + 目录到位 + 清 abort，一步到位。
 
         顺序有讲究：
           1. 先抢写权——第二个脚本要在这里就被告知"有人在跑"，而不是跑到一半
              才发现命令发不出去（也顺手挡住了"互相解停车"这个坑）
           2. 再清 abort——上一次脚本可能是在停车状态下异常退出的，不清的话
-             第一次 cmd() 就抛错。放在 claim 之后：steal 抢占时给我们自己解锁
+             第一次 cmd() 就抛错
         """
         self._claim()
         if not self.v.wait_connected(wait_connected):
             raise RuntimeError(f"后端没连上下位机：{self.v.status()}")
-        if not self.v.wait_dirs(wait_dirs):
-            print("[warn] 目录还没到位，fetch_dirs 可能拿不全项")
+        if not self.v.wait_tables(wait_tables):
+            print("[warn] 目录还没到位，fetch_tables 可能拿不全项")
         self.v.clear_abort()
-        self.fetch_dirs()
+        self.fetch_tables()
 
     def _claim(self) -> None:
-        """领写权；抢不到就把后端的话原样抛出来让人看明白。
+        """领写权；抢不到就把后端的话原样抛出来让人看明白。"""
+        self.v.claim_script()
 
-        默认不抢：第二个脚本直接在这里失败，"有人在跑"多半是真的忘了关，
-        而不是想接管。要接管是显式的 BackendLink(steal=True)。
-        """
-        r = self.v.claim_script(steal=self._steal)
-        self._lease_at = time.monotonic()
-        if r.get("evicted"):
-            print("[warn] 抢占了另一个脚本的写权（对方已置 abort，会在下一次写操作处停下）")
-
-    def fetch_dirs(self) -> None:
-        """拉三张目录建名字反查表；同名条目保留 fast 槽，避免订到低速陈旧值。
+    def fetch_tables(self) -> None:
+        """拉监控 / 调参两张目录建名字→index 表（列表位置即 index）；同名条目保留 fast 槽。
 
         目录走的是后端缓存（不是每次都打扰下位机），所以这个函数很便宜，
         脚本里想刷新就调，不用担心开销。
         """
-        self.mon_dir.clear()
+        self.monitor_table.clear()
         self._mon_fast.clear()
-        for it in self.v.get_column("monitor"):
+        for k, it in enumerate(self.v.get_column("monitor")):
+            if it is None:
+                continue
             name = it["name"]
             fast = bool(it["tag"] & _TAG_FAST)
-            if name not in self.mon_dir or (fast and not self._mon_fast.get(name)):
-                self.mon_dir[name] = it["index"]
+            if name not in self.monitor_table or (fast and not self._mon_fast.get(name)):
+                self.monitor_table[name] = k
                 self._mon_fast[name] = fast
-        self.tun_dir = {
-            it["name"]: (it["index"], it.get("value"))
-            for it in self.v.get_column("tunable")
+        self.tunable_table = {
+            it["name"]: (k, it.get("value"))
+            for k, it in enumerate(self.v.get_column("tunable"))
+            if it is not None
         }
         # 电机别名（L2 → 左2转速 之类）不在这里建：后端不认识任何命名约定，
         # 只认实车目录里的中文名或 index。需要别名的脚本在脚本侧自己维护。
-        print(f"[dir] 监控项 {len(self.mon_dir)}，调参项 {len(self.tun_dir)}")
+        print(f"[dir] 监控项 {len(self.monitor_table)}，调参项 {len(self.tunable_table)}")
 
     def resolve(self, names) -> list[int]:
         """中文名或 index 统一解析成 index；名字不认识就跳过并提醒。"""
         out = []
         for n in _as_list(names):
-            idx = n if isinstance(n, int) else self.mon_dir.get(n)
+            idx = n if isinstance(n, int) else self.monitor_table.get(n)
             if idx is None:
                 print(f"[warn] 监控项不存在: {n}")
                 continue
@@ -525,7 +509,7 @@ class BackendLink:
 
     def _idx(self, name_or_idx) -> int | None:
         """名字或 index → index；名字不在目录里返回 None。"""
-        return name_or_idx if isinstance(name_or_idx, int) else self.mon_dir.get(name_or_idx)
+        return name_or_idx if isinstance(name_or_idx, int) else self.monitor_table.get(name_or_idx)
 
     # ---------- 订阅 / 记录登记 ----------
 
@@ -571,20 +555,21 @@ class BackendLink:
         """结束本段记录（停止收集样本），返回本段样本数与丢弃数。"""
         return self.v.end_log()
 
-    def print_log(self, path: str | None = None) -> dict:
-        """导出记录到后端机器（脚本和后端通常同机），并打印摘要。
+    def print_log(self, path: str | None = None, csv: bool = True,
+                  meta: bool = False, plot: bool = False) -> dict:
+        """导出记录到后端机器，并打印摘要。path 是**基名**，不带后缀。
 
-        格式由 path 后缀决定：.json（无后缀默认）/ .csv / .png|.jpg（作图）。
-        path 带子目录会自动创建；不传则默认落后端 pytest/probe_data/log_<时间戳>.json。
+        默认只出 <基名>.csv；meta=True 额外出语义 json 头，plot=True 额外出 png。
+        不传 path 则默认落后端 pytest/probe_data/log_<时间戳>。
         """
-        return self.v.print_log(path)
+        return self.v.print_log(path, csv=csv, meta=meta, plot=plot)
 
-    def calc(self, expr: str, agg: str = "", window=None) -> dict:
+    def calc(self, expr: str, agg: str = "") -> dict:
         """对本段记录做表达式计算并聚合成标量（转发 VexScript.calc）。
 
         agg 只支持 mean/sum；复杂分析走 print_log 导 csv + pandas 回读。
         """
-        return self.v.calc(expr, agg, window)
+        return self.v.calc(expr, agg)
 
     # ---------- 产物落盘 ----------
 
@@ -756,11 +741,6 @@ class BackendLink:
             left = end - time.monotonic()
             if left <= 0:
                 return
-            # 长等待里没人给车发命令，租约会到期被当成"崩了"。这里按节奏续租。
-            # 抢不到时会直接抛——说明真有人接管了，正好趁早死而不是半路发命令失败。
-            if time.monotonic() - self._lease_at > _LEASE_REFRESH_S:
-                self.v.claim_script()
-                self._lease_at = time.monotonic()
             time.sleep(min(0.05, left))
 
     def check_abort(self) -> None:

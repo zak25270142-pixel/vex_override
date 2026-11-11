@@ -621,7 +621,7 @@ def main():
             print(f"[recover] 完成，当前 x={link.latest(NAME_X):+.3f}m")
             return
 
-        missing = [k for k in GAIN_KEYS + PAD_NAMES if k not in link.tun_dir]
+        missing = [k for k in GAIN_KEYS + PAD_NAMES if k not in link.tunable_table]
         if missing:
             print(f"[warn] 调参表缺少: {missing}（lowpad 组或闭环扫掠可能受限）")
         link.clear_subs()
@@ -629,8 +629,8 @@ def main():
 
         probe = Probe(link, outdir, args.tag, wd)
         for k in GAIN_KEYS + PAD_NAMES:
-            if k in link.tun_dir:
-                saved_gains[k] = link.tun_dir[k][1]
+            if k in link.tunable_table:
+                saved_gains[k] = link.tunable_table[k][1]
 
         print("\n安全机制：每个测试脉冲后【先刹停等零速，再按全局X残余距离定速闭环倒回】；")
         print(f"         相对起点 ±{args.fence_x:.1f}m/±0.30m/±30° 硬围栏；单脉冲位移预算+超速保护；")

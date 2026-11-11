@@ -53,8 +53,7 @@ def main() -> None:
             bl.sleep(args.hold)
             bl.end_log()
             seg = os.path.join(out_dir, name)
-            bl.print_log(seg + ".csv")
-            bl.print_log(seg + ".png")
+            bl.print_log(seg, plot=True)
 
             st = seg_stats(seg + ".csv",
                            [rpm_names[mid], cur_names[mid], *pos_names])

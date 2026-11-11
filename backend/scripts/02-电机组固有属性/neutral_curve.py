@@ -135,7 +135,7 @@ def build_ids(link: BackendLink, group: dict) -> dict:
         name = side_id_name(group[role])
         cn = motor_names(name)
         for key in ("rpm", "vact", "cur"):
-            if cn[key] not in link.mon_dir:
+            if cn[key] not in link.monitor_table:
                 raise RuntimeError(f"监控项缺失：{name} / {key}")
             out[f"{role}_{key}"] = cn[key]
     return out
@@ -176,9 +176,9 @@ def measure_state(
     link.sleep(hold)
     link.end_log()
 
-    seg = link.out_path("neutral_%s.csv" % tag)
+    seg = link.out_path("neutral_%s" % tag)
     link.print_log(seg)
-    st = seg_stats(seg, list(ids.values()))
+    st = seg_stats(seg + ".csv", list(ids.values()))
 
     def rpm_abs(key):
         return st[ids[key]]["abs_mean"]
@@ -645,7 +645,7 @@ def main():
 
     # with 退出时 __exit__ 自动收车收尾（刹车 / 停记录 / 退订 / 断连接）
     with BackendLink(args.base) as link:
-        directory = link.mon_dir
+        directory = link.monitor_table
         try:
             print("监控表共 %d 项" % len(directory))
 

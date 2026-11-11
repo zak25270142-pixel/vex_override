@@ -1,0 +1,43 @@
+{
+  "frame_head": 165,
+  "max_payload": 445,
+  "discovery_magic": "HDU",
+  "discovery_name_max": 16,
+  "discovery_len_clear": 255,
+  "req_list_max": 48,
+  "cmd_action_min": 128,
+  "cmd_action_max": 159,
+  "fw_lag_stale_ms": 300,
+  "fw_lag_extrapolate_cap_ms": 60000,
+
+  "max_retries": 3,
+  "table_resend_rounds": 3,
+
+  "max_groups": 4,
+  "max_items": 4,
+
+  "max_frames": 5000,
+  "same_tick_ms": 2.0,
+
+  "min_gap_ms": 2,
+  "batch_window_s": 0.005,
+  "batch_max_bytes": 480,
+  "batch_max_acks": 6,
+
+  "buffer_bytes": 4194304,
+  "max_packet_bytes": 65535,
+
+  "heartbeat_gap_s": 0.08,
+  "find_timeout_s": 0.12,
+  "find_retry_gap_s": 1.0,
+  "poll_gap_s": 0.05,
+  "port_try_gap_s": 0.05,
+  "udp_peer_wait_s": 0.2,
+  "peer_switch_timeout_s": 3.0,
+  "udp_broadcast_wait_s": 1.2,
+  "last_peer_retry_gap_s": 0.25,
+  "last_peer_retry_budget_s": 1.5,
+
+  "pong_timeout_s": 0.3,
+  "udp_pong_timeout_s": 2.0
+}

@@ -50,17 +50,17 @@ MONITOR_WANT = {
 # 全程要记的监控键
 SUB_KEYS = list(MONITOR_WANT.keys())
 
-def resolve_indices(mon_dir: Dict[str, int]) -> Dict[str, int]:
+def resolve_indices(monitor_table: Dict[str, int]) -> Dict[str, int]:
     """按中文名把监控目录映射到 index；缺项抛错。"""
     out: Dict[str, int] = {}
     missing = []
     for key, cn in MONITOR_WANT.items():
-        if cn not in mon_dir:
+        if cn not in monitor_table:
             missing.append(cn)
         else:
-            out[key] = mon_dir[cn]
+            out[key] = monitor_table[cn]
     if missing:
-        raise SystemExit("监控表缺少项: %s\n已有名称: %s" % (missing, sorted(mon_dir.keys())))
+        raise SystemExit("监控表缺少项: %s\n已有名称: %s" % (missing, sorted(monitor_table.keys())))
     return out
 
 
@@ -71,8 +71,7 @@ def capture(bl: BackendLink, out_dir: str, tag: str) -> str:
     段统计（stats 端点已删）从返回路径 + ".csv" 回读。
     """
     seg = os.path.join(out_dir, tag)
-    bl.print_log(seg + ".csv")
-    bl.print_log(seg + ".png")
+    bl.print_log(seg, plot=True)
     return seg
 
 
@@ -183,8 +182,8 @@ def main() -> None:
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("motor_speed_step_%s" % args.tag)   # 每段一个原始 CSV
         os.makedirs(out_dir, exist_ok=True)
-        print("监控表共 %d 项" % len(bl.mon_dir))
-        indices = resolve_indices(bl.mon_dir)
+        print("监控表共 %d 项" % len(bl.monitor_table))
+        indices = resolve_indices(bl.monitor_table)
         for k in SUB_KEYS:
             print("  %s → index %d (%s)" % (k, indices[k], MONITOR_WANT[k]))
 

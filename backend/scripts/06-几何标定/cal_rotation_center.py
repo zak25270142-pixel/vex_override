@@ -104,8 +104,7 @@ def run_one(bl, v, target_deg, label, out_dir):
     bl.sleep(0.3)
     bl.end_log()
     seg = os.path.join(out_dir, label)
-    bl.print_log(seg + ".csv")
-    bl.print_log(seg + ".png")
+    bl.print_log(seg, plot=True)
     bl.stop_move()
 
     d_yaw = b["yaw"] - a["yaw"]
@@ -140,11 +139,11 @@ def main():
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("cal_rotation_center_%s" % args.tag)   # 每向一段原始 CSV
         os.makedirs(out_dir, exist_ok=True)
-        missing = [n for n in WANT if n not in bl.mon_dir]
+        missing = [n for n in WANT if n not in bl.monitor_table]
         if missing:
-            sys.exit("监控表缺项: %s\n已有: %s" % (missing, sorted(bl.mon_dir)))
+            sys.exit("监控表缺项: %s\n已有: %s" % (missing, sorted(bl.monitor_table)))
 
-        print("监控表共 %d 项；标定量：%s / %s / %s" % (len(bl.mon_dir), NAME_YAW, NAME_FWD, NAME_SIDE))
+        print("监控表共 %d 项；标定量：%s / %s / %s" % (len(bl.monitor_table), NAME_YAW, NAME_FWD, NAME_SIDE))
         bl.clear_subs()
         bl.sub(WANT)
         bl.sleep(0.3)

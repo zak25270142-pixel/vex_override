@@ -70,7 +70,6 @@ import {
   ValueType,
   cmdSpec,
   typeName,
-  type CellValue,
   type CmdField,
   type CmdDirItem,
 } from '@/services/protocol'
@@ -131,7 +130,7 @@ const canSend = computed(() => {
 
 async function onSend(): Promise<void> {
   if (!sel.value || !canSend.value) return
-  const values: CellValue[] = sel.value.fields.map((f, i) => {
+  const values: any[] = sel.value.fields.map((f, i) => {
     const d = drafts[i]!
     if (isBool(f.type)) return d.check ? 1 : 0
     if (f.type === ValueType.Color) return d.text

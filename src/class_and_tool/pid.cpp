@@ -30,7 +30,7 @@ float PositionPID::update(float error, uint32_t current_time_us)
 {
     // uint32_t 时间戳相减得到两次计算之间经过的微秒数，再换算成本轮间隔秒数。
     uint32_t gap_time_us = current_time_us - last_time_us;
-    float gap_time_s = static_cast<float>(gap_time_us) / 1000000.0f;
+    float gap_time_s = gap_time_us / 1000000.0f;
 
     // pre_error为0时pre_sign保持不变
     if (previous_error != 0.0f)

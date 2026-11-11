@@ -1,5 +1,5 @@
 """
-Mock V5：没有真车/真固件时，在后端里模拟一台讲本协议的 V5 主控。
+Mock V5：没有真车/真固件时，模拟一台讲本协议的 V5 主控（调试数据源）。
 
 为什么在 backend 侧而不是小程序/浏览器里造帧：
   - 上位机（小程序/网页）连的是 WS，mock 顶替的是"串口后面的那台车"——
@@ -8,56 +8,64 @@ Mock V5：没有真车/真固件时，在后端里模拟一台讲本协议的 V5
   - 一台 mock 同时服务小程序和网页两个上位机（各开各的 WS，订阅互不干扰）
   - 模拟逻辑与 protocol.py 的构建器同源，不复制帧格式知识
 
-怎么用：
-    set V5_MOCK=1
+怎么用（真车时不会启动本进程）：
     .\\.venv\\Scripts\\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-  或 PowerShell：  $env:V5_MOCK=1; ...uvicorn...
-  连上后行为与真机一致：拉三张表（burst + OK 项数）、订阅推送 100Hz/80ms、
+    .\\.venv\\Scripts\\python -m debug.mock_ws_source
+  后端固定三探测（串口 + UDP + WS），本进程连上默认 8889 的 WS 端口即被选中。
+  连上后行为与真机一致：拉四张表（burst + OK 项数）、订阅推送 100Hz/80ms、
   调参回显、命令回执（原地转向永远 BUSY 拒绝，演示拒绝 toast）、80ms 心跳。
 
-实现方式：MockV5Bridge 继承 SerialBridge，只换"字节怎么进出设备"这一层
-（connect/send/disconnect/connected/list_ports），收数侧的 on_raw 广播 +
-FrameParser 喂帧 + 心跳超时判定全部复用父类——父类的心跳线程 self.send(ping())
-打进来的 Ping 由本类的 send 转交模拟主控，Pong 原路回去，_last_pong 自然更新，
-即"mock 也会掉线"这条真机行为不用特殊代码就成立了（停发 Ping 300ms 即停推）。
+实现方式：本文件只提供 _MockV5Core（模拟主控内核 + 四张表），跑在调试进程
+debug/mock_ws_source.py 里。帧仍是 A5|Cmd|Payload|XOR 二进制协议，走 WS 二进制
+消息；后端的 on_raw 广播 + FrameParser 喂帧 + 心跳超时判定全部复用真链路代码。
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import threading
 import time
 from collections.abc import Callable
 
-from .dataclass import PortInfo
-from .protocol import (
-    CMD_ACTION_MAX,
-    CMD_ACTION_MIN,
+from app.config import CONFIG
+from app.protocol import (
     CMD_TAG_ARGC_SHIFT,
     CMD_TAG_RANGE,
     CmdGet,
     CmdPost,
     CmdSpec,
-    FRAME_HEAD,
     MONITOR_TAG_FAST,
     MONITOR_TAG_GETTER,
     MONITOR_TAG_SUB,
     RESP_OK,
+    RESP_OK_INFO,
+    RESP_MODE_MASK,
     RespErrReject,
-    RespErrRetry,
     ValueType,
     build_frame,
-    build_response,
     decode_value,
     encode_value,
-    tag_fast,
-    tag_subscribed,
     value_size,
 )
-from .serial_bridge import VEX_VID, SerialBridge, Status
 
 logger = logging.getLogger("vex.mock")
+
+
+def build_response(echo_cmd: int, echo_payload: bytes = b"", status: int = RESP_OK, info: bytes = b"") -> bytes:
+    """组一帧 Response（假固件/测试用；真机由固件 send_responses 直接拼帧）。
+
+    帧 [L][原话cmd][status][附加段][原话payload]：0x00 无附加段；
+    0x80（OK+info）/ 内定err类 = [len][data]（len=0 即不带）；串类 = 裸串，低 6 位就是串长。
+    """
+    if status == RESP_OK:
+        body = bytes([echo_cmd & 0xFF, RESP_OK])
+    elif status == RESP_OK_INFO or (status & RESP_MODE_MASK):
+        body = bytes([echo_cmd & 0xFF, status & 0xFF, len(info)]) + info
+    else:
+        info = info[:0x3F]
+        body = bytes([echo_cmd & 0xFF, (status & 0xC0) | len(info)]) + info
+    body += echo_payload
+    return build_frame(CmdPost.Response, bytes([len(body)]) + body)
 
 # 监控项语义种类（tag & MONITOR_TAG_KIND_MASK，与 my_main.h 的 MENU_TAG_KIND_* 一致；
 # protocol.py 未导出枚举，这里按位值用）
@@ -69,20 +77,19 @@ _TAG_SUB = MONITOR_TAG_SUB
 _TAG_FAST = MONITOR_TAG_FAST
 _TAG_GETTER = MONITOR_TAG_GETTER
 _VT = ValueType
-# str 类型编号 10（与 my_main.h VALUE_TYPE 一致）。protocol.py 的 ValueType
-# 枚举没列 Str/Other 成员（TS 端有），但 value_size 对未列类型默认返回 0，
-# 行为等价；这里用原始值，不为此改协议文件
-_VT_STR = 10
 
 # 拒绝/补发类 status 字节 = 类别位 | err号。注意 protocol.py 的 RespErrReject /
-# RespErrRetry 成员值是 err 号（0~3）而不是完整 status 字节——直接拿成员值当
+# RespErrRetry 成员值是 err 号而不是完整 status 字节——直接拿成员值当
 # status 用会编出 0x03 这种"需补发+串模式"的错字节（本 mock 第一版就踩了）
-_RESP_UNKNOWN_CMD = 0x40 | int(RespErrRetry.UnknownCmd)
+_RESP_UNKNOWN_CMD = 0xC0 | int(RespErrReject.UnknownCmd)
 _RESP_INDEX_RANGE = 0xC0 | int(RespErrReject.IndexRange)
-_RESP_TYPE_UNWRITABLE = 0xC0 | int(RespErrReject.TypeUnwritable)
 _RESP_BUSY = 0xC0 | int(RespErrReject.Busy)
 
-# ---- 模拟的三张表（结构照实车：tag 位域/类型/单位都按协议给） ----
+# 按键事件（下行，前端→主控）：[index][state]，无回执。protocol.py 只透传这条命令、
+# 未列枚举，这里按原值处理
+_CMD_KEY_EVENT = 0x05
+
+# ---- 模拟的四张表（结构照实车：tag 位域/类型/单位都按协议给） ----
 # 表项用 dict 而不是 dataclass：mock 只负责按协议造字节，不参与 Hub 的目录缓存
 
 _MOCK_TUNABLES = [
@@ -94,8 +101,6 @@ _MOCK_TUNABLES = [
     {"index": 5, "type": _VT.UInt16, "name": "采样周期", "unit": "ms", "value": 10},
     {"index": 6, "type": _VT.Bool, "name": "调试开关", "unit": "", "value": 0},
     {"index": 7, "type": _VT.Color, "name": "主题色", "unit": "", "value": "#4fc3f7"},
-    # str 类型：值宽 0，目录帧到单位段即止；不可订阅/写入，UI 登记为只读
-    {"index": 8, "type": _VT_STR, "name": "设备备注", "unit": "", "value": ""},
 ]
 
 _MOCK_MONITORS = [
@@ -157,6 +162,17 @@ _MOCK_COMMANDS = [
     },
 ]
 
+# 按键表：下标即 index（与固件 KEY_TABLE 同序），目录帧只带名字
+_MOCK_KEYS = [
+    {"index": 0, "name": "确认"},
+    {"index": 1, "name": "上"},
+    {"index": 2, "name": "下"},
+    {"index": 3, "name": "返回"},
+    {"index": 4, "name": "呼吸灯"},
+    {"index": 5, "name": "风扇"},
+    {"index": 6, "name": "指示灯"},
+]
+
 
 def _clone(list_: list[dict]) -> list[dict]:
     """浅拷贝表项（运行时可改 tag/value，不动模块级常量表）。"""
@@ -170,16 +186,16 @@ def _clone(list_: list[dict]) -> list[dict]:
 
 
 class _MockV5Core:
-    """模拟主控内核：三张表 + 10ms 拍 + 下行帧处理。
+    """模拟主控内核：四张表 + 10ms 拍 + 下行帧处理。
 
     与 firmware USB_Comm 的行为子集同构（逐条注释标了对应处），上行帧用
     protocol.py 的构建器组装。线程模型：receive() 在 Hub 的 tx/心跳线程里跑
     （入队/改表），tick() 在 mock 自己的 10ms 线程里跑（出帧/算值）——
     队列是 list，append/pop(0) 在 GIL 下原子，表的读写同理；演示够用，
-    真机路径的并发纪律在 SerialBridge 侧，不归本类。
+    真机路径的并发纪律在 TransportBridge 侧，不归本类。
     """
 
-    TICK_DIR_BATCH = 8  # 固件 DIR_BATCH：每拍最多几项（一项一帧）
+    TICK_TABLE_BATCH = 8  # 固件 DIR_BATCH：每拍最多几项（一项一帧）
     MON_PACK_MAX = 16  # 固件 MON_PACK_MAX
     SLOW_PHASES = 8  # 固件 SLOW_PHASES
     LINK_PATROL_S = 0.3  # 固件 LINK_PATROL_TICKS=30 拍：300ms 无 Ping 停推
@@ -188,7 +204,7 @@ class _MockV5Core:
 
     def __init__(self, emit: Callable[[bytes], None]) -> None:
         """
-        emit: 上行帧出口（MockV5Bridge._emit：on_raw 广播 + FrameParser 喂帧）
+        emit: 上行帧出口（TransportBridge._mock_emit：on_raw 广播 + FrameParser 喂帧）
         """
         self._emit = emit
         self.tick_count = 0
@@ -196,13 +212,15 @@ class _MockV5Core:
         self.tun = _clone(_MOCK_TUNABLES)
         self.mon = _clone(_MOCK_MONITORS)
         self.cmd = _clone(_MOCK_COMMANDS)
+        self.key = _clone(_MOCK_KEYS)
 
-        # 三张表各一条目录倒计时（对应固件 dir_tun/dir_mon/dir_cmd）：
+        # 四张表各一条目录倒计时（对应固件 dir_tun/dir_mon/dir_cmd/dir_key）：
         # q=待发项、pending=末批是否要回 OK 项数、cmd/echo/total=回执用
-        self.dir: dict[str, dict] = {
+        self.tables: dict[str, dict] = {
             "tunable": {"q": [], "pending": False, "cmd": 0, "echo": b"", "total": 0},
             "monitor": {"q": [], "pending": False, "cmd": 0, "echo": b"", "total": 0},
             "cmd": {"q": [], "pending": False, "cmd": 0, "echo": b"", "total": 0},
+            "key": {"q": [], "pending": False, "cmd": 0, "echo": b"", "total": 0},
         }
 
         # 待发帧队列（Pong 最优先，回显次之，Response 兜底）
@@ -224,12 +242,12 @@ class _MockV5Core:
     # ---------- 下行帧 ----------
 
     def receive(self, frame: bytes) -> None:
-        """收一帧下行帧（Hub/心跳线程经 MockV5Bridge.send 转交）。
+        """收一帧下行帧（Hub/心跳线程经 TransportBridge 的 mock 分支转交）。
 
         每次 send 就是一整帧（上位机组帧后整帧下发），无需粘包状态机；
         但仍做帧头/XOR 校验，坏帧静默丢——与真实固件 rx 状态机一致。
         """
-        if len(frame) < 3 or frame[0] != FRAME_HEAD:
+        if len(frame) < 3 or frame[0] != CONFIG.frame_head:
             return
         xor = 0
         for b in frame[1:-1]:
@@ -244,8 +262,13 @@ class _MockV5Core:
             self.link_ok = True
             self.pong_q.append(build_frame(CmdPost.Pong))
             return
-        if cmd in (CmdGet.RequestTunable, CmdGet.RequestMonitor, CmdGet.RequestCommand):
-            self._on_dir_request(cmd, p)
+        if cmd in (
+            CmdGet.RequestTunable,
+            CmdGet.RequestMonitor,
+            CmdGet.RequestCommand,
+            CmdGet.RequestKeyDir,
+        ):
+            self._on_table_request(cmd, p)
             return
         if cmd == CmdGet.Subscribe:
             self._on_subscribe(cmd, p)
@@ -253,16 +276,20 @@ class _MockV5Core:
         if cmd == CmdGet.SetTunable:
             self._on_set_tunable(cmd, p)
             return
-        if CMD_ACTION_MIN <= cmd <= CMD_ACTION_MAX:
+        if cmd == _CMD_KEY_EVENT:
+            # 按键事件 [index][state]：离散输入，主控不回执（真机也不回）。
+            # 不拦会把未登记命令字当 UnknownCmd 回出去，刷满前端日志
+            return
+        if CONFIG.cmd_action_min <= cmd <= CONFIG.cmd_action_max:
             self._on_action(cmd, p)
             return
         # 其余命令字：未注册
         self.resp_q.append(build_response(cmd, p, _RESP_UNKNOWN_CMD))
 
-    def _on_dir_request(self, cmd: int, p: bytes) -> None:
+    def _on_table_request(self, cmd: int, p: bytes) -> None:
         """目录请求 [len 1B][index...]：len=0 全量；非0=只补发这些下标。
 
-        与固件 req_list_ok/req_register 同规则：超 REQ_LIST_MAX 或下标越界
+        与固件 req_list_ok/req_register 同规则：超 config.req_list_max 或下标越界
         → 整帧拒绝（回显原话 payload），主机端应改走全量重拉。
         """
         key = (
@@ -270,9 +297,11 @@ class _MockV5Core:
             if cmd == CmdGet.RequestTunable
             else "monitor"
             if cmd == CmdGet.RequestMonitor
+            else "key"
+            if cmd == CmdGet.RequestKeyDir
             else "cmd"
         )
-        items = {"tunable": self.tun, "monitor": self.mon, "cmd": self.cmd}[key]
+        items = {"tunable": self.tun, "monitor": self.mon, "cmd": self.cmd, "key": self.key}[key]
         if len(p) < 1:
             return
         n = p[0]
@@ -281,17 +310,25 @@ class _MockV5Core:
             total = len(items)
         else:
             idxs = list(p[1 : 1 + n])
-            if n > 16 or any(i >= len(items) for i in idxs):  # REQ_LIST_MAX
+            if n > CONFIG.req_list_max or any(i >= len(items) for i in idxs):  # config.req_list_max
                 self.resp_q.append(build_response(cmd, p, _RESP_INDEX_RANGE))
                 return
             queue = [items[i] for i in idxs]
             total = n
-        d = self.dir[key]
+        d = self.tables[key]
         d["q"] = queue
         d["pending"] = True
         d["cmd"] = cmd
         d["echo"] = p
         d["total"] = total
+        # 收到即回：整表 0x80 + 表项数，局部 0x00；末批另回一帧无回显的传完通知
+        if p[0] == 0:
+            self.resp_q.append(build_response(cmd, p, RESP_OK_INFO, bytes([total & 0xFF])))
+        else:
+            self.resp_q.append(build_response(cmd, p, RESP_OK))
+        if not queue:
+            d["pending"] = False
+            self.resp_q.append(build_response(cmd, b"", RESP_OK))
 
     def _on_subscribe(self, cmd: int, p: bytes) -> None:
         """订阅/退订：只合并上位机负责的 SUB/FAST 两位，保留本机 GETTER/KIND。
@@ -309,9 +346,9 @@ class _MockV5Core:
         self.resp_q.append(build_response(cmd, p, RESP_OK))
 
     def _on_set_tunable(self, cmd: int, p: bytes) -> None:
-        """调参写入 [index][value 8B 定长]：写成功回 TunableEcho（真实生效值）。
+        """调参写入 [index][value 8B 定长]：写成功回 Tunable_Echo（真实生效值）。
 
-        str/other 值宽 0 不可写（固件同款拒绝）；下标超表同样拒绝。
+        下标超表拒绝（其余情况按表项类型解码）。
         """
         if len(p) < 9:
             return
@@ -319,9 +356,6 @@ class _MockV5Core:
         it = self.tun[idx] if idx < len(self.tun) else None
         if it is None:
             self.resp_q.append(build_response(cmd, p, _RESP_INDEX_RANGE))
-            return
-        if value_size(it["type"]) == 0:
-            self.resp_q.append(build_response(cmd, p, _RESP_TYPE_UNWRITABLE))
             return
         it["value"] = decode_value(p[1:9], 0, it["type"])
         self.echo_q.append(self._echo_frame(it))
@@ -353,7 +387,7 @@ class _MockV5Core:
 
     # ---------- 上行帧构造 ----------
 
-    def _dir_frame(self, item: dict, cmd: int) -> bytes:
+    def _table_frame(self, item: dict, cmd: int) -> bytes:
         """tunable/monitor 目录帧：[index][type][tag][名长][名][单位长][单位][值?]
 
         str/other 值宽 0，帧到单位段即止（2026-10-25 协议行为）。
@@ -372,7 +406,7 @@ class _MockV5Core:
             payload += encode_value(item["type"], v)
         return build_frame(cmd, bytes(payload))
 
-    def _cmd_dir_frame(self, item: dict) -> bytes:
+    def _cmd_table_frame(self, item: dict) -> bytes:
         """命令目录帧：[内容长度2B][命令字][tag][名长][名][参数量]([类型][字段名长][字段名])×N[bit7=1时:(min,max)×N]"""
         name_b = item["name"].encode("utf-8")
         content = bytearray([item["index"], item["tag"], len(name_b)])
@@ -391,6 +425,13 @@ class _MockV5Core:
         return build_frame(
             CmdPost.CMDDirectory,
             len(content).to_bytes(2, "little") + bytes(content),
+        )
+
+    def _key_table_frame(self, item: dict) -> bytes:
+        """按键目录帧：[index][名长][名]（无类型/单位/值，名长 1~16，UTF-8）"""
+        name_b = item["name"].encode("utf-8")
+        return build_frame(
+            CmdPost.KeyDirectory, bytes([item["index"], len(name_b)]) + name_b
         )
 
     def _value_frame(self, pack: list[dict], t_ms: int) -> bytes:
@@ -437,21 +478,23 @@ class _MockV5Core:
             self._emit(self.echo_q.pop(0))
 
         # ③ 目录 burst：一拍一张表的一批；末批当拍回 OK + 1B 表内总项数
-        for key in ("tunable", "monitor", "cmd"):
-            d = self.dir[key]
+        for key in ("tunable", "monitor", "cmd", "key"):
+            d = self.tables[key]
             if not d["q"]:
                 continue
-            for _ in range(min(self.TICK_DIR_BATCH, len(d["q"]))):
+            for _ in range(min(self.TICK_TABLE_BATCH, len(d["q"]))):
                 item = d["q"].pop(0)
                 if key == "cmd":
-                    self._emit(self._cmd_dir_frame(item))
+                    self._emit(self._cmd_table_frame(item))
+                elif key == "key":
+                    self._emit(self._key_table_frame(item))
                 else:
                     post = CmdPost.TunableDirectory if key == "tunable" else CmdPost.MonitorDirectory
-                    self._emit(self._dir_frame(item, post))
+                    self._emit(self._table_frame(item, post))
             if not d["q"] and d["pending"]:
                 d["pending"] = False
-                # OK 尾字节 = 表内总项数（长度隐式，帧长剩余；主机拿它对照补发）
-                self.resp_q.append(build_response(d["cmd"], d["echo"], RESP_OK, bytes([d["total"] & 0xFF])))
+                # 传完通知：仅 OK、无回显（对该 cmd 全部生效），触发上位机完整性对照
+                self.resp_q.append(build_response(d["cmd"], b"", RESP_OK))
             break  # 一拍一张表
 
         # ④ 监控值：FAST 每拍；SLOW 按 8 相轮转（每项 80ms）
@@ -461,9 +504,9 @@ class _MockV5Core:
             pack = []
             for it in self.mon:
                 tag = it.get("tag", 0)
-                if not tag_subscribed(tag):
+                if not (tag & MONITOR_TAG_SUB):
                     continue
-                if not tag_fast(tag) and self.tick_count % self.SLOW_PHASES != it["index"] % self.SLOW_PHASES:
+                if not (tag & MONITOR_TAG_FAST) and self.tick_count % self.SLOW_PHASES != it["index"] % self.SLOW_PHASES:
                     continue
                 pack.append({"index": it["index"], "type": it["type"], "value": self._sim_value(it, now)})
             for i in range(0, len(pack), self.MON_PACK_MAX):
@@ -513,94 +556,3 @@ class _MockV5Core:
         return round(self.motor_rpm[base + n] * 10) / 10
 
 
-class MockV5Bridge(SerialBridge):
-    """把 SerialBridge 的"串口"换成模拟主控的桥。
-
-    只覆盖设备进出这一层；父类的 on_raw 广播、FrameParser 喂帧、Pong 时间戳
-    截获、心跳线程与 PONG_TIMEOUT 判定全部复用——父类心跳 self.send(ping())
-    打进来的 Ping 由本类 send 转交模拟主控，Pong 原路回去，_last_pong 自然
-    更新，"停 Ping 300ms 即停推"的真机行为不用特殊代码就成立。
-    """
-
-    def __init__(
-        self,
-        port: str | None = None,
-        baud: int = 115200,
-        on_frame: Callable[[int, bytes], None] | None = None,
-        on_status: Callable[[Status, str], None] | None = None,
-        on_raw: Callable[[bytes], None] | None = None,
-    ) -> None:
-        """签名与 SerialBridge 一致（Hub 用同一工厂创建）；port/baud 忽略。"""
-        super().__init__(port=port, baud=baud, on_frame=on_frame, on_status=on_status, on_raw=on_raw)
-        self._core: _MockV5Core | None = None
-        self._tick_thread: threading.Thread | None = None
-
-    # ---------- 连接 ----------
-
-    def connect(self, timeout: float = 0.12) -> bool:
-        """演示模式无需探测：立即"连上"，起 10ms 拍线程。"""
-        if self.connected:
-            return True
-        self._connected = True
-        self._stop.clear()
-        self._core = _MockV5Core(self._emit)
-        self._tick_thread = threading.Thread(target=self._tick_loop, name="vex-mock-tick", daemon=True)
-        self._tick_thread.start()
-        self.on_status(Status.connected, "演示模式：模拟 V5 已连接（V5_MOCK=1）")
-        logger.info("MockV5Bridge 已连接（V5_MOCK=1，无真车）")
-        return True
-
-    def disconnect(self) -> None:
-        """停心跳 → 置停止 → 收拍线程 → 报 idle。"""
-        self.stop_heartbeat()
-        self._stop.set()
-        self._connected = False
-        t = self._tick_thread
-        if t and t.is_alive() and threading.current_thread() is not t:
-            t.join(timeout=1.0)
-        self._tick_thread = None
-        self._core = None
-        self.on_status(Status.idle, "演示模式已断开")
-
-    @property
-    def connected(self) -> bool:
-        """mock 的"在线"就是标志位（没有真端口可查）。"""
-        return self._connected
-
-    # ---------- 收发 ----------
-
-    def send(self, data: bytes) -> None:
-        """写一帧：转交模拟主控（父类的写串口在这里换成喂 mock）。"""
-        if not self._connected or self._core is None:
-            raise RuntimeError("演示模式未连接")
-        self._core.receive(bytes(data))
-
-    def _emit(self, frame: bytes) -> None:
-        """模拟主控发出的一帧：走与父类 _rx_loop 完全相同的两个消费者。"""
-        self.on_raw(frame)
-        self._parser.feed(frame, self._on_frame)
-
-    def _tick_loop(self) -> None:
-        """10ms 拍线程（可中断 sleep：disconnect 不用等满一拍）。"""
-        while not self._stop.is_set():
-            try:
-                if self._core is not None:
-                    self._core.tick()
-            except Exception as e:  # pragma: no cover - 演示源不该崩，崩了也别带走线程
-                logger.exception("mock tick 异常: %s", e)
-            self._stop.wait(0.01)
-
-    # ---------- 端口枚举 ----------
-
-    @staticmethod
-    def list_ports() -> list[PortInfo]:
-        """演示模式报一个假端口（/api/ports 与 /api/status 的 ports 字段）。"""
-        return [
-            PortInfo(
-                device="MOCK-V5",
-                description="Mock V5 (演示数据源, V5_MOCK=1)",
-                vid=VEX_VID,
-                pid=0x0000,
-                serial_number="MOCK",
-            )
-        ]

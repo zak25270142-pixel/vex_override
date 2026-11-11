@@ -56,7 +56,7 @@ void MotorGroup::refresh(float dt_s)
 {
     this->dt_s = dt_s;
 
-    now_v = static_cast<float>(motors[0].motor->velocity(vex::velocityUnits::pct));
+    now_v = motors[0].motor->velocity(vex::velocityUnits::pct);
     now_a = (now_v - pre_v) / dt_s;
 
     pre_v = now_v;
@@ -73,7 +73,7 @@ void MotorGroup::refresh(float dt_s)
     feedforward = kf_at(target); // V，已含符号（表覆盖负半轴）
     // 已承诺的非可调地板：电机电压 = volt_floor + output_raw·factor。有符号——偏置把
     // 可调段窗口整体平移，不能当对称余量（旧 headroom 在 lift 偏置下会掐掉反向权限）。
-    volt_floor = base_bias + static_cast<float>(target_sign) * (base_volt + volt_min_max);
+    volt_floor = base_bias + target_sign * (base_volt + volt_min_max);
 
     // 原始输出值
     output_raw = feedforward + kp * error + ki * integral + kd * derivative;
@@ -86,11 +86,11 @@ void MotorGroup::apply_output(float volt_adjust)
 
     // 垫底不进可调段：它是摩擦补偿量（≈1~1.5V，正落在破静摩擦门槛附近），不是驱动力，
     // 翻符号只是换工作点。换向那拍它让幅值变小，属于"撤压"，而撤压本来就允许快。
-    const float pad = static_cast<float>(target_sign) * base_volt;
+    const float pad = target_sign * base_volt;
     for (uint8_t i = 0; i < motor_count; i++)
     {
         // base_bias 不乘 target_sign：它补的是恒定方向的外力，方向不随指令翻
-        const float volt = base_bias + pad + static_cast<float>(target_sign) * motors[i].volt_min + volt_adjust * motors[i].volt_factor;
+        const float volt = base_bias + pad + target_sign * motors[i].volt_min + volt_adjust * motors[i].volt_factor;
         motors[i].volt_output = volt;
         motors[i].motor->spin(vex::directionType::fwd, volt, vex::voltageUnits::volt);
     }

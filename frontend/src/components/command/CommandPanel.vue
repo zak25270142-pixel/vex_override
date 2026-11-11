@@ -3,7 +3,13 @@
   <aside class="cmd-panel">
     <div class="cmd-panel__head">
       <span class="cmd-panel__title">任务下发</span>
-      <span class="cmd-panel__count">{{ commands.length }} 条</span>
+      <span
+        class="cmd-panel__count"
+        :class="{ 'cmd-panel__count--warn': dirView.warn }"
+        :title="dirView.warn ? '命令目录项数与下位机登记不一致，可点导航栏「刷新」重拉' : ''"
+      >
+        {{ dirView.text || `${commands.length} 条` }}
+      </span>
     </div>
 
     <div class="cmd-panel__body">
@@ -84,10 +90,12 @@ import {
   typeName,
   cmdSpec,
   CmdSpec,
-  type CellValue,
   type CmdField,
 } from '@/services/protocol'
-import { commandMap, connected, sendCommand } from '@/stores/globle'
+import { commandMap, connected, dirStatusView, sendCommand } from '@/stores/globle'
+
+/** 命令目录完整性（后端 cmd 表）：项数与缺失状态 */
+const dirView = computed(() => dirStatusView('cmd'))
 
 /** 命令按命令字升序排列（注册表下发顺序可能乱）；停车是特化命令，不走表单，见底部停车按钮 */
 const commands = computed(() =>
@@ -147,7 +155,7 @@ const canSend = computed(() => {
 
 async function onSend(): Promise<void> {
   if (!sel.value || !canSend.value) return
-  const values: CellValue[] = sel.value.fields.map((f, i) => {
+  const values: any[] = sel.value.fields.map((f, i) => {
     const d = drafts[i]!
     if (isBool(f.type)) return d.check ? 1 : 0
     if (f.type === ValueType.Color) return d.text
@@ -185,6 +193,12 @@ async function onSend(): Promise<void> {
 .cmd-panel__count {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 目录项数对不上：黄色轻提示，不改变面板其它语义色 */
+.cmd-panel__count--warn {
+  color: var(--status-waiting);
+  text-shadow: 0 0 8px rgba(249, 199, 94, 0.35);
 }
 
 .cmd-panel__body {

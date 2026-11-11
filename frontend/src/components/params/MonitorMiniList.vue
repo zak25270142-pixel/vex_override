@@ -26,7 +26,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { tagFast, tagSubscribed, type CellValue, type DirItem } from '@/services/protocol'
+import { tagFast, tagSubscribed, type DirItem } from '@/services/protocol'
 import {
   connected,
   formatValueCompact,
@@ -43,7 +43,7 @@ function shortName(name: string): string {
   return name.length > 5 ? name.slice(0, 5) + '…' : name
 }
 
-function liveValue(it: DirItem): CellValue {
+function liveValue(it: DirItem): any {
   return monitorLatest[it.index] ?? it.value
 }
 

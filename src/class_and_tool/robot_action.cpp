@@ -220,7 +220,7 @@ void RobotAction::refresh()
         gap = 20000;
     previous_time_us = now;
     dt_us_now = gap;
-    dt_s_now = static_cast<float>(gap) / 1000000.0f;
+    dt_s_now = gap / 1000000.0f;
 
     // 先更新里程、速度和航向，再推进当前任务，最后跑速度环
     chassis.update(dt_us_now);

@@ -40,6 +40,12 @@
         <MonitorMiniList v-else />
       </template>
 
+      <!-- 按键快速触发：鼠标点击 + 只读绑定 + 键盘开关；录入/清空只在左侧「配置」页。
+           外层盒子由这里给（面板本身只管内部布局），高度撑满右栏可用区 -->
+      <div v-show="activeTab === 'keys'" class="right-work__keys">
+        <KeyMapPanel variant="quick" />
+      </div>
+
       <!-- 曲线设置 / 场景数据 上下文 -->
       <div v-show="activeTab === 'context'" class="right-work__pane">
         <component :is="context.comp" v-if="context.comp" :key="context.key" />
@@ -81,6 +87,7 @@ import MonitorMiniList from '@/components/params/MonitorMiniList.vue'
 import MonitorDetail from '@/components/params/MonitorDetail.vue'
 import TunableCard from '@/components/params/TunableCard.vue'
 import MonitorCard from '@/components/params/MonitorCard.vue'
+import KeyMapPanel from '@/components/keys/KeyMapPanel.vue'
 import { type CmdDirItem } from '@/services/protocol'
 import {
   connected,
@@ -112,13 +119,14 @@ const contextLabel = computed(() => {
   }
 })
 
-/** 标签顺序：独有上下文 → 任务下发 → 调参 → 实参 */
+/** 标签顺序：独有上下文 → 任务下发 → 调参 → 实参 → 按键（左半「配置」页隐藏，避免同屏两块按键面板） */
 const tabs = computed<TabDef[]>(() => {
   const list: TabDef[] = []
   if (contextLabel.value) list.push({ id: 'context', label: contextLabel.value })
   list.push({ id: 'command', label: '任务下发' })
   list.push({ id: 'tunable', label: '调参' })
   list.push({ id: 'monitor', label: '实参' })
+  if (view.value !== 'config') list.push({ id: 'keys', label: '按键' })
   return list
 })
 
@@ -230,6 +238,19 @@ async function onStop(cmd: CmdDirItem): Promise<void> {
 
 .right-work__pane {
   min-height: 0;
+}
+
+/* 按键标签的外层卡片：圆角+描边+内边距，并撑满右栏可用高度（内容在面板内部滚动） */
+.right-work__keys {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  background: var(--surface-panel);
+  border: var(--border-panel);
+  border-radius: var(--radius);
+  overflow: hidden;
 }
 
 .right-work__empty {

@@ -59,12 +59,42 @@
       title="后端地址，只填 IP:端口 即可（首尾自动补）；改完点「连接」生效，清空恢复默认"
       @change="onBackendUrlChange"
     />
+    <input
+      class="backend-url"
+      type="number"
+      :min="MAX_PAYLOAD_MIN"
+      :max="MAX_PAYLOAD_CAP"
+      style="width: 96px"
+      :value="loadPrefs().maxPayload"
+      title="单帧 payload 上限（字节），需 ≥ 后端 config.json 的 max_payload；留空恢复默认 4096"
+      @change="onMaxPayloadChange"
+    />
+    <input
+      class="backend-url"
+      type="number"
+      min="0"
+      max="255"
+      style="width: 80px"
+      :value="loadPrefs().frameHead"
+      title="帧头字节（十进制，0xA5=165）；与后端 config.json 的 frame_head 一致"
+      @change="onFrameHeadChange"
+    />
 
     <!-- 自动连接：打开页面 / 断线后自动重连已授权的串口设备 -->
     <label class="demo-switch" title="打开页面或断线后自动重连已授权串口（首次需手动选口授权）">
       <input type="checkbox" :checked="autoConnect" @change="onAutoConnectChange" />
       <span>自动连接</span>
     </label>
+
+    <!-- 手机端开了「电脑版页面」后，手机设置入口随手机外壳一起消失，这里留一个退回入口 -->
+    <button
+      v-if="desktopView"
+      class="btn btn--ghost"
+      title="关闭电脑版页面，按屏幕宽度重新判断"
+      @click="setDesktopView(false)"
+    >
+      手机版
+    </button>
 
     <!-- 连接链路：未选口时可先选口，再连接；已连接可断开 -->
     <div class="conn-group">
@@ -98,15 +128,20 @@ import {
   commStats,
   connState,
   connected,
+  desktopView,
   diagOpen,
   pickPort,
   serialSupported,
   setAccessMode,
   setAutoConnect,
   setBackendUrl,
+  setDesktopView,
+  setFrameHeadPref,
+  setFramePayloadLimit,
   statusText,
   toggleConnect,
 } from '@/stores/globle'
+import { loadPrefs, MAX_PAYLOAD_CAP, MAX_PAYLOAD_MIN, FRAME_HEAD_DEFAULT } from '@/services/persist'
 import DiagnosticsDialog from '@/components/shell/DiagnosticsDialog.vue'
 import Segmented from '@/components/common/Segmented.vue'
 import logoUrl from '@/assets/hdu-vex-logo.jpg'
@@ -134,6 +169,14 @@ function onAccessChange(i: number): void {
 
 function onBackendUrlChange(e: Event): void {
   setBackendUrl((e.target as HTMLInputElement).value)
+}
+function onMaxPayloadChange(e: Event): void {
+  const raw = (e.target as HTMLInputElement).value.trim()
+  setFramePayloadLimit(raw === '' ? MAX_PAYLOAD_CAP : Number(raw))
+}
+function onFrameHeadChange(e: Event): void {
+  const raw = (e.target as HTMLInputElement).value.trim()
+  setFrameHeadPref(raw === '' ? FRAME_HEAD_DEFAULT : Number(raw))
 }
 
 function onAutoConnectChange(e: Event): void {
@@ -209,6 +252,8 @@ function onAutoConnectChange(e: Event): void {
   cursor: pointer;
   white-space: nowrap;
   transition:
+    background 0.15s,
+    color 0.15s,
     box-shadow 0.15s,
     opacity 0.15s,
     border-color 0.15s;
@@ -219,14 +264,19 @@ function onAutoConnectChange(e: Event): void {
   cursor: not-allowed;
 }
 
+/* 三族按钮同一套半透明骨架：常态=同色相低透明度底 + 1px 同色相描边；
+   hover=不透明度抬高 + 同色相微亮 + 柔和外发光；全程半透明，不换不透明实底，边框宽度不变 */
 .btn--accent {
-  color: var(--text-on-accent);
-  background: var(--accent);
-  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
 }
 
 .btn--accent:not(:disabled):hover {
-  box-shadow: var(--glow-accent);
+  color: #9cedff;
+  background: rgba(79, 224, 255, 0.24);
+  border-color: rgba(79, 224, 255, 0.78);
+  box-shadow: 0 0 18px rgba(79, 224, 255, 0.2);
 }
 
 .btn--danger {
@@ -236,20 +286,24 @@ function onAutoConnectChange(e: Event): void {
 }
 
 .btn--danger:not(:disabled):hover {
-  box-shadow: var(--glow-danger);
+  color: #ff8a79;
+  background: rgba(255, 83, 61, 0.26);
+  border-color: rgba(255, 111, 90, 0.8);
+  box-shadow: 0 0 18px rgba(255, 83, 61, 0.2);
 }
 
 .btn--ghost {
   color: var(--text-secondary);
-  background: transparent;
-  border: var(--border-subtle);
+  background: rgba(79, 224, 255, 0.06);
+  border: 1px solid rgba(79, 224, 255, 0.28);
   font-weight: 600;
 }
 
 .btn--ghost:not(:disabled):hover {
-  color: var(--accent);
-  border-color: var(--accent-border);
-  box-shadow: var(--shadow-focus);
+  color: #9cedff;
+  background: rgba(79, 224, 255, 0.16);
+  border-color: rgba(79, 224, 255, 0.6);
+  box-shadow: 0 0 14px rgba(79, 224, 255, 0.16);
 }
 
 .conn-group {

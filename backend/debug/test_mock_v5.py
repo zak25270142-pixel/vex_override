@@ -1,20 +1,12 @@
-"""
-Mock V5 演示源自测（不起服务、不连真串口）：
-  - connect 即连上（无探测），10ms 拍线程起跑
-  - 三张目录请求 → burst 逐帧下发 + 末批 OK 尾字节带表内总项数
-  - Ping → Pong；Subscribe → OK 回执；Set_Tunable → TunableEcho
-  - 动作命令 → Response（停车 OK；原地转向永远 BUSY 拒绝）
-  - 坏帧（XOR 错）静默丢弃；停 Ping 300ms 后停推（link 巡视）
-  - 父类心跳线程自ping 自答：Pong 流通、不误判掉线
-  - on_raw 广播与 on_frame 解码同源同量（WS 透传路径）
+"""Mock V5 内核自测（不连服务、不起 WS）：四张目录、回执、Ping/Pong、坏帧。
+
 运行: python -m debug.test_mock_v5
 """
 
 from __future__ import annotations
 
-import time
+import struct
 
-from app.mock_v5 import MockV5Bridge
 from app.protocol import (
     CmdGet,
     CmdPost,
@@ -23,12 +15,13 @@ from app.protocol import (
     decode_response,
     ping,
     request_command,
+    request_key_table,
     request_monitor,
     request_tunable,
     set_tunable,
     subscribe,
 )
-from app.serial_bridge import Status
+from debug.mock_v5 import _MockV5Core
 
 passed = 0
 failed = 0
@@ -45,150 +38,88 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def main() -> None:
-    frames: list[tuple[int, bytes]] = []  # on_frame 解出的 (cmd, payload)
-    raws: list[bytes] = []  # on_raw 广播的原始字节（WS 透传路径）
-    statuses: list[tuple[Status, str]] = []
+    frames: list[tuple[int, bytes]] = []  # 内核发出的 (cmd, payload)
+    core = _MockV5Core(lambda f: frames.append((f[1], f[2:-1])))
+    tick = lambda n: [core.tick() for _ in range(n)]  # noqa: E731
 
-    def on_frame(cmd: int, payload: bytes) -> None:
-        frames.append((cmd, bytes(payload)))
-
-    def on_raw(data: bytes) -> None:
-        raws.append(bytes(data))
-
-    def on_status(s: Status, msg: str) -> None:
-        statuses.append((s, msg))
-
-    bridge = MockV5Bridge(on_frame=on_frame, on_status=on_status, on_raw=on_raw)
-
-    # ① 端口枚举报假口
-    ports = MockV5Bridge.list_ports()
-    check("list_ports 假口", len(ports) == 1 and ports[0].device == "MOCK-V5", str(ports))
-
-    # ② connect 即连上（无探测），status=connected
-    check("connect 返回 True", bridge.connect() is True)
-    check("connected 属性", bridge.connected is True)
-    check("上报 connected", any(s == Status.connected for s, _ in statuses))
-
-    # ③ 拉三张表：burst 逐帧 + 末批 OK 尾字节带总项数
-    bridge.send(request_tunable())
-    bridge.send(request_monitor())
-    bridge.send(request_command())
-    time.sleep(0.4)  # 28 项 × 10ms 拍 ≈ 0.3s 发完
+    # ① 四张目录：全量请求 → 快照 + 末批 OK 尾字节带表内总项数
+    core.receive(request_tunable())
+    core.receive(request_monitor())
+    core.receive(request_command())
+    core.receive(request_key_table())
+    tick(60)
 
     tun = [p for c, p in frames if c == CmdPost.TunableDirectory]
     mon = [p for c, p in frames if c == CmdPost.MonitorDirectory]
     cmd = [p for c, p in frames if c == CmdPost.CMDDirectory]
-    check("调参目录 9 项", len(tun) == 9, f"got {len(tun)}")
-    check("监控目录 14 项", len(mon) == 14, f"got {len(mon)}")
+    key = [p for c, p in frames if c == CmdPost.KeyDirectory]
+    check("调参目录 8 项", len(tun) == 8, f"got {len(tun)}")
+    check("监控目录 15 项", len(mon) == 15, f"got {len(mon)}")
     check("命令目录 5 项", len(cmd) == 5, f"got {len(cmd)}")
+    check("按键目录 7 项", len(key) == 7, f"got {len(key)}")
 
-    # 目录完成回执：OK + 1B 总项数（回显 = 全量请求的 [len=0]）
     ok_infos = []
     for c, p in frames:
         if c != CmdPost.Response:
             continue
-        dec = decode_response(p, 1)  # 目录请求回显 1B
-        if dec and dec[2] == 0x00 and len(dec[3]) == 1:
+        dec = decode_response(p)  # 整表请求收到即回：status=0x80 + 1B 表项数
+        if dec and dec[2] == 0x80 and len(dec[3]) == 1:
             ok_infos.append(dec[3][0])
-    check("三张表各有 OK 项数回执", sorted(ok_infos) == [5, 9, 14], f"got {sorted(ok_infos)}")
+    check("四张表各有 OK 项数回执", sorted(ok_infos) == [5, 7, 8, 15], f"got {sorted(ok_infos)}")
 
-    # str 目录项：值宽 0，帧到单位段即止（[index][type][tag][名长][名][单位长][单位]）
-    str_items = [p for p in tun if p[1] == 10]  # str 类型编号 10
-    check("str 目录项存在", len(str_items) == 1)
-    if str_items:
-        p = str_items[0]
-        name_len = p[3]
-        unit_at = 4 + name_len
-        check("str 帧到单位段即止", len(p) == unit_at + 1 + p[unit_at], f"len={len(p)}")
-
-    # ④ Ping → Pong
+    # ② Ping → Pong
     n_pong = sum(1 for c, _ in frames if c == CmdPost.Pong)
-    bridge.send(ping())
-    time.sleep(0.05)
+    core.receive(ping())
+    tick(1)
     check("Ping → Pong", sum(1 for c, _ in frames if c == CmdPost.Pong) == n_pong + 1)
 
-    # ⑤ Subscribe → OK 回执（回显 [index][tag]）
-    bridge.send(subscribe(0, True, True))
-    time.sleep(0.05)
-    sub_ok = False
-    for c, p in frames:
-        if c == CmdPost.Response:
-            dec = decode_response(p, 2)
-            if dec and dec[0] == CmdGet.Subscribe and dec[2] == 0x00:
-                sub_ok = True
+    # ③ Subscribe → OK 回执（回显 [index][tag]），随后 FAST 项每拍推值
+    core.receive(subscribe(0, True, True))
+    tick(10)
+    sub_ok = any(
+        (dec := decode_response(p)) and dec[0] == CmdGet.Subscribe and dec[2] == 0x00
+        for c, p in frames
+        if c == CmdPost.Response
+    )
     check("Subscribe → OK 回执", sub_ok)
+    check("监控值帧在流", sum(1 for c, _ in frames if c == CmdPost.MonitorValue) > 8)
 
-    # ⑥ Set_Tunable → TunableEcho（真实生效值）
-    bridge.send(set_tunable(0, ValueType.Float, 2.5))
-    time.sleep(0.05)
-    echo = [p for c, p in frames if c == CmdPost.TunableEcho]
+    # ④ Set_Tunable → TunableEcho（真实生效值）
+    n_echo = sum(1 for c, _ in frames if c == CmdPost.TunableEcho)
+    core.receive(set_tunable(0, ValueType.Float, 2.5))
+    tick(1)
+    echo = [p for c, p in frames if c == CmdPost.TunableEcho][n_echo:]
     check("调参回显一帧", len(echo) == 1, f"got {len(echo)}")
     if echo:
         p = echo[0]
         check("回显 type/index", p[0] == ValueType.Float and p[1] == 0)
-        import struct
-
         check("回显值 2.5", struct.unpack_from("<f", p, 2)[0] == 2.5)
 
-    # ⑦ 动作命令：停车 OK；原地转向永远 BUSY 拒绝
-    bridge.send(command_send(0x84, [], []))  # 停车（无参）
-    bridge.send(command_send(0x83, [ValueType.Float], [90.0]))  # 原地转向
-    time.sleep(0.1)
+    # ⑤ 动作命令：停车 OK；原地转向永远 BUSY 拒绝
+    core.receive(command_send(0x84, [], []))
+    core.receive(command_send(0x83, [ValueType.Float], [90.0]))
+    tick(1)
     stop_ok = busy = False
     for c, p in frames:
         if c != CmdPost.Response:
             continue
-        dec = decode_response(p, 4 if p[1] == 0x83 else 0)
+        dec = decode_response(p)
         if not dec:
             continue
         if dec[0] == 0x84 and dec[2] == 0x00:
             stop_ok = True
-        if dec[0] == 0x83 and dec[2] == 0xC3:
+        if dec[0] == 0x83 and dec[2] == 0xC2:
             busy = True
     check("停车 → OK", stop_ok)
-    check("原地转向 → BUSY(0xC3)", busy)
+    check("原地转向 → BUSY(0xC2)", busy)
 
-    # ⑧ 坏帧静默丢弃（XOR 改坏一个字节，不应产生 Pong）
+    # ⑥ 坏帧静默丢弃（XOR 改坏一个字节，不应产生 Pong）
     n_pong = sum(1 for c, _ in frames if c == CmdPost.Pong)
     bad = bytearray(ping())
     bad[-1] ^= 0xFF
-    bridge.send(bytes(bad))
-    time.sleep(0.05)
+    core.receive(bytes(bad))
+    tick(1)
     check("坏帧无 Pong", sum(1 for c, _ in frames if c == CmdPost.Pong) == n_pong)
-
-    # ⑨ on_raw 广播与 on_frame 同源同量（WS 透传路径）
-    check("on_raw 覆盖全部帧", len(raws) >= len(frames), f"raw={len(raws)} frames={len(frames)}")
-
-    # ⑩ 值帧在流（FAST 订阅项 100Hz）
-    n_val = sum(1 for c, _ in frames if c == CmdPost.MonitorValue)
-    check("监控值帧在流", n_val > 20, f"got {n_val}")
-
-    # ⑪ 父类心跳线程自 ping 自答：500ms 内 Pong 持续、不误判掉线
-    bridge.start_heartbeat(0.08)
-    time.sleep(0.5)
-    pong_now = sum(1 for c, _ in frames if c == CmdPost.Pong)
-    check("心跳期间 Pong 持续", pong_now > n_pong + 3, f"delta={pong_now - n_pong}")
-    check("心跳期间未掉线", all(s != Status.disconnected for s, _ in statuses))
-
-    # ⑫ 停心跳 + 不再手发 Ping：300ms 巡视后停推
-    bridge.stop_heartbeat()
-    time.sleep(0.45)  # 先过巡视期，让 link_ok 落闸
-    n_val2 = sum(1 for c, _ in frames if c == CmdPost.MonitorValue)
-    time.sleep(0.3)
-    n_val3 = sum(1 for c, _ in frames if c == CmdPost.MonitorValue)
-    check("停 Ping 后监控值停推", n_val3 == n_val2, f"{n_val2} → {n_val3}")
-
-    # ⑬ Ping 恢复即续传
-    bridge.send(ping())
-    time.sleep(0.1)
-    check("Ping 恢复后续传", sum(1 for c, _ in frames if c == CmdPost.MonitorValue) > n_val3)
-
-    # ⑭ disconnect：报 idle，拍线程退出
-    bridge.disconnect()
-    check("disconnect 后 connected=False", bridge.connected is False)
-    check("上报 idle", any(s == Status.idle for s, _ in statuses))
-    time.sleep(0.05)
-    check("拍线程已退出", bridge._tick_thread is None or not bridge._tick_thread.is_alive())
 
     print("---- 结果 ----")
     print(f"通过 {passed} / {passed + failed}")

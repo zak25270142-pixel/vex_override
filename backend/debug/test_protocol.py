@@ -8,15 +8,12 @@ from __future__ import annotations
 
 import struct
 
+from app.config import CONFIG
 from app.protocol import (
-    FRAME_HEAD,
     CmdGet,
     CmdPost,
-    MAX_PAYLOAD,
-    REQ_LIST_MAX,
     ValueType,
     FrameParser,
-    build_response,
     decode_response,
     decode_value,
     encode_value,
@@ -25,13 +22,17 @@ from app.protocol import (
     request_command,
     request_monitor,
     request_tunable,
-    resp_is_ok,
-    resp_is_reject,
-    resp_is_retry,
-    resp_reason_text,
-    resp_str_len,
+    RespErrReject,
+    RespErrRetry,
+    RESP_CLASS_MASK,
+    RESP_MODE_MASK,
+    RESP_OK,
+    RESP_PAYLOAD_MASK,
+    _RESP_ERR_NAMES_ZH,
     subscribe,
 )
+
+from debug.mock_v5 import build_response
 
 
 def _rec(frames: list):
@@ -43,7 +44,7 @@ def _frame(cmd: int, payload: bytes) -> bytes:
     xor = cmd
     for b in payload:
         xor ^= b
-    return bytes([FRAME_HEAD, cmd]) + payload + bytes([xor & 0xFF])
+    return bytes([CONFIG.frame_head, cmd]) + payload + bytes([xor & 0xFF])
 
 
 def test_build_ping():
@@ -151,7 +152,7 @@ def test_parser_echo_bad_type_resyncs():
     assert frames == [(CmdPost.Pong, b"")], frames
 
 
-def _monitor_dir_frame(index: int, name: str, unit: str, value: float) -> bytes:
+def _monitor_table_frame(index: int, name: str, unit: str, value: float) -> bytes:
     """监控目录帧: [index][type][tag][名长][名][单位长][单位][值]"""
     nb = name.encode("utf-8")
     ub = unit.encode("utf-8")
@@ -163,17 +164,17 @@ def _monitor_dir_frame(index: int, name: str, unit: str, value: float) -> bytes:
 
 
 def test_parser_directory_framing():
-    """目录帧变长：_dir_len 边收边试算，半帧跨 chunk 拼齐后边界不偏。"""
+    """目录帧变长：_table_frame_len 边收边试算，半帧跨 chunk 拼齐后边界不偏。"""
     frames: list[tuple[int, bytes]] = []
     p = FrameParser()
-    f = _monitor_dir_frame(2, "左0转速", "rpm", 0.0)
+    f = _monitor_table_frame(2, "左0转速", "rpm", 0.0)
     p.feed(f[:6], _rec(frames))  # 名字都没收全：定不了长
     assert frames == []
     p.feed(f[6:] + ping(), _rec(frames))
     assert frames == [(CmdPost.MonitorDirectory, f[2:-1]), (CmdPost.Pong, b"")], frames
 
 
-def _str_dir_frame(index: int, name: str) -> bytes:
+def _str_table_frame(index: int, name: str) -> bytes:
     """str 目录项：[index][type=10][tag][名长][名][单位长0]——值宽0，帧到单位段即止"""
     nb = name.encode("utf-8")
     payload = bytes([index, 10, 0, len(nb)]) + nb + bytes([0])
@@ -184,7 +185,7 @@ def test_parser_directory_str_zero_width():
     """str/other 目录项也发（值宽0）：帧长试算走到单位段即止，不能把后续帧的字节当值吞。"""
     frames: list[tuple[int, bytes]] = []
     p = FrameParser()
-    f = _str_dir_frame(5, "模式名")
+    f = _str_table_frame(5, "模式名")
     p.feed(f + ping(), _rec(frames))
     assert frames == [(CmdPost.MonitorDirectory, f[2:-1]), (CmdPost.Pong, b"")], frames
     frames.clear()
@@ -214,18 +215,18 @@ def test_parser_unknown_cmd_resyncs():
     """不认识的命令字：回找帧头，不猜长度硬跳（后续正常帧不受影响）。"""
     frames: list[tuple[int, bytes]] = []
     p = FrameParser()
-    p.feed(bytes([FRAME_HEAD, 0x07, 0x00]) + ping(), _rec(frames))
+    p.feed(bytes([CONFIG.frame_head, 0x07, 0x00]) + ping(), _rec(frames))
     assert frames == [(CmdPost.Pong, b"")], frames
 
 
 def test_parser_overflow_resyncs():
-    """payload 超过 MAX_PAYLOAD：回找帧头，不硬吞（后续正常帧不受影响）。"""
+    """payload 超过 config.max_payload：回找帧头，不硬吞（后续正常帧不受影响）。"""
     frames: list[tuple[int, bytes]] = []
     p = FrameParser()
     # 目录帧试算出 519B 总长（>445）：名长/单位长都顶格
     payload = bytes([0, ValueType.Float, 0, 255]) + b"n" * 255 + bytes([255]) + b"u" * 255
     payload += bytes(200)  # 继续灌，逼 len 撞 445
-    p.feed(bytes([FRAME_HEAD, CmdPost.MonitorDirectory]) + payload + ping(), _rec(frames))
+    p.feed(bytes([CONFIG.frame_head, CmdPost.MonitorDirectory]) + payload + ping(), _rec(frames))
     assert frames == [(CmdPost.Pong, b"")], frames
 
 
@@ -242,7 +243,7 @@ def test_parser_bad_checksum_and_half_frame():
 
 
 def test_max_payload_constant():
-    assert MAX_PAYLOAD == 445
+    assert CONFIG.max_payload == 445
 
 
 # ---------- Response 帧（通用响应：对下行命令的回执） ----------
@@ -257,7 +258,7 @@ def test_build_response_roundtrip():
     frames: list[tuple[int, bytes]] = []
     FrameParser().feed(f, _rec(frames))
     assert frames == [(CmdPost.Response, f[2:-1])], frames
-    assert decode_response(f[2:-1], 3) == (0x82, echo, 0x00, b"")
+    assert decode_response(f[2:-1]) == (0x82, echo, 0x00, b"")
 
 
 def test_parser_response_framing():
@@ -285,32 +286,68 @@ def test_parser_response_short_len_resyncs():
     assert frames == [(CmdPost.Pong, b"")], frames
 
 
-def test_decode_response_consistency():
-    """一致性校验：payloadlen 必须 = 2 + 回显长 + 串长；对不上返回 None（不猜）。"""
+def test_decode_response_l_driven():
+    """L 驱动：[L][原话cmd][status][info_len][info][原话payload]；status 固定在 p[2]。"""
     echo = bytes([1, 2, 3])
     f = build_response(0x82, echo, 0x00)
-    assert decode_response(f[2:-1], 3) == (0x82, echo, 0x00, b"")
-    assert decode_response(f[2:-1], 2) is None, "回显长度猜错：status 落错位置"
-    assert decode_response(f[2:-1], 4) is None
-    # 串模式：长度取低6位（"忙" 3B UTF-8 → status 0x83 = 拒绝+串长3）
-    f2 = build_response(0x82, echo, 0x83, "忙".encode())
-    assert decode_response(f2[2:-1], 3) == (0x82, echo, 0x83, "忙".encode())
-    # 内定err模式：不带原因串（0xC3 = 拒绝·忙）
-    f3 = build_response(0x82, echo, 0xC3)
-    assert decode_response(f3[2:-1], 3) == (0x82, echo, 0xC3, b"")
+    assert decode_response(f[2:-1]) == (0x82, echo, 0x00, b"")
+    # 内定err模式（0xC2 = 拒绝·忙）：不带原因串，status 就在末字节
+    f2 = build_response(0x82, echo, 0xC2)
+    assert decode_response(f2[2:-1]) == (0x82, echo, 0xC2, b"")
+    # 0x80 = OK + info（无 info 内容），info 段仍带 1B 长度=0
+    f3 = build_response(0x82, echo, 0x80)
+    assert decode_response(f3[2:-1]) == (0x82, echo, 0x80, b"")
+
+
+def test_decode_response_rejects_bad_l():
+    """L 与实际长度不符（截断/流错位）返回 None：不猜、不硬解。"""
+    f = build_response(0x82, bytes([1, 2, 3]), 0x00)
+    p = f[2:-1]
+    assert decode_response(bytes([p[0] + 2]) + p[1:]) is None, "L 偏大"
+    assert decode_response(bytes([p[0] - 2]) + p[1:]) is None, "L 偏小"
+    assert decode_response(p[:2]) is None, "不足 [L][命令字][status]"
 
 
 def test_response_ok_info():
-    """OK+info：0x00 后跟二进制附加信息（目录项数），长度隐式=帧长剩余，不按 UTF-8 解。"""
-    echo = bytes([0x00])  # 全量目录请求的回显就是 [len=0]
-    f = build_response(CmdGet.RequestMonitor, echo, 0x00, b"\x05")
-    assert decode_response(f[2:-1], 1) == (CmdGet.RequestMonitor, echo, 0x00, b"\x05")
-    # 纯 OK（无 info）：尾字节为空
-    f2 = build_response(0x82, b"", 0x00)
-    assert decode_response(f2[2:-1], 0) == (0x82, b"", 0x00, b"")
-    # info 是二进制：0xFF 之流不能当 UTF-8 解坏
-    f3 = build_response(CmdGet.RequestTunable, echo, 0x00, b"\xff")
-    assert decode_response(f3[2:-1], 1)[3] == b"\xff"
+    """OK+info（0x80）：info 段自带 1B 长度，原话payload 在帧尾；不看命令字。"""
+    echo = bytes([0x00])  # 全量目录请求的原话payload = [len=0]
+    f = build_response(CmdGet.RequestMonitor, echo, 0x80, b"\x05")
+    assert decode_response(f[2:-1]) == (CmdGet.RequestMonitor, echo, 0x80, b"\x05")
+    # 边界：info = 196（>=0x80）整字节保留，不能被当成状态位
+    f = build_response(0x82, echo, 0x80, bytes([196]))
+    assert decode_response(f[2:-1]) == (0x82, echo, 0x80, bytes([196]))
+    # 边界：info = 0（空表）必须能拿到 0，而不是"没有 info"
+    f = build_response(CmdGet.RequestCommand, echo, 0x80, b"\x00")
+    assert decode_response(f[2:-1]) == (CmdGet.RequestCommand, echo, 0x80, b"\x00")
+    # 边界：0x00 无 info 段，回显末字节恰为 0x00 也不得误判
+    f = build_response(0x82, b"\x00", 0x00)
+    assert decode_response(f[2:-1]) == (0x82, b"\x00", 0x00, b"")
+    # info 不定长：两个字节原样交出，原话payload 仍完整
+    f = build_response(CmdGet.RequestMonitor, echo, 0x80, bytes([5, 0]))
+    assert decode_response(f[2:-1]) == (CmdGet.RequestMonitor, echo, 0x80, bytes([5, 0]))
+    # 无回显的传完通知：L=2，原话payload 长度 0 = 匹配该 cmd 全部
+    f = build_response(CmdGet.RequestMonitor, b"", 0x00)
+    assert decode_response(f[2:-1]) == (CmdGet.RequestMonitor, b"", 0x00, b"")
+    # 目录部分补发的回显 [len][0]：末字节 0x00 也不会把 status 误读成 info
+    f = build_response(CmdGet.RequestKeyDir, bytes([1, 0]), 0xC1)
+    assert decode_response(f[2:-1]) == (CmdGet.RequestKeyDir, bytes([1, 0]), 0xC1, b"")
+    # info 是二进制：按字节保留，不按 UTF-8 解
+    f3 = build_response(CmdGet.RequestTunable, echo, 0x80, b"\x3f")
+    assert decode_response(f3[2:-1])[3] == b"\x3f"
+
+
+def test_response_str_mode():
+    """串类（0x01~0x3F / 0x81~0xBF）：低 6 位就是串长，裸串不带 [len] 前缀。"""
+    echo = bytes([0x03, 0x02, 0x05, 0x07])
+    for base, klass in ((0x01, "需补发"), (0x81, "明确拒绝")):
+        msg = "下标 37 超出监控表".encode("utf-8")
+        f = build_response(0x82, echo, base, msg)
+        p = f[2:-1]
+        assert p[2] == base | len(msg), f"{klass}: status 低6位应为串长，实际 0x{p[2]:02x}"
+        assert decode_response(p) == (0x82, echo, p[2], msg), klass
+    # 内定err类仍走 [len][data]，与串类不混
+    f = build_response(0x82, echo, 0x42, b"\x05")
+    assert decode_response(f[2:-1]) == (0x82, echo, 0x42, b"\x05")
 
 
 def test_request_dir_indices():
@@ -322,23 +359,35 @@ def test_request_dir_indices():
     f3 = request_command([0x80])
     assert list(f3) == [0xA5, 0x04, 0x01, 0x80, 0x04 ^ 0x01 ^ 0x80]
     try:
-        request_tunable(list(range(REQ_LIST_MAX + 1)))
+        request_tunable(list(range(CONFIG.req_list_max + 1)))
         raise AssertionError("补发列表超上限应抛错（让调用方改全量）")
     except ValueError as e:
         assert "全量" in str(e)
 
 
-def test_response_status_helpers():
-    """status 位域 helper 与内定err中文名（与固件 communication.h 同口径）。"""
-    assert resp_is_ok(0x00) and not resp_is_ok(0x01)
-    assert resp_is_retry(0x01) and resp_is_retry(0x41) and not resp_is_retry(0x00)
-    assert resp_is_reject(0x80) and resp_is_reject(0xC3) and not resp_is_reject(0x40)
-    assert resp_str_len(0x00) == -1, "OK 的尾字节长度隐式（哨兵-1，由帧长反推）"
-    assert resp_str_len(0x83) == 3 and resp_str_len(0xC3) == 0
-    assert resp_reason_text(0x41, b"") == "Checksum(内定err#1)"
-    assert resp_reason_text(0xC3, b"") == "Busy(内定err#3)"
-    assert resp_reason_text(0x83, "下标超表".encode()) == "下标超表"
-    assert resp_reason_text(0x00, b"\x05") == "OK", "info 不进 reason_text，由调用方按 cmd 解释"
+def test_response_err_names():
+    """status 位域与内定err中文名表（与固件 communication.h / protocol.ts 同口径）。
+
+    resp_* 判定函数已删除——结算处就地做位测试，这里只锁住数据表本身。
+    """
+    # 拒绝类顺位：Generic=0 / IndexRange=1 / Busy=2 / UnknownCmd=3
+    assert RESP_OK == 0x00
+    assert RESP_CLASS_MASK == 0x80 and RESP_MODE_MASK == 0x40 and RESP_PAYLOAD_MASK == 0x3F
+    assert int(RespErrReject.Generic) == 0
+    assert int(RespErrReject.IndexRange) == 1
+    assert int(RespErrReject.Busy) == 2
+    assert int(RespErrReject.UnknownCmd) == 3
+    assert _RESP_ERR_NAMES_ZH[0x40] == "通用重试"
+    assert _RESP_ERR_NAMES_ZH[0x41] == "校验失败"
+    assert _RESP_ERR_NAMES_ZH[0xC0] == "通用拒绝"
+    assert _RESP_ERR_NAMES_ZH[0xC1] == "下标超表"
+    assert _RESP_ERR_NAMES_ZH[0xC2] == "忙", "0xC2 是拒绝类 err 2 = Busy"
+    assert _RESP_ERR_NAMES_ZH[0xC3] == "命令字未注册", "0xC3 是拒绝类 err 3 = UnknownCmd"
+    assert int(RespErrRetry.PoolFull) == 2
+    assert int(RespErrReject.InFlight) == 4
+    assert _RESP_ERR_NAMES_ZH[0x42] == "目录补发池满"
+    assert _RESP_ERR_NAMES_ZH[0xC4] == "同表目录在途"
+    assert len(_RESP_ERR_NAMES_ZH) == 8, "含 PoolFull(0x42) / InFlight(0xC4)，表内不留空洞"
 
 
 def test_is_ack_tracked():
@@ -376,10 +425,12 @@ if __name__ == "__main__":
     test_build_response_roundtrip()
     test_parser_response_framing()
     test_parser_response_short_len_resyncs()
-    test_decode_response_consistency()
+    test_decode_response_l_driven()
+    test_decode_response_rejects_bad_l()
     test_response_ok_info()
+    test_response_str_mode()
     test_request_dir_indices()
-    test_response_status_helpers()
+    test_response_err_names()
     test_is_ack_tracked()
     test_request_monitor()
     print("all protocol tests passed")

@@ -43,7 +43,7 @@ CUR = [f"{s}{i}电流" for s in "左右" for i in range(3)]
 
 def tval(bl: BackendLink, name: str, default: float) -> float:
     """读实车当前调参值，缺项回退默认（默认值只是兜底，以实车为准）。"""
-    entry = bl.tun_dir.get(name)
+    entry = bl.tunable_table.get(name)
     if entry and entry[1] is not None:
         try:
             return float(entry[1])
@@ -74,7 +74,7 @@ def main() -> None:
         if st_l != 0 or st_r != 0:
             print(f"[warn] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}），"
                   f"0x84 会被每拍覆盖，结论不可信")
-        missing = [n for n in want if n not in bl.mon_dir]
+        missing = [n for n in want if n not in bl.monitor_table]
         if missing:
             sys.exit("监控表缺少: %s" % missing)
 
@@ -100,8 +100,7 @@ def main() -> None:
             bl.sleep(args.hold)
             bl.end_log()
             seg = os.path.join(out_dir, "v%.2f" % v)
-            bl.print_log(seg + ".csv")
-            bl.print_log(seg + ".png")
+            bl.print_log(seg, plot=True)
             st = seg_stats(seg + ".csv", want)
 
             def m(name):

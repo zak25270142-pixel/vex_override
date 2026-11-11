@@ -9,9 +9,9 @@
 
     motor_names("L2") -> {"vact": "左2实际电压", "rpm": "左2转速", "cur": "左2电流"}
 
-用法（用 bl.mon_dir 校验一遍，缺项早点报错，别静默跑空）：
+用法（用 bl.monitor_table 校验一遍，缺项早点报错，别静默跑空）：
     ids = motor_names("L2")
-    missing = [k for k, n in ids.items() if n not in bl.mon_dir]
+    missing = [k for k, n in ids.items() if n not in bl.monitor_table]
     if missing:
         raise RuntimeError(f"监控表里没有 L2 的 {missing}")
 """

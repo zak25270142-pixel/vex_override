@@ -54,11 +54,11 @@ MyMotor right_motor_list[3] = {
 
 ChassisMotorGroup left_motors(
     left_motor_list, 3,
-    left_kf_table, static_cast<uint8_t>(sizeof(left_kf_table) / sizeof(left_kf_table[0])),
+    left_kf_table, sizeof(left_kf_table) / sizeof(left_kf_table[0]),
     0.0f, 0.0f, 0.0f);
 ChassisMotorGroup right_motors(
     right_motor_list, 3,
-    right_kf_table, static_cast<uint8_t>(sizeof(right_kf_table) / sizeof(right_kf_table[0])),
+    right_kf_table, sizeof(right_kf_table) / sizeof(right_kf_table[0]),
     0.0f, 0.0f, 0.0f);
 
 // 定位轮端口与转向取
@@ -114,8 +114,8 @@ void robot_init()
     // lift_bar.init() 不在这：随 RobotAction::init() 走动作层生命周期
 }
 // ---- 上位机命令 ----
-// handler 返回值：CMD_RET_OK=已处理 / CMD_RET_BUSY=忙时拒绝 / CMD_RET_REJECT=参数越界。
-// 非 OK 由 handle_command 回对应的 Response 拒绝帧——拒绝不再静默。
+// handler 返回值：USB_Comm::ok=已处理 / busy=忙时拒绝 / reject=参数越界，
+// 由 handle_command 原样写进 Response——拒绝不再静默。
 
 static uint8_t cmd_stop(const uint8_t *p)
 {
@@ -124,40 +124,40 @@ static uint8_t cmd_stop(const uint8_t *p)
     // 掉线 failsafe 复用的也是 stop_move()（my_main.cpp comm_link_lost_handler）。
     // 升降杆的停止是另一条命令：它掉链时的失效模式是就地保持（没 stop 就不该断
     // 电压），不跟着底盘收。想停一切就连发两条。
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 static uint8_t cmd_turn(const uint8_t *p)
 {
     pc_took_control = true; // PC 位置环任务：掉线 failsafe 在 is_busy 时据此收车
     if (robot_action.is_busy())
-        return CMD_RET_BUSY;
+        return USB_Comm::busy;
     float angle;
     memcpy(&angle, p, sizeof(angle));
     robot_action.turn(angle);
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 static uint8_t cmd_move(const uint8_t *p)
 {
     pc_took_control = true; // PC 位置环任务：掉线 failsafe 在 is_busy 时据此收车
     if (robot_action.is_busy())
-        return CMD_RET_BUSY;
+        return USB_Comm::busy;
     float distance;
     memcpy(&distance, p, sizeof(distance));
     robot_action.move(distance);
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 static uint8_t cmd_goto(const uint8_t *p)
 {
     pc_took_control = true; // PC 位置环任务：掉线 failsafe 在 is_busy 时据此收车
     if (robot_action.is_busy())
-        return CMD_RET_BUSY;
+        return USB_Comm::busy;
     float arg[3]; // x前(米)、y右(米)、heading最终朝向(度)，紧凑小端排列
     memcpy(arg, p, sizeof(arg));
     robot_action.goto_local(arg[0], arg[1], arg[2]);
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 // 开环直控的组表：下标即命令里的"组别"。**只放底盘左右两组**。
@@ -174,31 +174,31 @@ static uint8_t cmd_group_volt(const uint8_t *p)
     // 本组停着时，写下的电压会一直保持：速度环在 Stopped 下每拍什么都不下发，
     // 不会拿 0V 覆盖。直到收到"给目标"或"停止"，本组才重新归速度环管。
     if (robot_action.is_busy())
-        return CMD_RET_BUSY;
+        return USB_Comm::busy;
     uint8_t group;
     float volt[4]; // 固定 4 槽，够任何组用；该组台数不足时多传的忽略
     memcpy(&group, p, sizeof(group));
     memcpy(volt, p + sizeof(group), sizeof(volt));
     if (group >= raw_group_count)
-        return CMD_RET_REJECT; // 组别越界
+        return USB_Comm::reject; // 组别越界
 
     // 前提是本组的速度环不在工作。任务型的冲突（位置环、缓停、手柄）已经被上面的
     // is_busy() 挡掉了；剩下唯一能进来的矛盾是"上位机先下过目标速度、再下开环电压"——
     // 两条命令都是上位机自己发的，谁后发谁生效、被速度环覆盖也由上位机担责，
     // 固件不替它决定该停哪一个（这里越权去 stop() 反而会静默清掉它的速度目标）。
     raw_groups[group]->set_volt(volt);
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 static uint8_t cmd_set_spin(const uint8_t *p)
 {
     // 直接给左右轮目标速度(pct，±100)，只写目标，速度环负责追踪并保持。
     if (robot_action.is_busy())
-        return CMD_RET_BUSY;
+        return USB_Comm::busy;
     float arg[2];
     memcpy(arg, p, sizeof(arg));
     chassis.output(arg[0], arg[1]);
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 static uint8_t cmd_reset_pos(const uint8_t *p)
@@ -210,7 +210,7 @@ static uint8_t cmd_reset_pos(const uint8_t *p)
     chassis.heading_offset = arg[2] - chassis.imu_heading;
     chassis.heading = arg[2]; // 同步供 begin_segment() 快照
     chassis.begin_segment();
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 // ---- 上位机命令：升降杆 ----
@@ -223,7 +223,7 @@ static uint8_t cmd_lift_to(const uint8_t *p)
     memcpy(&raw, p, sizeof(raw));
     pc_took_control = true;   // 与底盘共用：掉线时两者一起收
     lift_bar.lift_to(raw);    // 单机构命令直接给电机组，不经 RobotAction 转发
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 // 开环直控走"最后门"：直接调电机组的 set_volt()——它本就是绕过
@@ -234,7 +234,7 @@ static uint8_t cmd_lift_volt(const uint8_t *p)
     float volt[4]; // 逐台电压（V），直通下发；顺序同 lift_motor_list（升0~3）
     memcpy(volt, p, sizeof(volt));
     lift_bar.set_volt(volt);
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 // 上位机构停止：升降杆受控回落，到底才断电。与底盘停止各走各的命令，
@@ -243,7 +243,7 @@ static uint8_t cmd_stop_upper(const uint8_t *p)
 {
     (void)p;          // 无参
     lift_bar.stop();  // 受控回落，到底才断电；pc_took_control 是历史标记，不清零
-    return CMD_RET_OK;
+    return USB_Comm::ok;
 }
 
 // 字段类型表：顺序必须与 handler 里 memcpy 的顺序一致
@@ -268,17 +268,16 @@ static_assert(sizeof(range_group_volt) == 2 + 4 * 2 * sizeof(float), "范围字�
 
 // 本车动作命令总表，非 static 供外部链接
 const CMD_ITEM robot_cmds[] = {
-    {cmd_stop, nullptr, nullptr, "停止底盘", cmd_tag_make(0, CMD_SPEC_STOP), nullptr},
-    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, "原地转向", cmd_tag_make(1, CMD_SPEC_NORMAL), nullptr},
-    {cmd_move, cmd_f_type, (const char *[]){"距离(米)"}, "直行", cmd_tag_make(1, CMD_SPEC_NORMAL), (const void *)&(const float[2]){-5.0f, 5.0f}},
-    {cmd_goto, cmd_3f_type, (const char *[]){"x前(米)", "y右(米)", "航向(度)"}, "局部移动", cmd_tag_make(3, CMD_SPEC_NORMAL), (const void *)&(const float[6]){-3.6f, 3.6f, -3.6f, 3.6f, -360.0f, 360.0f}},
-    {cmd_group_volt, cmd_ui8_4f_type, (const char *[]){"组别(0左1右)", "0号电压", "1号电压", "2号电压", "3号电压"}, "组开环电压", cmd_tag_make(5, CMD_SPEC_NORMAL), &range_group_volt},
-    {cmd_set_spin, cmd_2f_type, (const char *[]){"左目标速度", "右目标速度"}, "设置底盘目标速度", cmd_tag_make(2, CMD_SPEC_NORMAL), (const void *)&(const float[4]){-100.0f, 100.0f, -100.0f, 100.0f}},
-    {cmd_reset_pos, cmd_3f_type, (const char *[]){"坐标x", "坐标y", "航向yaw"}, "重置底盘位置", cmd_tag_make(3, CMD_SPEC_NORMAL), nullptr},
-
-    {cmd_lift_to, cmd_f_type, (const char *[]){"目标位置(raw)"}, "升降杆位置", cmd_tag_make(1, CMD_SPEC_NORMAL), (const void *)&(const float[2]){0.0f, 5400.0f}},
-    {cmd_lift_volt, cmd_4f_type, (const char *[]){"升0电压", "升1电压", "升2电压", "升3电压"}, "升降杆电压", cmd_tag_make(4, CMD_SPEC_NORMAL), (const void *)&(const float[8]){-12.0f, 12.0f, -12.0f, 12.0f, -12.0f, 12.0f, -12.0f, 12.0f}},
-    {cmd_stop_upper, nullptr, nullptr, "停止升降杆", cmd_tag_make(0, CMD_SPEC_STOP), nullptr},
+    {cmd_stop, nullptr, nullptr, 0, "停止底盘", CMD_ITEM::stop, nullptr},
+    {cmd_turn, cmd_f_type, (const char *[]) { "角度(度)" }, 1, "原地转向", CMD_ITEM::normal, nullptr},
+    {cmd_move, cmd_f_type, (const char *[]) { "距离(米)" }, 1, "直行", CMD_ITEM::normal, (const void *)&(const float[2]) { -5.0f, 5.0f }},
+    {cmd_goto, cmd_3f_type, (const char *[]) { "x前(米)", "y右(米)", "航向(度)" }, 3, "局部移动", CMD_ITEM::normal, (const void *)&(const float[6]) { -3.6f, 3.6f, -3.6f, 3.6f, -360.0f, 360.0f }},
+    {cmd_group_volt, cmd_ui8_4f_type, (const char *[]) { "组别(0左1右)", "0号电压", "1号电压", "2号电压", "3号电压" }, 5, "组开环电压", CMD_ITEM::normal, &range_group_volt},
+    {cmd_set_spin, cmd_2f_type, (const char *[]) { "左目标速度", "右目标速度" }, 2, "设置底盘目标速度", CMD_ITEM::normal, (const void *)&(const float[4]) { -100.0f, 100.0f, -100.0f, 100.0f }},
+    {cmd_reset_pos, cmd_3f_type, (const char *[]) { "坐标x", "坐标y", "航向yaw" }, 3, "重置底盘位置", CMD_ITEM::normal, nullptr},
+    {cmd_lift_to, cmd_f_type, (const char *[]) { "目标位置(raw)" }, 1, "升降杆位置", CMD_ITEM::normal, (const void *)&(const float[2]) { 0.0f, 5400.0f }},
+    {cmd_lift_volt, cmd_4f_type, (const char *[]) { "升0电压", "升1电压", "升2电压", "升3电压" }, 4, "升降杆电压", CMD_ITEM::normal, (const void *)&(const float[8]) { -12.0f, 12.0f, -12.0f, 12.0f, -12.0f, 12.0f, -12.0f, 12.0f }},
+    {cmd_stop_upper, nullptr, nullptr, 0, "停止升降杆", CMD_ITEM::stop, nullptr},
 
 };
 const uint8_t robot_cmd_count = sizeof(robot_cmds) / sizeof(robot_cmds[0]);

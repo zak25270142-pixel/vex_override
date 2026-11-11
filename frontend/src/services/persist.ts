@@ -11,6 +11,13 @@ const WRITE_DEBOUNCE_MS = 300
 export const WINDOW_MIN = 0.5
 export const WINDOW_MAX = 60
 
+/** 帧长上限：接收缓冲一次按这个尺寸分配，也是判定上限的最大值与默认值 */
+export const MAX_PAYLOAD_CAP = 4096
+export const MAX_PAYLOAD_MIN = 64
+
+/** 帧头字节默认值（0xA5）；与后端 config.frame_head 一起改 */
+export const FRAME_HEAD_DEFAULT = 165
+
 export interface PortIdentity {
   vid: number
   pid: number
@@ -19,6 +26,12 @@ export interface PortIdentity {
 export interface SubEntry {
   sub: boolean
   fast: boolean
+}
+
+/** 一个事件（按键表项或停车命令）的键盘绑定：codes 为 KeyboardEvent.code（物理键位，不受输入法影响）。
+ *  空数组表示只走点击/触屏触发；一个事件可绑多个键，键盘与点击始终并存。 */
+export interface KeyBinding {
+  codes: string[]
 }
 
 export interface ChannelCfg {
@@ -49,11 +62,21 @@ export interface Prefs {
   backend: boolean
   /** 后端 WS 地址覆盖值；null = 按页面来源推导（见 wsTransport.defaultWsUrl） */
   backendUrl: string | null
+  /** 单帧 payload 判定上限（字节）；需 ≥ 后端 config.json 的 max_payload */
+  maxPayload: number
+  /** 帧头字节（十进制 0~255）；与后端 config.json 的 frame_head 一致 */
+  frameHead: number
   port: PortIdentity | null
   /** monitor index → 订阅档位（含退订，用于对抗主控默认订阅位） */
   subs: Record<number, SubEntry>
   chart: ChartPrefs
   layout: LayoutPrefs
+  /** 事件 index（按键表下标 / 命令字）→ 键盘绑定 */
+  keyMap: Record<number, KeyBinding>
+  /** 键盘输入开关：只约束键盘监听，缺省关闭，避免打开页面就劫持按键 */
+  keyInputEnabled: boolean
+  /** 强制电脑版页面：开启后忽略宽度与触控判断，直接用桌面外壳（手机端设置里可切） */
+  desktopView: boolean
 }
 
 function defaultChart(): ChartPrefs {
@@ -80,10 +103,15 @@ function defaultPrefs(): Prefs {
     demo: false,
     backend: false,
     backendUrl: null,
+    maxPayload: MAX_PAYLOAD_CAP,
+    frameHead: FRAME_HEAD_DEFAULT,
     port: null,
     subs: {},
     chart: defaultChart(),
     layout: defaultLayout(),
+    keyMap: {},
+    keyInputEnabled: false,
+    desktopView: false,
   }
 }
 
@@ -102,6 +130,19 @@ function readBackendUrl(raw: unknown): string | null {
   if (typeof raw !== 'string') return null
   const s = raw.trim()
   return /^wss?:\/\/\S+$/.test(s) ? s : null
+}
+
+function readMaxPayload(raw: unknown): number {
+  return typeof raw === 'number' && Number.isInteger(raw) &&
+    raw >= MAX_PAYLOAD_MIN && raw <= MAX_PAYLOAD_CAP
+    ? raw
+    : MAX_PAYLOAD_CAP
+}
+
+function readFrameHead(raw: unknown): number {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 && raw <= 255
+    ? raw
+    : FRAME_HEAD_DEFAULT
 }
 
 function readPort(raw: unknown): PortIdentity | null {
@@ -169,6 +210,25 @@ function readChart(raw: unknown): ChartPrefs {
   }
 }
 
+function readKeyMap(raw: unknown): Record<number, KeyBinding> {
+  const out: Record<number, KeyBinding> = {}
+  if (!raw || typeof raw !== 'object') return out
+  const seen = new Set<string>() // 一个 code 只能绑一个事件；重复时保留先读到的那行
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!validIdx(Number(k)) || !v || typeof v !== 'object') continue
+    const o = v as { codes?: unknown }
+    if (!Array.isArray(o.codes)) continue
+    const codes: string[] = []
+    for (const c of o.codes) {
+      if (typeof c !== 'string' || c.length > 32 || codes.includes(c) || seen.has(c)) continue
+      codes.push(c)
+      seen.add(c)
+    }
+    if (codes.length > 0) out[Number(k)] = { codes }
+  }
+  return out
+}
+
 function readLayout(raw: unknown): LayoutPrefs {
   const def = defaultLayout()
   if (!raw || typeof raw !== 'object') return def
@@ -193,10 +253,15 @@ function readPrefs(): Prefs {
     demo: asBool(raw.demo, def.demo),
     backend: asBool(raw.backend, def.backend),
     backendUrl: readBackendUrl(raw.backendUrl),
+    maxPayload: readMaxPayload(raw.maxPayload),
+    frameHead: readFrameHead(raw.frameHead),
     port: readPort(raw.port),
     subs: readSubs(raw.subs),
     chart: readChart(raw.chart),
     layout: readLayout(raw.layout),
+    keyMap: readKeyMap(raw.keyMap),
+    keyInputEnabled: asBool(raw.keyInputEnabled, def.keyInputEnabled),
+    desktopView: asBool(raw.desktopView, def.desktopView),
   }
 }
 

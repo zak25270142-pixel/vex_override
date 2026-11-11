@@ -8,17 +8,26 @@
  * 地址在每次 connect 时才读取，所以改完设置点「连接」即生效，不必重建传输实例。
  *
  * 数据约定：
- *   - 后端 → 浏览器：ArrayBuffer 原样协议帧（进 FrameParser，store 零改动）
- *                   文本 JSON：连接状态 {"op":"status",...} + 固件回执异常
- *                   {"op":"alert",...}（后端待确认表的拒绝/放弃结论，见 transport.FwAlert）
- *                   + 脚本推荐的曲线配置 {"op":"chart_suggest",...}（见 transport.ChartSuggestion）
+ *   - 后端 → 浏览器：一律 ArrayBuffer。下位机原帧进 FrameParser（store 零改动）；
+ *                   上位机内部段 0xE0~0xEF 是后端自己造的独立帧，按 Cmd 先截下来：
+ *                   E0 连接状态 / E1 giveup 结论 / E2 脚本曲线建议（见 protocol.decodeUiFrame）。
+ *                   目录完整性不再推，前端从透传的目录帧与 Response 自算。
  *   - 浏览器 → 后端：ArrayBuffer 原样协议帧
  *
  * OPEN 之前发出的帧进入待发队列，连接一建立按序 flush，避免「连接中点击/自动拉表」丢命令。
  */
 
-import type { ConnState, PortProbe, SerialTransport, TransportCallbacks } from './transport'
+let uiSuggestSeq = 0
+
+import type {
+  ConnState,
+  DirStats,
+  PortProbe,
+  SerialTransport,
+  TransportCallbacks,
+} from './transport'
 import { loadPrefs } from './persist'
+import { decodeUiFrame } from './protocol'
 
 const CONNECT_TIMEOUT_MS = 5000
 
@@ -59,6 +68,18 @@ function apiBaseOf(wsUrl: string): string {
     return `${u.protocol === 'wss:' ? 'https:' : 'http:'}//${u.host}`
   } catch {
     return ''
+  }
+}
+
+/** 连上后拉一次目录完整性初值（HTTP GET /api/dirs）。
+ *  后端没起来/接口不可用时返回 null，不打扰界面 */
+export async function fetchDirStatus(): Promise<DirStats | null> {
+  try {
+    const r = await fetch(`${apiBaseOf(currentWsUrl())}/api/dirs`)
+    if (!r.ok) return null
+    return (await r.json()) as DirStats
+  } catch {
+    return null
   }
 }
 
@@ -146,46 +167,31 @@ export class WsTransport implements SerialTransport {
         this.cb.onStatus('error', '后端已断开')
       }
       ws.onmessage = (ev) => {
-        if (typeof ev.data === 'string') {
-          try {
-            const obj = JSON.parse(ev.data)
-            if (obj.op === 'status') {
-              // 状态映射：只有串口 connected 才整体算 connected；
-              // connecting/reconnecting/disconnected 都是「链路还没好」，前端亮连接中
+        if (ev.data instanceof ArrayBuffer) {
+          const d = new Uint8Array(ev.data)
+          // 上位机内部段（0xE0~0xEF）是后端自己造的完整帧，独立消息；
+          // 先截下来按 Cmd 分流，其余原样交给 FrameParser（与直连串口一致）。
+          const ui = decodeUiFrame(d)
+          if (ui) {
+            if (ui.kind === 'uiStatus') {
               const state: ConnState =
-                obj.state === 'connected'
-                  ? 'connected'
-                  : obj.state === 'connecting' || obj.state === 'reconnecting'
-                    ? 'connecting'
-                    : obj.state === 'disconnected'
-                      ? 'connecting' // 后端正在重连，不亮红灯
-                      : obj.state === 'idle'
-                        ? 'connecting' // 串口 idle 表示 WS 活着但车没接上
-                        : 'error'
-              this.cb.onStatus(state, obj.message ?? '')
-            } else if (obj.op === 'alert') {
-              // 固件回执异常（补发预算耗尽/无法结算等）：Response 帧本身走二进制
-              // 透传、store 自己解析，这里是后端独有的决策结论，弹 toast 提示
-              this.cb.onAlert?.({
-                level: obj.level,
-                cmd: obj.cmd,
-                name: obj.name,
-                text: obj.text,
-              })
-            } else if (obj.op === 'chart_suggest') {
-              // Python 脚本推荐的曲线配置：交给 store 弹建议条（桌面端左下角）
+                ui.state === 1 ? 'connected' : ui.state === 2 ? 'error' : 'connecting'
+              const message =
+                state === 'connected' ? '已连接 V5' : state === 'error' ? '连接失败' : '正在连接…'
+              this.cb.onStatus(state, message)
+            } else if (ui.kind === 'uiAlert') {
+              this.cb.onAlert?.({ cmd: ui.cmd })
+            } else {
               this.cb.onChartSuggest?.({
-                id: obj.id,
-                groups: obj.groups ?? [],
-                source: obj.source ?? '',
-                note: obj.note ?? '',
+                id: `ui-${++uiSuggestSeq}`,
+                groups: ui.groups,
+                source: ui.source,
+                note: ui.note,
               })
             }
-          } catch {
-            /* 非 JSON 文本忽略 */
+            return
           }
-        } else if (ev.data instanceof ArrayBuffer) {
-          this.cb.onData(new Uint8Array(ev.data))
+          this.cb.onData(d)
         }
       }
     })

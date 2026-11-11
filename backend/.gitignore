@@ -1,5 +1,8 @@
 pytest/
 __pycache__/
 .venv/
-debug/
+# debug/ 默认忽略本机调试脚本；放行假固件数据源（演示模式要用）
+debug/*
+!debug/mock_v5.py
+!debug/mock_ws_source.py
 .idea/

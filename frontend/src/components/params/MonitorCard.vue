@@ -37,7 +37,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { tagFast, tagSubscribed, type CellValue } from '@/services/protocol'
+import { tagFast, tagSubscribed } from '@/services/protocol'
 import {
   formatValue,
   monitorLatest,
@@ -48,7 +48,7 @@ import {
 
 const item = selectedMonitorItem
 
-const liveValue = computed<CellValue>(() => {
+const liveValue = computed<any>(() => {
   const it = item.value
   if (!it) return ''
   return monitorLatest[it.index] ?? it.value
@@ -203,15 +203,31 @@ async function onUnsub(): Promise<void> {
   font-weight: 700;
   border-radius: var(--radius);
   cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s, transform 0.08s;
 }
 
+.sub-btn:active {
+  transform: translateY(1px);
+}
+
+/* 半透明骨架：常态同色相低透明度底 + 1px 同色相描边；hover 抬高不透明度 + 同色相微亮 + 柔光；
+   按下回落一档、光减弱、下移 1px。全程半透明，无实底、边框宽度不变 */
 .sub-btn--slow {
   color: var(--status-waiting);
   background: rgba(249, 199, 94, 0.12);
   border: 1px solid rgba(249, 199, 94, 0.5);
 }
 .sub-btn--slow:hover {
+  color: #ffe4ac;
   background: rgba(249, 199, 94, 0.24);
+  border-color: rgba(249, 199, 94, 0.8);
+  box-shadow: 0 0 18px rgba(249, 199, 94, 0.2);
+}
+.sub-btn--slow:active {
+  color: #ffdc9c;
+  background: rgba(249, 199, 94, 0.18);
+  border-color: rgba(249, 199, 94, 0.64);
+  box-shadow: 0 0 10px rgba(249, 199, 94, 0.09);
 }
 .sub-btn--fast {
   color: var(--accent);
@@ -219,7 +235,16 @@ async function onUnsub(): Promise<void> {
   border: 1px solid var(--accent-border);
 }
 .sub-btn--fast:hover {
+  color: #9cedff;
   background: rgba(79, 224, 255, 0.24);
+  border-color: rgba(79, 224, 255, 0.78);
+  box-shadow: 0 0 18px rgba(79, 224, 255, 0.2);
+}
+.sub-btn--fast:active {
+  color: #7ce6ff;
+  background: rgba(79, 224, 255, 0.18);
+  border-color: rgba(79, 224, 255, 0.62);
+  box-shadow: 0 0 10px rgba(79, 224, 255, 0.09);
 }
 .sub-btn--off {
   color: var(--status-danger);
@@ -227,6 +252,15 @@ async function onUnsub(): Promise<void> {
   border: 1px solid var(--danger-border);
 }
 .sub-btn--off:hover {
-  background: rgba(255, 83, 61, 0.24);
+  color: #ff8a79;
+  background: rgba(255, 83, 61, 0.26);
+  border-color: rgba(255, 111, 90, 0.8);
+  box-shadow: 0 0 18px rgba(255, 83, 61, 0.2);
+}
+.sub-btn--off:active {
+  color: #ff7360;
+  background: rgba(255, 83, 61, 0.2);
+  border-color: rgba(255, 111, 90, 0.64);
+  box-shadow: 0 0 10px rgba(255, 83, 61, 0.09);
 }
 </style>

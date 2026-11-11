@@ -26,7 +26,13 @@
         placeholder="搜索名称 / 序号 / 类型…"
       />
 
-      <span class="count">共 {{ visibleRows.length }} 项</span>
+      <span
+        class="count"
+        :class="{ 'count--warn': dirView.warn }"
+        :title="dirView.warn ? '目录项数与下位机登记不一致，可点导航栏「刷新」重拉' : ''"
+      >
+        {{ dirView.text || `共 ${visibleRows.length} 项` }}
+      </span>
     </div>
 
     <div class="params__body">
@@ -120,9 +126,11 @@
 </template>
 
 <script setup lang="ts">
-import { ValueType, tagFast, tagSubscribed, typeName, type CellValue } from '@/services/protocol'
+import { computed } from 'vue'
+import { ValueType, tagFast, tagSubscribed, typeName } from '@/services/protocol'
 import {
   connected,
+  dirStatusView,
   formatValue,
   keyword,
   monitorLatest,
@@ -136,8 +144,13 @@ import {
   visibleRows,
 } from '@/stores/globle'
 
+/** 当前表对应的目录完整性（调参表→tunable，实参表→monitor） */
+const dirView = computed(() =>
+  dirStatusView(paramTable.value === 'tunable' ? 'tunable' : 'monitor'),
+)
+
 /** 调参表没有实时推送，显示目录帧里带的初始值；实参表显示实时值 */
-function displayValue(index: number, fallback: CellValue): CellValue {
+function displayValue(index: number, fallback: any): any {
   return paramTable.value === 'monitor' ? (monitorLatest[index] ?? fallback) : fallback
 }
 
@@ -233,6 +246,12 @@ async function onUnsub(index: number): Promise<void> {
 .count {
   font-size: 12.5px;
   color: var(--text-muted);
+}
+
+/* 目录项数对不上：黄色轻提示（不是错误，不发光弹窗），只是让这行字被看见 */
+.count--warn {
+  color: var(--status-waiting);
+  text-shadow: 0 0 8px rgba(249, 199, 94, 0.35);
 }
 
 .params__body {
@@ -429,8 +448,15 @@ async function onUnsub(index: number): Promise<void> {
   font-weight: 700;
   border-radius: var(--radius);
   cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s, transform 0.08s;
 }
 
+.sub-btn:active {
+  transform: translateY(1px);
+}
+
+/* 半透明骨架：常态同色相 12%/14% 底 + 1px 同色相描边；hover 抬高不透明度 + 同色相微亮 + 柔光；
+   按下回落一档、光减弱、下移 1px。全程半透明，无实底、边框宽度不变 */
 .sub-btn--slow {
   color: var(--status-waiting);
   background: rgba(249, 199, 94, 0.12);
@@ -439,7 +465,17 @@ async function onUnsub(index: number): Promise<void> {
 }
 
 .sub-btn--slow:hover {
+  color: #ffe4ac;
   background: rgba(249, 199, 94, 0.24);
+  border-color: rgba(249, 199, 94, 0.8);
+  box-shadow: 0 0 18px rgba(249, 199, 94, 0.2);
+}
+
+.sub-btn--slow:active {
+  color: #ffdc9c;
+  background: rgba(249, 199, 94, 0.18);
+  border-color: rgba(249, 199, 94, 0.64);
+  box-shadow: 0 0 10px rgba(249, 199, 94, 0.09);
 }
 
 .sub-btn--fast {
@@ -450,7 +486,17 @@ async function onUnsub(index: number): Promise<void> {
 }
 
 .sub-btn--fast:hover {
+  color: #9cedff;
   background: rgba(79, 224, 255, 0.24);
+  border-color: rgba(79, 224, 255, 0.78);
+  box-shadow: 0 0 18px rgba(79, 224, 255, 0.2);
+}
+
+.sub-btn--fast:active {
+  color: #7ce6ff;
+  background: rgba(79, 224, 255, 0.18);
+  border-color: rgba(79, 224, 255, 0.62);
+  box-shadow: 0 0 10px rgba(79, 224, 255, 0.09);
 }
 
 .sub-btn--off {
@@ -461,7 +507,17 @@ async function onUnsub(index: number): Promise<void> {
 }
 
 .sub-btn--off:hover {
-  background: rgba(255, 83, 61, 0.24);
+  color: #ff8a79;
+  background: rgba(255, 83, 61, 0.26);
+  border-color: rgba(255, 111, 90, 0.8);
+  box-shadow: 0 0 18px rgba(255, 83, 61, 0.2);
+}
+
+.sub-btn--off:active {
+  color: #ff7360;
+  background: rgba(255, 83, 61, 0.2);
+  border-color: rgba(255, 111, 90, 0.64);
+  box-shadow: 0 0 10px rgba(255, 83, 61, 0.09);
 }
 
 .swatch {

@@ -65,9 +65,9 @@ def main():
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("cal_wheel_r_%s" % args.tag)   # 行驶段原始波形
         os.makedirs(out_dir, exist_ok=True)
-        missing = [n for n in want if n not in bl.mon_dir]
+        missing = [n for n in want if n not in bl.monitor_table]
         if missing:
-            sys.exit("监控表缺项: %s\n已有: %s" % (missing, sorted(bl.mon_dir)))
+            sys.exit("监控表缺项: %s\n已有: %s" % (missing, sorted(bl.monitor_table)))
 
         bl.clear_subs()
         bl.sub(want)
@@ -102,8 +102,7 @@ def main():
         bl.sleep(0.3)
         bl.end_log()
         seg = os.path.join(out_dir, "run")
-        bl.print_log(seg + ".csv")
-        bl.print_log(seg + ".png")
+        bl.print_log(seg, plot=True)
         bl.stop_move()
         bl.sleep(SETTLE_S)
 

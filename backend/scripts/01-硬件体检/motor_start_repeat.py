@@ -66,10 +66,10 @@ def main():
     with BackendLink(args.base) as bl:
         out_dir = bl.out_path("motor_start_repeat_%s" % args.tag)   # 每档一段原始 CSV
         os.makedirs(out_dir, exist_ok=True)
-        print("监控表共 %d 项" % len(bl.mon_dir))
+        print("监控表共 %d 项" % len(bl.monitor_table))
         alias = {m: motor_names(m) for m in motors if m[:1] in "LR" and m[1:].isdigit()}
         missing = ["%s:%s" % (m, k) for m in motors for k in ("rpm", "vact", "cur")
-                   if m not in alias or alias[m][k] not in bl.mon_dir]
+                   if m not in alias or alias[m][k] not in bl.monitor_table]
         if missing:
             print("监控项映射不完整：%s" % missing)
             sys.exit(1)
@@ -115,8 +115,7 @@ def main():
                     bl.sleep(args.hold)
                     bl.end_log()
                     seg = os.path.join(out_dir, "%s_t%d_v%.2f" % (motor, trial, v))
-                    bl.print_log(seg + ".csv")
-                    bl.print_log(seg + ".png")
+                    bl.print_log(seg, plot=True)
                     st = seg_stats(seg + ".csv", [names["rpm"], names["vact"]],
                                    thresholds=[1.0, 3.0])
                     st_r = st[names["rpm"]]

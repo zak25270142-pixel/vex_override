@@ -4,7 +4,6 @@
  */
 
 import {
-  FRAME_HEAD,
   CmdGet,
   CmdPost,
   MONITOR_TAG_FAST,
@@ -15,12 +14,38 @@ import {
   CMD_TAG_ARGC_SHIFT,
   CMD_TAG_RANGE,
   RESP_OK,
+  RESP_OK_INFO,
+  RESP_MODE_MASK,
   RESP_REJECT_INDEX_RANGE,
-  buildResponse,
+  buildFrame,
   tagFast,
   tagSubscribed,
 } from './protocol'
+import { loadPrefs } from './persist'
 import type { SerialTransport, TransportCallbacks } from './transport'
+
+/** 组一帧 Response（本演示源自造回执；真机由固件 send_responses 直接拼帧）。
+    帧 [L][原话cmd][status][附加段][原话payload]：0x00 无附加段；
+    0x80（OK+info）/ 内定err类 = [len][data]，串类 = 裸串且低 6 位就是串长 */
+function buildResponse(
+  echoCmd: number,
+  echoPayload: number[] = [],
+  status: number = RESP_OK,
+  info: Uint8Array | number[] = [],
+): Uint8Array {
+  const data = Array.from(info)
+  let body: number[]
+  if (status === RESP_OK) {
+    body = [echoCmd & 0xff, RESP_OK]
+  } else if (status === RESP_OK_INFO || (status & RESP_MODE_MASK) !== 0) {
+    body = [echoCmd & 0xff, status & 0xff, data.length & 0xff, ...data]
+  } else {
+    const str = data.slice(0, 0x3f)
+    body = [echoCmd & 0xff, (status & 0xc0) | str.length, ...str]
+  }
+  body.push(...echoPayload)
+  return buildFrame(CmdPost.Response, [body.length & 0xff, ...body])
+}
 
 interface MockItem {
   type: ValueType
@@ -188,7 +213,7 @@ const CMD_USER_MAX = 0x9f
 /** 通用封帧（响应帧的命令字不是 CmdGet，所以不能直接用 protocol.buildFrame） */
 function frame(cmd: number, payload: number[]): Uint8Array {
   const out = new Uint8Array(payload.length + 3)
-  out[0] = FRAME_HEAD
+  out[0] = loadPrefs().frameHead
   out[1] = cmd
   let xor = cmd
   payload.forEach((b, i) => {
@@ -259,10 +284,11 @@ export class MockTransport implements SerialTransport {
 
   /** 模拟下位机收到下发命令 */
   async send(data: Uint8Array): Promise<void> {
-    if (data.length < 2 || data[0] !== FRAME_HEAD) return
+    if (data.length < 2 || data[0] !== loadPrefs().frameHead) return
     const cmd = data[1]
-    // 与真机一致的回执语义：目录请求在 burst 发完后回 OK+总项数；Subscribe/调参/动作命令立即回。
-    // 拒绝用内定err（0xC0|n）：1=下标超表 2=类型不可写——演示源照实模拟
+    // 与真机一致的回执语义：目录请求收到即回（整表 0x80+表项数 / 局部 0x00），
+    // burst 发完再回一帧无回显的传完通知；Subscribe/调参/动作命令立即回。
+    // 拒绝用内定err（0xC0|n）：1=下标超表 2=忙 3=命令字未注册——演示源照实模拟
     const respond = (echoPayload: number[], status = RESP_OK) =>
       this.emit(buildResponse(cmd, echoPayload, status))
     /** 目录请求 [len][index...]：len=0 全量，非0=补发指定下标；越界返回 null（整帧拒绝） */
@@ -275,27 +301,32 @@ export class MockTransport implements SerialTransport {
       if (indices.some((i) => i >= total)) return null
       return { indices, echo: Array.from(data.subarray(2, data.length - 1)) }
     }
-    /** 目录传完：OK + 1B 表内总项数（与真机 enqueue_response_count 同语义，后端据此对照补发） */
+    /** 收到即回：整表 0x80 + 1B 表项数，局部 0x00 */
     const respondDir = (echo: number[], count: number) =>
-      this.emit(buildResponse(cmd, echo, RESP_OK, [count & 0xff]))
+      this.emit(buildResponse(cmd, echo, echo[0] === 0 ? RESP_OK_INFO : RESP_OK,
+        echo[0] === 0 ? [count & 0xff] : []))
+    /** burst 发完：仅 OK、无回显的传完通知，触发上位机完整性对照 */
+    const respondDirDone = () => this.emit(buildResponse(cmd, [], RESP_OK))
     const rejectDir = () => respond(Array.from(data.subarray(2, data.length - 1)), RESP_REJECT_INDEX_RANGE)
     if (cmd === CmdGet.RequestTunable) {
       const req = parseDirReq(tunableItems.length)
       if (!req) return rejectDir()
+      respondDir(req.echo, tunableItems.length)
       directoryFrames(
         CmdPost.TunableDirectory,
         req.indices.map((i) => [i, tunableItems[i]!] as [number, MockItem]),
       ).forEach((f) => this.emit(f))
-      respondDir(req.echo, tunableItems.length)
+      respondDirDone()
     } else if (cmd === CmdGet.RequestMonitor) {
       const req = parseDirReq(monitorItems.length)
       if (!req) return rejectDir()
+      respondDir(req.echo, monitorItems.length)
       directoryFrames(
         CmdPost.MonitorDirectory,
         req.indices.map((i) => [i, monitorItems[i]!] as [number, MockItem]),
       ).forEach((f) => this.emit(f))
       this.startTimers()
-      respondDir(req.echo, monitorItems.length)
+      respondDirDone()
     } else if (cmd === CmdGet.Subscribe) {
       // [index][tag]，与真机 merge_subscribe_tag 同语义：
       // 只合并上位机的 SUB/FAST 两位，GETTER/KIND 等本机位保留；bit7=0 即退订；index=0xFF 全部生效

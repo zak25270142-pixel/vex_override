@@ -24,7 +24,7 @@ void LiftBar::init()
     setStopping(vex::brakeType::brake); // 全生命期设定；本类不设 coast
     MotorGroup::stop();
     state = Stoped;
-    position = static_cast<float>(motors[0].motor->position(vex::rotationUnits::raw));
+    position = motors[0].motor->position(vex::rotationUnits::raw);
     pos_target = position;
     pos_need_reset = true;
 }
@@ -32,7 +32,7 @@ void LiftBar::init()
 void LiftBar::lift_tick(uint32_t dt_us, float dt_s)
 {
     // 位置只在此处读一次；速度由基类 refresh 读。各读各的量，不重复取编码器。
-    position = static_cast<float>(motors[0].motor->position(vex::rotationUnits::raw));
+    position = motors[0].motor->position(vex::rotationUnits::raw);
 
     // Stoped：只刷数据、不下发。开环写下的电压因此能一直保持；断电态也不必
     // 每拍重申 0V（0V 由 stop() 那一次表达）。同底盘 speed_tick 的 Stopped 早退。

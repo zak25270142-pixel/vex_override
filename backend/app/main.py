@@ -1,12 +1,15 @@
 r"""
 FastAPI 入口：
-  - WebSocket /ws      与 Vue3 上位机通信（串口字节二进制透传 + 状态 JSON）
+  - WebSocket /ws      与 Vue3 上位机通信（下位机字节透传 + 上位机内部段 0xE0~0xEF）
   - HTTP   /api/*      脚本友好接口（停车/目录/订阅/命令/日志）
+  - WS 设备链路        由 TransportBridge 自己监听 V5_WS_PORT（默认 8889），
+                       与上面的 HTTP/前端通道分开；debug/mock_ws_source.py 接这里
 
 两条通道的分工要分清：
   · 下位机的原始字节只走 WS 二进制帧，前端 FrameParser 自己拆
-    （因此前端代码跟"直连串口"时代完全一致，零改动）
-  · Backend 自己的状态（连接/掉线）走 WS 的 JSON 文本帧，op="status"
+    （0xE0~0xEF 段在传输层先截下来，不进 FrameParser）
+  · Backend 自己的结论走 WS 二进制帧的上位机内部段 0xE0~0xEF
+    （E0 连接状态 / E1 giveup / E2 曲线建议），不下发主控
   · /api/* 是 HTTP，只给 Python 脚本用，前端不调
 
 启动（先建虚拟环境并用它跑，见 README）：
@@ -25,15 +28,8 @@ from fastapi.middleware.cors import CORSMiddleware # CORS 中间件（允许跨�
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field 
 
-from .dataclass import (
-    CalcResult,
-    ChartSuggestResult,
-    ConnectResult,
-    LeaseResult,
-    OkResult,
-    ValueSnapshot,
-)
-from .hub import SCRIPT_LEASE_TTL_S, Hub
+from .hub import Hub
+from .transport_bridge import TransportBridge
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,34 +41,31 @@ logger = logging.getLogger("vex.main")
 V5_PORT = os.environ.get("V5_PORT")  # 例如 COM3 / /dev/ttyACM0；不设则 Ping 探测
 V5_BAUD = int(os.environ.get("V5_BAUD", "115200"))  # CDC 虚拟口，波特率仅占位（USB 全速跑）
 AUTO_CONNECT = os.environ.get("V5_AUTO_CONNECT", "1") not in ("0", "false", "False")
-# 传输通道：serial=USB 直连（默认），udp=WiFi 下位机（Hi3861 等，对端自动发现）。
-# 两者互斥——现阶段只连一个 client，不支持多设备并存。
-V5_TRANSPORT = os.environ.get("V5_TRANSPORT", "serial").lower()  # serial | udp
+# 传输链路固定为“三探测”：串口 + WiFi(UDP) + WS 同时探测，谁先完成 Ping/Pong
+# 握手就用谁（纯先到先得）。两端都在线时结果可预测地偏向串口（串口探测快得多），
+# 刻意接受；选中者失联则回到三探测，其余链路可接管，不需要重启后端。
+# 没有 mode 开关：真车与调试假设备走同一套选路，区别只在于有没有进程去连 WS 端口。
+# 单 client 约束不变：任意时刻只有【选中者】的字节喂给 Hub，Hub 状态仍是单份。
 UDP_BIND_HOST = os.environ.get("V5_UDP_HOST", "0.0.0.0")
 UDP_BIND_PORT = int(os.environ.get("V5_UDP_PORT", "8888"))
-# 演示模式：没有真车/真固件时，用 mock_v5.MockV5Bridge 顶替串口后面的那台 V5。
-# 小程序/网页连 WS 的行为与真机完全一致（目录 burst、100Hz 推送、回执、心跳），
-# 区别只在数据是本地模拟的
-V5_MOCK = os.environ.get("V5_MOCK", "0") in ("1", "true", "True")
+# WS 链路由 bridge 自己监听，端口要避开 8000（后端 HTTP + 前端 /ws）和 8888
+WS_BIND_HOST = os.environ.get("V5_WS_HOST", "0.0.0.0")
+WS_BIND_PORT = int(os.environ.get("V5_WS_PORT", "8889"))
 
 # hub 是模块级单例：整个进程只有一个，所有路由共享同一份目录缓存和下行队列。
 # 这也是"串口独占"的落点——别在别处再 new 一个 Hub。
 
-_bridge_factory = None
-if V5_MOCK:
-    from .mock_v5 import MockV5Bridge
 
-    _bridge_factory = MockV5Bridge
-elif V5_TRANSPORT == "udp":
-    from .udp_bridge import UdpBridge
+def _bridge_factory(**kw):
+    """Hub 统一传 port/baud/on_*；这里补 UDP / WS 监听地址。"""
+    return TransportBridge(
+        bind_host=UDP_BIND_HOST,
+        bind_port=UDP_BIND_PORT,
+        ws_host=WS_BIND_HOST,
+        ws_port=WS_BIND_PORT,
+        **kw,
+    )
 
-    def _udp_factory(**kw):
-        """Hub 统一传 port/baud，UDP 用不上，剥掉后按监听地址构造。"""
-        kw.pop("port", None)
-        kw.pop("baud", None)
-        return UdpBridge(bind_host=UDP_BIND_HOST, bind_port=UDP_BIND_PORT, **kw)
-
-    _bridge_factory = _udp_factory
 
 hub = Hub(port=V5_PORT, baud=V5_BAUD, bridge_factory=_bridge_factory)
 
@@ -88,12 +81,16 @@ async def lifespan(app: FastAPI):
     # 投回这个循环里执行（线程里不能 await）。必须在 start() 之前注入，
     # 否则首批串口事件推不出去。
     hub.set_loop(asyncio_get_loop())
+    transport_label = "serial + udp@%s:%d + ws@%s:%d" % (
+        UDP_BIND_HOST, UDP_BIND_PORT, WS_BIND_HOST, WS_BIND_PORT,
+    )
+    # 字段名写全成 auto_connect：以前那个 auto= 跟 transport 撞名，
+    # 曾被误读成"transport 自动切换"，其实它只是 V5_AUTO_CONNECT。
     logger.info(
-        "启动 Hub, transport=%s port=%s auto=%s mock=%s",
-        "udp@%s:%d" % (UDP_BIND_HOST, UDP_BIND_PORT) if V5_TRANSPORT == "udp" else "serial",
+        "启动 Hub, transport=%s port=%s auto_connect=%s",
+        transport_label,
         V5_PORT or "自动探测",
         AUTO_CONNECT,
-        V5_MOCK,
     )
     hub.start(auto_connect=AUTO_CONNECT)
     try:
@@ -129,6 +126,7 @@ _GUARDED_WRITE_PATHS = frozenset({
     "/api/sub",                # 改订阅意图 + 登记记录
     "/api/sub/clear_script",
     "/api/cmd",                # 下发动作命令
+    "/api/key",                # 下发虚拟按键事件（和动作命令一样会改变设备行为）
     "/api/tunable",            # 写调参项
     "/api/log/start",          # 开/收段（缓冲属于持有者）
     "/api/log/end",
@@ -157,13 +155,18 @@ async def script_exclusive(request: Request, call_next):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
-    """WS 端点：把连接整体托管给 hub.attach_ui（收字节透传/发状态 JSON 都在里面）。
+    """WS 端点：把连接整体托管给 hub.attach_ui（收协议帧透传 + 发 E0 状态帧）。
 
     ws: 已建立的 WebSocket 连接
     一个连接 = 一个 WS 客户端，Hub 内部用 id(ws) 区分订阅来源，
     所以开多个页面时各自的订阅不会互相覆盖。本函数在连接关闭前一直不返回。
     """
     await hub.attach_ui(ws)
+
+
+# WS 设备链路不在这里：TransportBridge 自己监听 V5_WS_PORT（默认 8889），
+# 不依赖 FastAPI app 生命周期，也不和 /ws 前端通道共用端口。
+
 
 
 # ---------- HTTP 脚本 API ----------
@@ -174,12 +177,9 @@ class SubBody(BaseModel):
     # index_or_name 用 Any：HTTP 传进来的可能是 5 / "5" / "左0转速" 三种形态，
     # 具体分发在 hub.resolve_monitor 里用 isinstance 做
     index_or_name: Any
-    # 字段名兼容：对外文档写 type，但 Python 里 type 是内置名，故别名到 kind
-    kind: str = Field(default="both", alias="type")  # push | log | both
+    kind: str = "both"         # push | log | both
     on: bool = True            # False = 退订 / 取消登记
     fast: bool | None = None   # None 时跟随 on（订阅即高速，退订即关）
-
-    model_config = {"populate_by_name": True}  # 允许请求体里写 kind 或 type 都行
 
 
 class ChartSuggestBody(BaseModel):
@@ -206,28 +206,36 @@ class TunableBody(BaseModel):
     value: Any
 
 
+class KeyBody(BaseModel):
+    """/api/key 请求体：给按键目录里的一项发一条虚拟按键事件。"""
+    index_or_name: Any
+    state: int  # 1=按下 0=抬起
+
+
 class ScriptClaimBody(BaseModel):
     """/api/script/claim 与 /api/script/release 请求体：认领/归还脚本写权。"""
     token: str            # 脚本进程唯一标识（BackendLink 自动生成 uuid）
-    steal: bool = False   # 别人占着时是否抢占（release 不看这个字段）
-    ttl_s: float = Field(default=SCRIPT_LEASE_TTL_S, gt=0)  # 租约时长，release 不看
 
 
 class PrintLogBody(BaseModel):
-    """/api/log/print 请求体：导出路径 + 要导出的项。
+    """/api/log/print 请求体：导出基名 + 要导出的项 + 产物开关。
 
-    path：None=默认落后端 pytest/probe_data/log_<时间戳>.json；后缀决定格式
-          （json / csv / png / jpg / pdf / svg）。
+    path：None=默认落后端 pytest/probe_data/log_<时间戳>（基名，不带后缀）。
+          产物按 <基名>.csv / <基名>.meta.json / <基名>.png 派生。
     names：只导出这几项（中文名或 index，可混）；None=全部已登记项。
           记录缓冲 end_log 后仍在（下次 start_log 才清），可换组合反复导出。
+    csv/meta/plot：默认只出 csv；meta 是 csv 的语义快照，必须跟 csv 一起。
     """
     path: str | None = None
     names: list[Any] | None = None
+    csv: bool = True
+    meta: bool = False
+    plot: bool = False
 
 
 @app.get("/api/status")
 def api_status():
-    """后端全貌快照：连接状态、三张表项数、记录状态、端口列表（调试连不上的第一站）。"""
+    """后端全貌快照：连接状态、目录表项数、记录状态、端口列表（调试连不上的第一站）。"""
     return hub.snapshot()
 
 
@@ -235,7 +243,7 @@ def api_status():
 def api_connect():
     """前端连接/重连按钮入口：标记想连并异步触发探测，立即返回当前快照。
 
-    返回: ConnectResult(ok, snapshot)
+    返回: {"snapshot": {...}}
     探测本身有阻塞（逐口开/关，每口 ≤120ms），不等结果——进度靠 WS 状态消息感知；置意愿后掉线会自动重连。
     """
     # 前端连接/重连按钮入口：标记想连并立即尝试。
@@ -243,30 +251,31 @@ def api_connect():
     # 前端看 WS 状态消息（connecting/connected/disconnected）感知进度。
     # 注意这是"意愿开关"：置 _want_connected=True 后，之后每次掉线都会自动重连。
     hub.ensure_connected()
-    return ConnectResult(ok=True, snapshot=hub.snapshot())
+    return {"snapshot": hub.snapshot()}
 
 
 @app.post("/api/disconnect")
 def api_disconnect():
-    """用户主动断开：先关自动重连意愿，再关串口（顺序反了会被立刻重连回去）。"""
+    """用户主动断开：先关自动重连意愿，再断开当前链路（顺序反了会被立刻重连回去）。"""
     # 先关意愿再断：顺序反了的话，断线回调看到 _want_connected 还是 True，
     # 会立刻触发自动重连，等于断开失败
     hub.set_want_connected(False)
     hub.bridge.disconnect()
-    return OkResult()
+    return {}
 
 
 @app.post("/api/dirs/refresh")
 def api_dirs_refresh():
-    """清空目录缓存并重新向 V5 拉三张表（表结构变更或怀疑缓存过期时用）。"""
-    return hub.refresh_directories()
+    """清空目录缓存并重新向 V5 拉四张表（表结构变更或怀疑缓存过期时用）。"""
+    hub.refresh_tables()
+    return {}
 
 
 @app.post("/api/sub/clear_script")
 def api_clear_script_subs():
     """脚本结束时调用：去掉 script 侧订阅意图，不影响各 UI 客户端。"""
     hub.clear_script_intents()
-    return OkResult()
+    return {}
 
 
 @app.get("/api/ports")
@@ -275,15 +284,24 @@ def api_ports():
     return hub.bridge.list_ports()
 
 
-@app.get("/api/column")
-def api_column(type: str = "monitor"):
-    """拉一张目录整表。
+@app.get("/api/dirs")
+def api_dirs():
+    """四张目录表的完整性状态（expected / received / complete）。
 
-    type: monitor(实参表) | tunable(调参表) | cmd(命令表)，默认 monitor
-    返回: 该项列表；type 不认识 → 400
+    返回: {tunable|monitor|cmd|key: {expected, received, complete}}；complete 在 expected 未知时为 False
+    """
+    return hub.table_status()
+
+
+@app.get("/api/column")
+def api_column(table_kind: str = Query("monitor", alias="type")):
+    """拉一张整表。
+
+    table_kind: monitor(实参表) | tunable(调参表) | cmd(命令表) | key(按键表)，默认 monitor
+    返回: 列表，位置 i 对应 index=base+i（cmd 的 base=0x80）；缺项放 null；未知 type → 400
     """
     try:
-        return hub.get_column(type)
+        return hub.get_column(table_kind)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -293,7 +311,7 @@ def api_sub(body: SubBody):
     """订阅/退订一个监控项。
 
     body: SubBody（index_or_name + kind=push/log/both + on + fast）
-    返回: SubResult；index_or_name 不存在 → 404
+    返回: {index, name, push, log}；index_or_name 不存在 → 404
     """
     try:
         return hub.sub(body.index_or_name, body.kind, on=body.on, fast=body.fast)
@@ -302,11 +320,11 @@ def api_sub(body: SubBody):
 
 
 @app.post("/api/chart/suggest")
-def api_chart_suggest(body: ChartSuggestBody) -> ChartSuggestResult:
+def api_chart_suggest(body: ChartSuggestBody) -> dict:
     """脚本推荐一套曲线配置：广播给所有上位机，桌面端左下角弹条（5s 内可应用/忽略）。
 
     body: ChartSuggestBody（groups + note + source）
-    返回: ChartSuggestResult（回显解析后的 index，便于脚本自检有没有订错槽）
+    返回: {"id": 建议号}
     越界 → 400；名字不在监控目录 → 404
 
     不纳入脚本写权互斥：它不改车的行为，只是给操作者递个建议；纯分析脚本（不 claim
@@ -322,9 +340,11 @@ def api_chart_suggest(body: ChartSuggestBody) -> ChartSuggestResult:
 
 @app.post("/api/stop")
 def api_stop():
-    """紧急停车：最高优先级发停车帧 + 清脚本队列 + 置 abort（立即返回，不等串口）。"""
-    # 停车不等串口：先入队（PRI_STOP），串口一接上立刻发出去。
-    # 即便此刻断线，停车帧也会反复重试直到发出——不会静默丢失。
+    """紧急停车：清脚本队列 + 置 abort + 最高优先级发停车帧，入队即返回。
+
+    断线时动作帧在入队处就被丢弃，本次只置本地 abort；断线后固件自己会停机，
+    队列里的旧帧一律不重发。
+    """
     return hub.emergency_stop()
 
 
@@ -332,7 +352,7 @@ def api_stop():
 def api_abort_clear():
     """清掉中止旗标：停车后要再跑脚本前必须调，否则 cmd() 直接报 409。"""
     hub.clear_abort()
-    return OkResult()
+    return {}
 
 
 @app.post("/api/script/claim")
@@ -343,22 +363,21 @@ def api_script_claim(body: ScriptClaimBody):
     刚吃到的停车解掉（后者以为自己被停了，实际又开始发命令）。所以与其修 clear_abort，
     不如先把第二个脚本挡在门外——这里就是那道门。
 
-    租约到期自动释放（SCRIPT_LEASE_TTL_S 秒没动静），所以脚本崩了别人也能接管。
-    返回: LeaseResult；被别人占着 → 409（held_age_s 是对方已持有的秒数）
+    写权归先占者，直到它自己 release，或被停车中止时释放。
+    返回: {}；被别人占着 → 409
     """
-    r = hub.claim_script(body.token, body.steal, body.ttl_s)
-    if not r.ok:
-        raise HTTPException(
-            409, f"已有脚本持有写权（{r.held_age_s:.0f}s 前领取，token={body.token} 不是它）。"
-                 f"确认对方已退出后重跑，或 steal=true 抢占（抢占会给对方置 abort）")
-    return r
+    try:
+        hub.claim_script(body.token)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {}
 
 
 @app.post("/api/script/release")
 def api_script_release(body: ScriptClaimBody):
     """还写权（脚本收尾时调）。不是自己的就静默无事——这里不需要用报错提醒谁。"""
     hub.release_script(body.token)
-    return OkResult()
+    return {}
 
 
 @app.post("/api/cmd")
@@ -366,10 +385,11 @@ def api_cmd(body: CmdBody):
     """下发动作命令（脚本主力写接口）。
 
     body: CmdBody（index_or_name + args，参数个数须与命令目录一致）
-    返回: CmdResult；名字不存在 → 404；abort 中 → 409；参数个数/范围不符 → 400
+    返回: {}；名字不存在 → 404；abort 中 → 409；参数个数/范围不符 → 400
     """
     try:
-        return hub.cmd(body.index_or_name, *body.args)
+        hub.cmd(body.index_or_name, *body.args)
+        return {}
     except KeyError as e:
         raise HTTPException(404, str(e))
     except RuntimeError as e:
@@ -380,25 +400,55 @@ def api_cmd(body: CmdBody):
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/key")
+def api_key(body: KeyBody):
+    """虚拟按键：给按键目录里的一项发一条下行 0x05 事件。
+
+    body: KeyBody（index_or_name + state=1按下/0抬起）
+    返回: {}；按键不存在 → 404；state 非 0/1 → 400；abort 中 → 409
+    说明: state 是"期望电平"（1=按下/0=抬起），电平语义幂等；与 cmd 同等待遇登记回执，
+          固件不回 Response 时按 0.1s 超时原帧重发（重发不会产生新边沿）。
+    """
+    try:
+        hub.key_event(body.index_or_name, body.state)
+        return {}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+
+
 @app.post("/api/tunable")
 def api_tunable(body: TunableBody):
     """写一个调参项的值。
 
     body: TunableBody（index_or_name + value）
-    返回: SetTunableResult；名字不存在 → 404；abort 中 → 409
+    返回: {}；名字不存在 → 404；值类型不符 → 400；abort 中 → 409
     """
     try:
-        return hub.set_tunable_value(body.index_or_name, body.value)
+        hub.set_tunable_value(body.index_or_name, body.value)
+        return {}
     except KeyError as e:
         raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(409, str(e))
 
 
 @app.post("/api/log/start")
 def api_log_start():
-    """开始一段记录：清上一段缓冲并以此刻为本段零点，返回已登记项列表。"""
-    return hub.start_log()
+    """开始一段记录：清上一段缓冲并以此刻为本段零点。
+
+    返回: {}；一个已登记项都没有 → 400
+    """
+    try:
+        hub.start_log()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {}
 
 
 @app.post("/api/log/end")
@@ -409,12 +459,12 @@ def api_log_end():
 
 @app.post("/api/log/print")
 def api_log_print(body: PrintLogBody = PrintLogBody()):
-    """把本段记录导出到后端机器（格式由 path 后缀决定：json/csv/png/jpg/pdf/svg）。
+    """把本段记录导出到后端机器（产物由 csv/meta/plot 三个开关组合）。
 
-    body: PrintLogBody（path + names；names=None 导出全部已登记项）
-    返回: PrintLogResult(ok, path, format, samples, dropped, columns, missing)
+    body: PrintLogBody（path + names + 三个开关）
+    返回: {path, files, samples, dropped, columns, missing}
     """
-    return hub.print_log(body.path, body.names)
+    return hub.print_log(body.path, body.names, body.csv, body.meta, body.plot)
 
 
 class CalcBody(BaseModel):
@@ -425,17 +475,16 @@ class CalcBody(BaseModel):
     """
     expr: str
     agg: str = ""
-    window: list[float] | None = None
 
 
 @app.post("/api/log/calc")
-def api_log_calc(body: CalcBody) -> CalcResult:
+def api_log_calc(body: CalcBody) -> dict:
     """对本段记录做表达式计算并聚合成标量，如 "左0电流 - 左1电流" + agg="mean"。
 
     agg 只支持 mean/sum；要逐点序列或更复杂的统计，用 /api/log/print 导 csv 回读。
     """
     try:
-        return hub.calc(body.expr, body.agg, body.window)
+        return hub.calc(body.expr, body.agg)
     except KeyError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -448,8 +497,8 @@ def api_value(
     missing_ok: bool = False,
 ):
     """读当前值（看门狗用）：?index_or_name=x 单项；多个就重复传参一次取多项。
-    每项返回 index/name/value/unit/age_s/lag_ms。看门狗主判 lag_ms（落后最新
-    监控帧 >300ms 或 None 即旧，对传输延迟免疫）；age_s 是到达新近度，仅诊断。
+    每项返回 index/name/value/unit/lag_ms。看门狗主判 lag_ms（落后最新
+    监控帧 >300ms 或 None 即旧，对传输延迟免疫）。
     missing_ok=true 时跳过还没有数据的项，不整批 404（批量轮询用）。"""
     if not index_or_name:
         raise HTTPException(400, "用法：/api/value?index_or_name=x&index_or_name=y")
@@ -464,18 +513,20 @@ def api_values():
     """当前监控值快照（未订阅的项停推后保持最后收到的值）。
 
     ⚠️ 这里给的是"缓存里的最新值"，不保证新鲜——已经停推的项会一直留着旧值。
-    要判新鲜度请用 /api/value，它带 lag_ms（主判据）/age_s（诊断）。
+    要判新鲜度请用 /api/value，它带 lag_ms（主判据）。
     """
     out = []
-    # list() 快照：本路由在线程池里跑，rx 线程 100Hz 在往 monitor_latest 里写（R1）
-    for idx, s in list(hub.monitor_latest.items()):
-        entry = hub.monitor_dir.get(idx)
-        out.append(
-            ValueSnapshot(
-                index=idx,
-                name=entry.item.name if entry else str(idx),
-                value=s.value,
-                unit=entry.item.unit if entry else "",
-            )
-        )
+    # list() 快照：本路由在线程池里跑，rx 线程 100Hz 整体替换目录项的 value（R1）
+    for idx, c in list(hub.monitor_table.items()):
+        if c.item is None:
+            continue           # 目录还没到，没名字/单位可报
+        s = c.item.value
+        if s is None:          # 有目录项但还没收到过值
+            continue
+        out.append({
+            "index": idx,
+            "name": c.item.name,
+            "value": s.value,
+            "unit": c.item.unit,
+        })
     return out

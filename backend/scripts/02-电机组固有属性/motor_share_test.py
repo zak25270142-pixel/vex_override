@@ -71,9 +71,9 @@ def main() -> None:
             bl.sleep(args.hold)
             bl.end_log()
             seg = os.path.join(out_dir, "t%g" % tgt)
-            bl.print_log(seg + ".csv")
+            bl.print_log(seg)
             for tag, names in PNG_GROUPS:
-                bl.v.print_log("%s_%s.png" % (seg, tag), names)
+                bl.v.print_log("%s_%s" % (seg, tag), names, csv=False, plot=True)
             bl.spin_target(0.0, 0.0)
             bl.sleep(0.3)
             st = seg_stats(seg + ".csv", want)

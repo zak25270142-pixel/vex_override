@@ -88,7 +88,7 @@ def main() -> None:
             print(f"[warn] 速度环状态非 Stopped（左={st_l:g} 右={st_r:g}），"
                   f"0x84 会被每拍覆盖，结论不可信")
         names = {m: motor_names(m) for m in motors if m[:1] in "LR" and m[1:].isdigit()}
-        unknown = [m for m in motors if m not in names or names[m]["rpm"] not in bl.mon_dir]
+        unknown = [m for m in motors if m not in names or names[m]["rpm"] not in bl.monitor_table]
         if unknown:
             sys.exit("监控表里没有这些电机: %s" % unknown)
 
@@ -102,8 +102,7 @@ def main() -> None:
                 bl.sleep(args.hold)
                 bl.end_log()
                 seg = os.path.join(out_dir, "%s_%s_%.2f" % (motor, phase, v))
-                bl.print_log(seg + ".csv")
-                bl.print_log(seg + ".png")
+                bl.print_log(seg, plot=True)
                 st = seg_stats(seg + ".csv", list(ids.values()))
                 v_act, rpm, cur = (st[ids[k]] for k in ("vact", "rpm", "cur"))
                 rows.append({

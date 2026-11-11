@@ -97,7 +97,7 @@ struct MENU_ITEM
     // getter 只读项：固定 type_float；get 无参，返回 float；tag 自动加上 MENU_TAG_GETTER
     MENU_ITEM(const char *name, MenuFloatGetter get, const char *c,
               const char *u, uint8_t t)
-        : item_name(name), data_type(type_float), data_ptr(reinterpret_cast<void *>(get)), Chinese_name(c), unit(u), tag(static_cast<uint8_t>(t | MENU_TAG_GETTER))
+        : item_name(name), data_type(type_float), data_ptr(reinterpret_cast<void *>(get)), Chinese_name(c), unit(u), tag(t | MENU_TAG_GETTER)
     {
     }
     bool is_getter() const { return (tag & MENU_TAG_GETTER) != 0; }

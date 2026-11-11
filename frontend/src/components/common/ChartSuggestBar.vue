@@ -28,9 +28,9 @@
 </template>
 
 <script setup lang="ts">
-import type { ChartSuggestItem } from '@/services/transport'
 import {
   applyChartSuggestion,
+  monitorName,
   chartSuggestion,
   dismissChartSuggestion,
   SUGGEST_TTL_MS,
@@ -40,8 +40,8 @@ const sug = chartSuggestion
 const ttlS = SUGGEST_TTL_MS / 1000
 
 /** 空组在该通道上的含义是"清空"，直接写"清空"比留一片空白好懂 */
-function names(group: ChartSuggestItem[]): string {
-  return group.length ? group.map((it) => it.name).join(' · ') : '清空'
+function names(group: number[]): string {
+  return group.length ? group.map(monitorName).join(' · ') : '清空'
 }
 </script>
 

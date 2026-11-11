@@ -3,3 +3,6 @@ dist
 web
 *.local
 .DS_Store
+
+# 调试截图（Vite keymap/配色比对用，不入库）
+/*.png

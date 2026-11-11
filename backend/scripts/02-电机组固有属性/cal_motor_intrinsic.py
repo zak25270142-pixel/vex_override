@@ -151,13 +151,12 @@ def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float,
     bl.end_log()
     # 原始段一律落盘：它既是结论的底稿，也是段统计的数据源（stats 端点已删，
     # 统计在脚本侧从 csv 算）。raw_path 给了就用它，没给就按电压自动命名。
-    csv_path = raw_path or bl.out_path("cal_motor_v%g.csv" % volt_cmd)
-    bl.print_log(csv_path)                                     # 全量原始点 CSV
+    base = raw_path[:-4] if raw_path else bl.out_path("cal_motor_v%g" % volt_cmd)
+    bl.print_log(base)                                         # 全量原始点 CSV
     if raw_path:
-        base = raw_path[:-4]
         for tag, names in PNG_GROUPS:
-            bl.v.print_log("%s_%s.png" % (base, tag), names)       # 分组出图
-    st = seg_stats(csv_path, WANT)
+            bl.v.print_log("%s_%s" % (base, tag), names, csv=False, plot=True)
+    st = seg_stats(base + ".csv", WANT)
 
     def m(name: str) -> float:
         d = st.get(name) or {}

@@ -3,41 +3,37 @@
 export type ConnState = 'idle' | 'connecting' | 'connected' | 'error'
 
 /**
- * 后端 WS 推送的固件回执异常（文本 JSON，op="alert"）。
- * 只在"后端中转"模式下出现：直连串口时 Response 帧的意义由 store 自己解析
- * （见 globle.ts 的 response 分支），没有这层消息。level 与 toast 档位一致：
- *   reject 固件明确拒绝（命令没执行） / retry 帧没成正在自动重发 /
- *   giveup 重试预算耗尽或无法结算（命令状态不明，该查链路）
+ * 后端推来的 giveup 结论帧（E1）：只带命令字；
+ * 中文名与文案由前端按 cmd 查目录表生成。
  */
 export interface FwAlert {
-  level: 'reject' | 'retry' | 'giveup'
-  /** 回显的命令字（动作命令 0x80~0x9F 或内置命令字） */
   cmd: number
-  /** 命令中文名描述，如 动作命令「直行」 */
-  name: string
-  /** 结局说明，如 补发 3 次仍无固件确认，已放弃 */
-  text: string
 }
 
 /**
- * 后端 WS 推送的曲线配置建议（文本 JSON，op="chart_suggest"），来自 Python 脚本。
- * groups[ch] 是第 ch 个通道的追踪项；空组表示该通道清空。后端只中继不留存，
+ * 后端转发的脚本曲线配置建议（E2 帧）。groups[ch] 是监控项 index 列表，
+ * 空组表示该通道清空；名字前端按 index 查目录表。后端只中继不留存，
  * 所以页面刷新后收不到——建议的有效期就是弹出来那几秒。
  */
-export interface ChartSuggestItem {
-  /** 监控项 index（后端已把中文名解析成 index，目录重名也不会订错槽） */
-  index: number
-  name: string
-  unit: string
-}
 export interface ChartSuggestion {
   id: string
-  groups: ChartSuggestItem[][]
-  /** 来源标识（脚本 token），显示在建议条上便于溯源 */
+  groups: number[][]
   source: string
-  /** 脚本给的一句话说明 */
   note: string
 }
+
+/**
+ * 目录完整性：前端从透传的目录帧与 Response 自算，连上后端时从 HTTP GET /api/dirs 取初值。
+ * 键是四张目录表；expected 是下位机 Response 帧登记的总项数，null 表示还没收到过，
+ * 此时只能报已收数量，不能声称总数。
+ */
+export type DirTable = 'tunable' | 'monitor' | 'cmd' | 'key'
+export interface DirStat {
+  expected: number | null
+  received: number
+  complete: boolean
+}
+export type DirStats = Record<DirTable, DirStat>
 
 export interface TransportCallbacks {
   /** 连接状态变化（含人类可读的说明文本） */

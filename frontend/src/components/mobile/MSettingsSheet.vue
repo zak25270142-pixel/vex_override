@@ -41,9 +41,50 @@
 
     <div class="m-row-card">
       <div class="set-row">
+        <span>帧长上限</span>
+        <input
+          class="m-url"
+          type="number"
+          :min="MAX_PAYLOAD_MIN"
+          :max="MAX_PAYLOAD_CAP"
+          style="width: 110px"
+          :value="loadPrefs().maxPayload"
+          @change="onMaxPayload"
+        />
+      </div>
+      <div class="set-row">
+        <span>帧头字节</span>
+        <input
+          class="m-url"
+          type="number"
+          min="0"
+          max="255"
+          style="width: 110px"
+          :value="loadPrefs().frameHead"
+          @change="onFrameHead"
+        />
+      </div>
+      <p class="m-note">
+        换固件时与后端 config.json 的 frame_head / max_payload 对齐；帧长上限需 ≥ 后端值。
+        帧头填十进制（0xA5=165）；两项留空都恢复默认。
+      </p>
+    </div>
+
+    <div class="m-row-card">
+      <div class="set-row">
         <span>自动连接</span>
         <input type="checkbox" class="m-switch" :checked="autoConnect" @change="onAuto" />
       </div>
+    </div>
+
+    <div class="m-row-card">
+      <div class="set-row">
+        <span>电脑版页面</span>
+        <input type="checkbox" class="m-switch" :checked="desktopView" @change="onDesktopView" />
+      </div>
+      <p class="m-note">
+        开启后用桌面布局（适合接蓝牙键盘的平板录按键绑定），忽略屏幕宽度；关闭回到按宽度自动判断。
+      </p>
     </div>
 
     <div class="m-row-card">
@@ -82,13 +123,18 @@ import {
   batteryLevel,
   connected,
   connState,
+  desktopView,
   refreshAll,
   setAccessMode,
   setAutoConnect,
   setBackendUrl,
+  setDesktopView,
+  setFrameHeadPref,
+  setFramePayloadLimit,
   statusText,
   toggleConnect,
 } from '@/stores/globle'
+import { loadPrefs, MAX_PAYLOAD_CAP, MAX_PAYLOAD_MIN, FRAME_HEAD_DEFAULT } from '@/services/persist'
 import MBottomSheet from './MBottomSheet.vue'
 import BatteryBadge from '@/components/common/BatteryBadge.vue'
 import Segmented from '@/components/common/Segmented.vue'
@@ -128,8 +174,20 @@ async function onAccess(i: number): Promise<void> {
 function onBackendUrl(e: Event): void {
   setBackendUrl((e.target as HTMLInputElement).value)
 }
+function onMaxPayload(e: Event): void {
+  const raw = (e.target as HTMLInputElement).value.trim()
+  setFramePayloadLimit(raw === '' ? MAX_PAYLOAD_CAP : Number(raw))
+}
+function onFrameHead(e: Event): void {
+  const raw = (e.target as HTMLInputElement).value.trim()
+  setFrameHeadPref(raw === '' ? FRAME_HEAD_DEFAULT : Number(raw))
+}
 function onAuto(): void {
   setAutoConnect(!autoConnect.value)
+}
+/** 切「电脑版页面」：立即换外壳并落盘，刷新后仍生效 */
+function onDesktopView(): void {
+  setDesktopView(!desktopView.value)
 }
 /** 按当前接入方式连。以前这里在手机（无 Web Serial）上强制切演示，
  *  导致后端模式下点连接也会被拉去演示，后端只能靠自动连上 */

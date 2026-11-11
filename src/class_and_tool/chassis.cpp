@@ -73,11 +73,11 @@ void Chassis::update(uint32_t dt_us)
     // right_distance_change = new_right_distance - right_distance;
 
     // 读取惯性传感器角速度，用于pid控制，扣除零偏使静止时读数在0附近
-    angular_speed = static_cast<float>(inertial_sensor.gyroRate(vex::axisType::zaxis, vex::velocityUnits::dps));
+    angular_speed = inertial_sensor.gyroRate(vex::axisType::zaxis, vex::velocityUnits::dps);
     // - gyro_bias;
 
     // 读取惯性传感器航向，增量只从 IMU 原始读数差分
-    float new_imu_heading = static_cast<float>(inertial_sensor.rotation(vex::rotationUnits::deg));
+    float new_imu_heading = inertial_sensor.rotation(vex::rotationUnits::deg);
     // - gyro_bias * (now - heading_origin) / 1000000.0f;
     heading_change = new_imu_heading - imu_heading;
     imu_heading = new_imu_heading;
@@ -87,9 +87,9 @@ void Chassis::update(uint32_t dt_us)
     // 定位轮从此开始
     float tracking_wheel_c = 2.0f * math_pi * wheel_r; // 定位轮周长，单位 m。
     float new_forward_tracking_distance =              // 前向定位轮累计转数 * 定位轮周长 = 前向定位轮累计路程
-        static_cast<float>(forward_tracking_sensor.position(vex::rotationUnits::rev)) * tracking_wheel_c;
+        forward_tracking_sensor.position(vex::rotationUnits::rev) * tracking_wheel_c;
     float new_side_tracking_distance = // 侧向定位轮累计转数 * 定位轮周长 = 侧向定位轮累计路程
-        static_cast<float>(left_tracking_sensor.position(vex::rotationUnits::rev)) * tracking_wheel_c;
+        left_tracking_sensor.position(vex::rotationUnits::rev) * tracking_wheel_c;
 
     // 定位轮不在车体旋转中心时，原地转向也会带动定位轮滚动，减去这部分旋转造成的假平移
     local_forward_change = new_forward_tracking_distance - forward_tracking_distance +
@@ -176,7 +176,7 @@ void Chassis::output(float left_output, float right_output)
 void Chassis::speed_tick(uint32_t dt_us, float dt_s)
 {
     // 底盘同启同停：唤醒在 output()（两侧一起醒，含 0 目标侧）、休眠在 stop()（两侧一起睡），
-    // 两组 is_stopped 恒等，查一侧即可。睡着时整拍不下发——0V 也是一条指令，
+    // 两组 spin_state 恒等，查一侧即可。睡着时整拍不下发——0V 也是一条指令，
     // 会覆盖开环直写（扫压）与 stop() 留下的刹车；"停"的语义由 stop() 那一次
     // motor->stop()（按 setStopping 的刹车）表达，不需要每秒重复声明 100 次。
     // 睡着时也刷一次数据：now_v 等派生量只在 refresh 里更新，不刷则开环扫压看不到转速。
@@ -197,7 +197,7 @@ void Chassis::speed_tick(uint32_t dt_us, float dt_s)
     //    几十伏（error 大 × kp，I 反倒被抗饱和卡在 ±full_volt 的投影上）。超过余量的那部分
     //    物理上做不到，但两侧的比例仍是控制器的意图，所以这里按意图等比缩、不夹请求
     //    （往 output_raw 上夹 ±12 会让比例先失真）。待实车确认：若出现"单侧顶住 →
-    //    整车被拽偏"，说明虚构的 P 不该有话语权，那时再加夹幅。见 memory 2026-10-25。
+    //    整车被拽偏"，说明虚构的 P 不该有话语权，那时再加夹幅。
     // 缩放分母 full_volt ± volt_floor 恒为正：volt_floor 量级（偏置 + 垫底 + 最小电压）
     // 远小于 12；真要 ≥12 等价于满电压车也动不了，正常调参到不了，无需除零守卫。
     volt_scale = 1.0f;
@@ -206,13 +206,13 @@ void Chassis::speed_tick(uint32_t dt_us, float dt_s)
     {
         const float a = left_motors.output_raw;
         const float k = a > 0.0f ? a / (full_volt - left_motors.volt_floor)
-                                 : (a < 0.0f ? (-a) / (full_volt + left_motors.volt_floor) : 0.0f);
+            : (a < 0.0f ? (-a) / (full_volt + left_motors.volt_floor) : 0.0f);
         volt_scale = fmaxf(volt_scale, k);
     }
     {
         const float a = right_motors.output_raw;
         const float k = a > 0.0f ? a / (full_volt - right_motors.volt_floor)
-                                 : (a < 0.0f ? (-a) / (full_volt + right_motors.volt_floor) : 0.0f);
+            : (a < 0.0f ? (-a) / (full_volt + right_motors.volt_floor) : 0.0f);
         volt_scale = fmaxf(volt_scale, k);
     }
 

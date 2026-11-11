@@ -22,6 +22,8 @@
       <MChartPage v-else-if="tab === 'chart'" />
       <MFieldPage v-else-if="tab === 'field'" />
       <MVisionPage v-else-if="tab === 'vision'" />
+      <MConfigPage v-else-if="tab === 'config'" />
+      <MKeysPage v-else-if="tab === 'keys'" />
     </main>
 
     <!-- 任务下发表：作为布局子项挤入下半屏，把内容盒挤成上半屏（两者各自可滑动） -->
@@ -53,17 +55,21 @@ import MDataPage from './MDataPage.vue'
 import MChartPage from './MChartPage.vue'
 import MFieldPage from './MFieldPage.vue'
 import MVisionPage from './MVisionPage.vue'
+import MConfigPage from './MConfigPage.vue'
+import MKeysPage from './MKeysPage.vue'
 import MTaskSheet from './MTaskSheet.vue'
 import MSettingsSheet from './MSettingsSheet.vue'
 import MStopBar from './MStopBar.vue'
 import './mobile.css'
 
-type TabKey = 'data' | 'chart' | 'field' | 'vision' | 'task'
+type TabKey = 'data' | 'chart' | 'field' | 'vision' | 'config' | 'keys' | 'task'
 const tabs: { key: TabKey; label: string; icon: string }[] = [
   { key: 'data', label: '数据', icon: '📊' },
   { key: 'chart', label: '曲线', icon: '📈' },
   { key: 'field', label: '场地', icon: '🗺' },
   { key: 'vision', label: '视觉', icon: '👁' },
+  { key: 'config', label: '配置', icon: '⚙️' },
+  { key: 'keys', label: '按键', icon: '⌨️' },
   { key: 'task', label: '任务', icon: '🎯' },
 ]
 const tab = ref<TabKey>('data')

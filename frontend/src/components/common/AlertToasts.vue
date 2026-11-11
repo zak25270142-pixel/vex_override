@@ -1,6 +1,6 @@
 <template>
   <!-- 固件回执异常 toast：左下角堆叠、自动消失、点击关闭。
-       级别与后端 AlertLevel 对齐：reject 拒绝 / retry 补发中 / giveup 放弃 -->
+       三档均为前端本地分类：reject 拒绝 / retry 补发中 / giveup 放弃（后端只推 E1 giveup） -->
   <Teleport to="body">
     <!-- 曲线建议条同在左下角（更靠下，因为要操作），此时整体上移让位 -->
     <div v-if="uiAlerts.length" class="toasts" :class="{ 'toasts--raised': !!chartSuggestion }">

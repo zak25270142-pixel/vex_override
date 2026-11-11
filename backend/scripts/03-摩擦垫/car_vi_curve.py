@@ -207,8 +207,7 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
         data = sample(bl, args.hold, WANT, args.min_cycles, args.hold_cap)
         bl.end_log()
         seg = os.path.join(args.out_dir, "t%d_up_o%.4f" % (idx, o))
-        bl.print_log(seg + ".csv")
-        bl.print_log(seg + ".png")
+        bl.print_log(seg, plot=True)
         x = mean(data[X_NAME])
         if abs(x - x_ref) > args.fence_m:
             zero_all(bl)
@@ -258,8 +257,7 @@ def run_trial(bl, args, vmin, factor, idx, rows) -> dict:
             data = sample(bl, args.hold, WANT, args.min_cycles, args.hold_cap)
             bl.end_log()
             seg = os.path.join(args.out_dir, "t%d_down_o%.4f" % (idx, o))
-            bl.print_log(seg + ".csv")
-            bl.print_log(seg + ".png")
+            bl.print_log(seg, plot=True)
             x = mean(data[X_NAME])
             if abs(x - x_ref) > args.fence_m:
                 zero_all(bl)
@@ -347,7 +345,7 @@ def main() -> None:
     with BackendLink(args.base) as bl:
         args.out_dir = bl.out_path("cal_pads_%s" % args.tag)   # 每档一段原始 CSV
         os.makedirs(args.out_dir, exist_ok=True)
-        missing = [n for n in WANT if n not in bl.mon_dir]
+        missing = [n for n in WANT if n not in bl.monitor_table]
         if missing:
             sys.exit("监控表缺项: %s" % missing)
         bl.clear_subs()

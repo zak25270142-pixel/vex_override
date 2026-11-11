@@ -86,7 +86,7 @@ SIDE_CN = {"L": "左", "R": "右"}
 ALL_IDS = list(range(6))
 # 每组速度环 PID 六个调参项：验证模式清零。
 # 注意必须是目录里的中文名——目录帧发的是 Chinese_name（communication.cpp），
-# 固件内部的英文 item_name（L_kp 等）在 tun_dir 里查不到，会静默取默认值。
+# 固件内部的英文 item_name（L_kp 等）在 tunable_table 里查不到，会静默取默认值。
 PID_ITEMS = ("左kp", "左ki", "左kd", "右kp", "右ki", "右kd")
 
 
@@ -135,9 +135,9 @@ def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float,
     bl.start_log()
     bl.sleep(hold)
     bl.end_log()
-    csv_path = raw_path or bl.out_path("cal_kf_raw_v%g.csv" % volt_cmd)
-    bl.print_log(csv_path)
-    st = seg_stats(csv_path, WANT)
+    base = raw_path[:-4] if raw_path else bl.out_path("cal_kf_raw_v%g" % volt_cmd)
+    bl.print_log(base)
+    st = seg_stats(base + ".csv", WANT)
 
     def m(name: str):
         """整段均值。该项没数据/没样本时返回 None——绝不拿 0.0 冒充实测值。"""
@@ -175,7 +175,7 @@ def measure(bl: BackendLink, volt_cmd: float, settle: float, hold: float,
 
 def tun(bl: BackendLink, name: str, default: float = 0.0) -> float:
     """读当前调参值（目录缓存，不下位机）"""
-    item = bl.tun_dir.get(name)
+    item = bl.tunable_table.get(name)
     if item and item[1] is not None:
         try:
             return float(item[1])
@@ -359,10 +359,10 @@ def main() -> None:
             # ---------- 闭环验证：强制清零 kp/ki/kd ----------
             saved = {}
             for name in PID_ITEMS:
-                if name in bl.tun_dir:
-                    saved[name] = bl.tun_dir[name][1]
+                if name in bl.tunable_table:
+                    saved[name] = bl.tunable_table[name][1]
                     bl.set_tunable(name, 0.0)
-            bl.fetch_dirs()
+            bl.fetch_tables()
             got = {n: tun(bl, n, -1.0) for n in PID_ITEMS}
             bad = [n for n, v in got.items() if abs(v) > 1e-9]
             print(f"[pid] 已写 0 并读回确认：{got}")

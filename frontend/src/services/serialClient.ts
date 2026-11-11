@@ -5,7 +5,7 @@ import { ConnectError, WebSerialTransport } from './webSerialTransport'
 import { WsTransport } from './wsTransport'
 import { MockTransport } from './mockTransport'
 import { loadPrefs, savePrefs } from './persist'
-import { BAUD_CDC, FRAME_HEAD, ping } from './protocol'
+import { BAUD_CDC, ping } from './protocol'
 
 /** 接入方式：Web Serial 实机 / Python backend 中转 / 演示数据源 */
 export type AccessMode = 'serial' | 'backend' | 'demo'
@@ -30,7 +30,7 @@ const userPortProbe: PortProbe = {
   frame: ping(),
   ack: (bytes) => {
     for (let i = 0; i + 2 < bytes.length; i++) {
-      if (bytes[i] === FRAME_HEAD && bytes[i + 1] === 0xff && bytes[i + 2] === 0xff) return true
+      if (bytes[i] === loadPrefs().frameHead && bytes[i + 1] === 0xff && bytes[i + 2] === 0xff) return true
     }
     return false
   },

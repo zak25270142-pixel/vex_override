@@ -66,7 +66,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { type CellValue, ValueType, typeName, valueSize, type DirItem } from '@/services/protocol'
+import { ValueType, typeName, valueSize, type DirItem } from '@/services/protocol'
 import {
   connected,
   formatValueCompact,
@@ -107,7 +107,7 @@ function open(it: DirItem): void {
 
 async function save(): Promise<void> {
   if (!sel.value || !writable.value) return
-  let val: CellValue
+  let val: any
   if (isBool(sel.value.type)) val = draftCheck.value ? 1 : 0
   else if (sel.value.type === ValueType.Color) val = draftText.value
   else val = Number(draftText.value)

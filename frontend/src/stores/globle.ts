@@ -4,11 +4,14 @@
  */
 import { computed, reactive, ref, watch } from 'vue'
 import { serialClient, type AccessMode } from '@/services/serialClient'
-import { currentWsUrl, normalizeBackendUrl, shortBackendUrl } from '@/services/wsTransport'
+import { currentWsUrl, fetchDirStatus, normalizeBackendUrl, shortBackendUrl } from '@/services/wsTransport'
 import {
   loadPrefs,
   savePrefs,
   type Prefs,
+  FRAME_HEAD_DEFAULT,
+  MAX_PAYLOAD_CAP,
+  MAX_PAYLOAD_MIN,
   RIGHT_WIDTH_DEFAULT,
   RIGHT_WIDTH_MAX,
   RIGHT_WIDTH_MIN,
@@ -27,7 +30,9 @@ import {
   subscribe,
   setTunable,
   requestCommand,
+  requestKeyDir,
   commandSend,
+  buildFrame,
   ping,
   tagFast,
   tagKind,
@@ -35,16 +40,20 @@ import {
   formatFloat32,
   typeName,
   valueSize,
-  respIsReject,
-  respReasonText,
-  type CellValue,
+  RESP_CLASS_MASK,
+  RESP_OK_FAMILY_MASK,
+  RESP_OK_INFO,
+  RESP_MODE_MASK,
+  RESP_PAYLOAD_MASK,
+  RESP_ERR_NAMES_ZH,
   type DirItem,
   type CmdDirItem,
+  type KeyDirItem,
   type RxEvent,
   BAUD_CDC,
 } from '@/services/protocol'
 import { CHANNELS, FAST_PERIOD, PLOT_WINDOW_S, TRACE_BUF_CAP } from '@/config/workspace'
-import type { ChartSuggestion } from '@/services/transport'
+import type { ChartSuggestion, DirStats, DirTable } from '@/services/transport'
 import type { WorkView } from '@/config/workspace'
 
 /* ===== 连接 ===== */
@@ -66,6 +75,15 @@ export const statusText = ref(
 export const baud = BAUD_CDC
 /** 顶栏"自动连接"开关（持久化）：页面加载与断线后自动重连 */
 export const autoConnect = ref(loadPrefs().autoConnect)
+
+/* ===== 外壳 ===== */
+/** 强制电脑版页面（持久化）：手机/平板在设置里开启后忽略宽度与触控判断 */
+export const desktopView = ref(loadPrefs().desktopView)
+/** 切换「电脑版页面」：立即落盘；App.vue 的外壳判断随之重算 */
+export function setDesktopView(on: boolean): void {
+  desktopView.value = on
+  savePrefs({ desktopView: on })
+}
 
 /* ===== 分页 / 参数表切换 ===== */
 export const view = ref<WorkView>('params')
@@ -146,10 +164,10 @@ export function clearDiag(): void {
   parser.clearStats()
 }
 
-/* ===== 操作提示 toast：固件回执异常的即时提示（原来只进诊断日志，等于没人看） =====
-   两个来源，覆盖两种模式：
+/* ===== 操作提示 toast：固件回执异常的即时提示 =====
+   两个来源：
    ① Response 帧非 OK——store 自己解析（直连串口/后端模式都看得到这帧）；
-   ② 后端 op="alert"——补发预算耗尽/无法结算，前端等不到帧，只有后端知道。 */
+   ② E1 结论帧——补发预算耗尽/无法结算，只有后端知道，前端等不到透传帧。 */
 export interface UiAlert {
   id: number
   level: 'reject' | 'retry' | 'giveup'
@@ -182,6 +200,7 @@ const BUILTIN_CMD_NAMES: Record<number, string> = {
   [CmdGet.RequestTunable]: '请求调参目录',
   [CmdGet.RequestMonitor]: '请求监控目录',
   [CmdGet.RequestCommand]: '请求命令目录',
+  [CmdGet.RequestKeyDir]: '请求按键目录',
   [CmdGet.Subscribe]: '订阅监控项',
   [CmdGet.SetTunable]: '写调参项',
   [CmdGet.Ping]: '心跳',
@@ -222,6 +241,15 @@ async function sendFrame(frame: Uint8Array, label: string, quiet = false): Promi
   }
 }
 
+/**
+ * 按键事件统一出口：A5 05 <index> <state> XOR，state 1=按下 0=抬起。
+ * 按住期间由 keyInput 每 100ms 重发，quiet 避免刷诊断日志；计数仍由 sendFrame 累加一次。
+ */
+export async function sendKeyEvent(index: number, state: 0 | 1): Promise<boolean> {
+  if (!connected.value) return false
+  return sendFrame(buildFrame(CmdGet.KeyEvent, [index, state]), '按键事件', true)
+}
+
 /* ===== 心跳：连上后每 80ms 发 Ping，主控回 Pong；主控 300ms 收不到会停推监控值并收车 ===== */
 let pingTimer: number | null = null
 
@@ -245,8 +273,71 @@ function startPing(): void {
 /* ===== 两张参数目录（key=下位机数组下标 index） ===== */
 export const tunableMap = reactive<Record<number, DirItem>>({})
 export const monitorMap = reactive<Record<number, DirItem>>({})
+
+/** 监控项 index → 中文名。曲线建议帧只传 index，名字前端查目录表重建。 */
+export function monitorName(index: number): string {
+  return monitorMap[index]?.name ?? String(index)
+}
 /** 动作命令目录（key=命令字 0x80~0x9F），右侧下发表单按它渲染 */
 export const commandMap = reactive<Record<number, CmdDirItem>>({})
+/** 按键目录（key=按键表 index）。S1 只做存储，按键配置 UI 留到 S2 */
+export const keyMap = reactive<Record<number, KeyDirItem>>({})
+
+/* ===== 目录完整性：前端自算，后端模式连上时从 GET /api/dirs 取初值 =====
+   键为 tunable/monitor/cmd/key。expected=下位机登记的总项数（null=还没收到过），
+   received=已收到的目录项数，complete=两者是否相等。只报数量，不推断缺了哪个 index。 */
+export const dirStatus = reactive<DirStats>({
+  tunable: { expected: null, received: 0, complete: false },
+  monitor: { expected: null, received: 0, complete: false },
+  cmd: { expected: null, received: 0, complete: false },
+  key: { expected: null, received: 0, complete: false },
+})
+
+/** 目录请求命令字 → 对外表名；Response OK 的 reason[0] 是本轮总项数。 */
+const DIR_BY_REQ: Record<number, DirTable> = {
+  [CmdGet.RequestTunable]: 'tunable',
+  [CmdGet.RequestMonitor]: 'monitor',
+  [CmdGet.RequestCommand]: 'cmd',
+  [CmdGet.RequestKeyDir]: 'key',
+}
+
+/** 完整性不再由后端推：从透传的目录帧（4 张表长度）与 Response OK 自算。 */
+function refreshDirStatus(): void {
+  const counts: Record<DirTable, number> = {
+    tunable: Object.keys(tunableMap).length,
+    monitor: Object.keys(monitorMap).length,
+    cmd: Object.keys(commandMap).length,
+    key: Object.keys(keyMap).length,
+  }
+  for (const t of Object.keys(counts) as DirTable[]) {
+    dirStatus[t].received = counts[t]
+    dirStatus[t].complete = dirStatus[t].expected !== null && counts[t] === dirStatus[t].expected
+  }
+}
+
+export interface DirStatusView {
+  text: string
+  /** 数量对不上：用黄色轻提示（不是错误，不弹窗） */
+  warn: boolean
+}
+
+/** 目录完整性文案：总数未知→只报已收；齐了→「共 N 项」；缺项→「已收/总数」。
+    完全没数据（未连后端）返回空串，调用方据此回落到本地行数或整条隐藏 */
+export function dirStatusView(table: DirTable): DirStatusView {
+  const s = dirStatus[table]
+  if (s.expected === null) return { text: s.received > 0 ? `已收 ${s.received} 项` : '', warn: false }
+  if (s.complete) return { text: `共 ${s.expected} 项`, warn: false }
+  return { text: `${s.received}/${s.expected} 项`, warn: true }
+}
+
+/** 断开时清空：完整性只属于后端会话，留着会在切到串口/演示模式后假装是当前目录的状态 */
+function clearDirStatus(): void {
+  for (const t of Object.keys(dirStatus) as DirTable[]) {
+    dirStatus[t].expected = null
+    dirStatus[t].received = 0
+    dirStatus[t].complete = false
+  }
+}
 
 /**
  * 停车类特化命令（tag 的 SPEC 位 == Stop），按命令字排序。
@@ -284,7 +375,7 @@ export function selectMonitor(index: number | null): void {
 const setTimers = new Map<number, number>()
 const SET_ACK_TIMEOUT_MS = 2000
 /** 监控量最新值，由 50ms 定时刷新从高频原始缓冲搬运（避免 100Hz 直接触发响应式） */
-export const monitorLatest = reactive<Record<number, CellValue>>({})
+export const monitorLatest = reactive<Record<number, any>>({})
 
 /* ===== 电池电量（V5 Brain.Battery.capacity()，低速推送）=====
    按中文名"电池电量"在 monitorMap 里定位，不依赖 index：真机/演示同名同义，
@@ -321,8 +412,8 @@ export const focusCh = ref<number | null>(null)
 export const bigView = ref(false)
 
 /* ===== 右侧工作区：标签分页 + 折叠 + 可拖拽宽度 ===== */
-/** 右栏标签：context=随主视图变化的上下文面板，command=任务下发，tunable/monitor=迷你列表 */
-export type RightTab = 'command' | 'tunable' | 'monitor' | 'context'
+/** 右栏标签：context=随主视图变化的上下文面板，command=任务下发，tunable/monitor=迷你列表，keys=按键快速触发 */
+export type RightTab = 'command' | 'tunable' | 'monitor' | 'context' | 'keys'
 export const rightTab = ref<RightTab>('command')
 /** 右栏折叠：收成最右侧一条竖条，点一下展开 */
 export const rightCollapsed = ref(false)
@@ -457,10 +548,10 @@ export function applyChartSuggestion(): void {
   s.groups.forEach((group, ch) => {
     const list = channelTraces[ch]
     if (!list) return
-    for (const item of group) {
+    for (const idx of group) {
       if (list.length >= TRACE_MAX) break
-      if (list.includes(item.index)) continue
-      list.push(item.index)
+      if (list.includes(idx)) continue
+      list.push(idx)
     }
   })
   syncTraceSubs(before, tracedIndices())
@@ -599,7 +690,7 @@ interface SeriesBuf {
   len: number
 }
 const seriesBuf = new Map<number, SeriesBuf>()
-const rawLatest: Record<number, CellValue> = {}
+const rawLatest: Record<number, any> = {}
 const rawPose = { x: 0, y: 0, yaw: 0 }
 
 /* ===== 下位机时间戳展开：帧里带的是毫秒时钟低16位（65.536s回绕），曲线要的是单调时间轴 =====
@@ -805,7 +896,6 @@ function clearMonitorData(): void {
   stampRaw = -1 // 时间戳展开从头开始：重连后下位机时钟与旧基准不再连续
   stampMs = 0
   parser.resetMonitorTypes()
-  parser.resetCmdEchoLens() // 命令目录重拉，回显长度登记一并作废
   pose.valid = false
   poseIndex.x = -1
   poseIndex.y = -1
@@ -867,14 +957,15 @@ function handleEvent(e: RxEvent): void {
     pushDiag('EVT', `调参 #${e.index} 已确认：${item ? formatValue(item, e.value) : e.value}`)
     return
   }
+  if (e.kind === 'keyDirectory') {
+    // 按键目录：一条按键一帧，按 index 存表（S1 不做 UI，只存储）
+    keyMap[e.item.index] = e.item
+    pushDiag('EVT', `按键目录 #${e.item.index} ${e.item.name}`)
+    return
+  }
   if (e.kind === 'cmdDirectory') {
     // 动作命令目录：一条命令一帧，按命令字存表，右侧面板据此渲染表单
     commandMap[e.item.index] = e.item
-    // 登记回显长度（字段类型累加）：解 Response 帧时靠它定位 status 字节
-    parser.setCmdEchoLen(
-      e.item.index,
-      e.item.fields.reduce((n, f) => n + valueSize(f.type), 0),
-    )
     return
   }
   if (e.kind === 'response') {
@@ -882,12 +973,22 @@ function handleEvent(e: RxEvent): void {
     // OK 只记诊断日志（每帧都记会淹没什么都看不出来的关键事件）；
     // 非 OK（拒绝/需补发）记 ERR 并弹 toast——"命令发了车没动"必须当场看得见
     const label = cmdLabel(e.echoCmd, e.echoPayload)
-    if (e.status === 0x00) {
+    if ((e.status & RESP_OK_FAMILY_MASK) === 0) {
       pushDiag('ACK', `命令 ${label} 已确认`)
+      const t = DIR_BY_REQ[e.echoCmd]
+      if (t && e.status === RESP_OK_INFO && e.reason.length > 0) dirStatus[t].expected = e.reason[0]!
     } else {
-      const text = respReasonText(e.status, e.reason)
+      // 状态码 → 一句人话：内定 err 查中文表（全字节为键），串模式给原文
+      let text: string
+      if (e.status & RESP_MODE_MASK) {
+        const code = e.status & RESP_PAYLOAD_MASK
+        const name = RESP_ERR_NAMES_ZH[e.status]
+        text = name ? `${name}(内定err#${code})` : `未知内定err#${code}`
+      } else {
+        text = new TextDecoder('utf-8').decode(e.reason) || '(空)'
+      }
       pushDiag('ERR', `命令 ${label}：${text}`)
-      pushAlert(respIsReject(e.status) ? 'reject' : 'retry', `${label}：${text}`)
+      pushAlert(e.status & RESP_CLASS_MASK ? 'reject' : 'retry', `${label}：${text}`)
     }
     return
   }
@@ -932,7 +1033,7 @@ function handleEvent(e: RxEvent): void {
 setInterval(() => {
   for (const k of Object.keys(rawLatest)) {
     const index = Number(k)
-    const v = rawLatest[index] as CellValue
+    const v = rawLatest[index] as any
     monitorLatest[index] = v
     if (monitorMap[index]) monitorMap[index]!.value = v
     delete rawLatest[index]
@@ -965,14 +1066,22 @@ serialClient.onStatus = (state, message) => {
   if (state === 'connected') {
     // 新一轮连接：允许按持久化意向重新补发订阅（connected 必定转发，不受重试去重影响）
     restoredSubs.clear()
-    // 连上自动拉三张表，标题栏按钮也可随时手动刷新
+    // 连上自动拉四张表，标题栏按钮也可随时手动刷新
     void fetchTunable()
     void fetchMonitor()
     void fetchCommands()
+    void fetchKeys()
+    // 后端模式：目录已在后端缓存，连上先拉一次 HTTP 初值把完整性补齐
+    if (backendMode.value) {
+      void fetchDirStatus().then((d) => {
+        if (d) Object.assign(dirStatus, d)
+      })
+    }
     startPing() // 同时启动80ms心跳；主控300ms收不到Ping会自动停推监控值并收车
   } else {
     stopPing() // 断开/连接中/出错都停心跳，避免向已关闭的端口写
     clearPendingTunable() // 待确认的写参也全部作废
+    clearDirStatus() // 目录完整性只属于当前后端会话
     selectedTunableIndex.value = null
     selectedMonitorIndex.value = null
   }
@@ -985,19 +1094,25 @@ serialClient.onData = (data) => {
     lastRxLogAt = now
     pushDiag('RX', `原始字节 ${data.length}B：${toHex(data)}`)
   }
-  parser.feed(data, handleEvent)
+  parser.feed(data, (e) => {
+    handleEvent(e)
+    refreshDirStatus()
+  })
 }
 // 后端中转模式：固件回执异常（补发预算耗尽/无法结算）。Response 帧本身的
 // 拒绝/补发由 handleEvent 的 response 分支弹（透传字节谁都看得到），这里只补
 // 后端独有的决策结论——前端等不到帧，不推就彻底无声
 serialClient.onAlert = (a) => {
-  pushDiag('ERR', `${a.name}：${a.text}`)
-  pushAlert(a.level, `${a.name}：${a.text}`)
+  // E1 帧只带 cmd：level 恒 giveup，命令名与文案由前端查目录表造
+  const label = cmdLabel(a.cmd, new Uint8Array())
+  const text = `后端已放弃等待「${label}」的回执，请检查链路`
+  pushDiag('ERR', text)
+  pushAlert('giveup', text)
 }
 // 脚本推荐的曲线配置：只递给桌面端建议条，手机端不显示（手机曲线页是单通道，
 // 4 组建议没有落点）。诊断日志留一行，便于事后回看脚本推过什么
 serialClient.onChartSuggest = (s) => {
-  const desc = s.groups.map((g) => g.map((it) => it.name).join('、') || '空').join(' | ')
+  const desc = s.groups.map((g) => g.map(monitorName).join('、') || '空').join(' | ')
   pushDiag('EVT', `脚本推荐曲线配置（${s.source || '未知来源'}）：${desc}`)
   pushChartSuggestion(s)
 }
@@ -1067,6 +1182,18 @@ export async function setAccessMode(m: AccessMode): Promise<void> {
   if (m === 'backend' && autoConnect.value) void serialClient.autoConnect(baud)
 }
 
+/** 设置页改帧头：只写 prefs，协议层直接读，没有镜像要同步 */
+export function setFrameHeadPref(v: number): void {
+  const n = Number.isFinite(v) ? Math.min(255, Math.max(0, Math.floor(v))) : FRAME_HEAD_DEFAULT
+  savePrefs({ frameHead: n })
+}
+
+/** 设置页改帧长上限：只写 prefs，钳到 [MAX_PAYLOAD_MIN, MAX_PAYLOAD_CAP] */
+export function setFramePayloadLimit(v: number): void {
+  const n = Number.isFinite(v) ? Math.floor(v) : MAX_PAYLOAD_CAP
+  savePrefs({ maxPayload: Math.min(MAX_PAYLOAD_CAP, Math.max(MAX_PAYLOAD_MIN, n)) })
+}
+
 /** 设置页改后端地址：空串=清除覆盖、回到按页面来源推导。
  *  只落盘 + 同步 ref，不断开当前连接——WsTransport 每次 connect 才读地址，
  *  所以下一次点「连接」即生效。 */
@@ -1125,7 +1252,15 @@ export async function fetchCommands(): Promise<void> {
   await sendFrame(requestCommand(), '请求命令表')
 }
 
-/** 一键刷新：清空并重新拉取三张目录表（调参/实参/命令）。
+/* ===== 动作：按键目录 ===== */
+/** 拉取按键目录（S1 只存储，不做按键配置 UI） */
+export async function fetchKeys(): Promise<void> {
+  if (!connected.value) return
+  for (const k of Object.keys(keyMap)) delete keyMap[Number(k)]
+  await sendFrame(requestKeyDir(), '请求按键目录')
+}
+
+/** 一键刷新：清空并重新拉取四张目录表（调参/实参/命令/按键）。
     连接成功后本来会自动拉，这里供导航栏「刷新」手动重拉；未连接直接提示。 */
 export async function refreshAll(): Promise<void> {
   if (!connected.value) {
@@ -1135,6 +1270,7 @@ export async function refreshAll(): Promise<void> {
   await fetchTunable()
   await fetchMonitor()
   await fetchCommands()
+  await fetchKeys()
 }
 
 /**
@@ -1142,7 +1278,7 @@ export async function refreshAll(): Promise<void> {
  * 车是否执行可从实参表观察，相对量命令（转向/直行/局部移动）注意重发会累计。
  * values 顺序与 item.fields 对应，由面板保证已填且为有效数。
  */
-export async function sendCommand(index: number, values: CellValue[]): Promise<void> {
+export async function sendCommand(index: number, values: any[]): Promise<void> {
   if (!connected.value) return
   const item = commandMap[index]
   if (!item) return
@@ -1176,7 +1312,7 @@ export async function setSubscription(index: number, sub: boolean, fast: boolean
 }
 
 /* ===== 动作：写调参（SetTunable，以 TunableEcho 回显为确认） ===== */
-export async function setTunableValue(index: number, value: CellValue): Promise<void> {
+export async function setTunableValue(index: number, value: any): Promise<void> {
   if (!connected.value) return
   const item = tunableMap[index]
   // 类型以下位机目录为准；str/other 无可写宽度，直接拒绝
@@ -1199,7 +1335,7 @@ export async function setTunableValue(index: number, value: CellValue): Promise<
 }
 
 /** 数值显示格式化：浮点固定 3 位小数（防位数跳动），整数原样，bool/onoff 显开关 */
-export function formatValue(item: DirItem, v: CellValue): string {
+export function formatValue(item: DirItem, v: any): string {
   if (typeof v === 'string') return v // color: #RRGGBB
   if (item.type === ValueType.Bool || item.type === ValueType.OnOff) return v ? '开' : '关'
   if (item.type === ValueType.Float || item.type === ValueType.Double) {
@@ -1209,7 +1345,7 @@ export function formatValue(item: DirItem, v: CellValue): string {
 }
 
 /** 迷你列表用的紧凑数值格式：4 位有效数字，极大/极自动用科学计数法 */
-export function formatValueCompact(item: DirItem, v: CellValue): string {
+export function formatValueCompact(item: DirItem, v: any): string {
   if (typeof v === 'string') return v
   if (item.type === ValueType.Bool || item.type === ValueType.OnOff) return v ? '开' : '关'
   if (typeof v !== 'number') return String(v)

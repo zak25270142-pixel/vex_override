@@ -59,7 +59,7 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AppHeader from '@/components/shell/AppHeader.vue'
 import AlertToasts from '@/components/common/AlertToasts.vue'
 import ChartSuggestBar from '@/components/common/ChartSuggestBar.vue'
@@ -71,6 +71,7 @@ import {
   autoConnect,
   baud,
   demoMode,
+  desktopView,
   rightCollapsed,
   rightWidthPct,
   setAccessMode,
@@ -82,6 +83,11 @@ import { serialClient } from '@/services/serialClient'
 
 const isMobileView = ref(false)
 function detectMobile(): void {
+  // 「电脑版页面」开关优先级最高：无视宽度断点、触控能力和 ?mobile 调试参数
+  if (desktopView.value) {
+    isMobileView.value = false
+    return
+  }
   const params = new URLSearchParams(location.search)
   if (params.get('mobile') !== null) {
     isMobileView.value = true
@@ -92,6 +98,9 @@ function detectMobile(): void {
 function onResize(): void {
   detectMobile()
 }
+
+// 设置里切「电脑版页面」后立即换外壳，不必等下一次 resize
+watch(desktopView, detectMobile)
 
 onMounted(() => {
   detectMobile()

@@ -12,6 +12,7 @@
         desc="视觉画面与目标标注将在此呈现，当前版本预留"
         :icon="visionIcon"
       />
+      <ConfigView v-show="view === 'config'" />
     </div>
   </section>
 </template>
@@ -22,6 +23,7 @@ import ParamsView from '@/components/params/ParamsView.vue'
 import ChartView from '@/components/chart/ChartView.vue'
 import FieldMap from '@/components/map/FieldMap.vue'
 import PlaceholderView from '@/components/stage/PlaceholderView.vue'
+import ConfigView from '@/components/config/ConfigView.vue'
 import { view } from '@/stores/globle'
 
 const stroke =

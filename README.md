@@ -38,13 +38,15 @@
 
 通信类，负责和上位机通信，与其他模块低耦合
 
-### class MyMotorGroup
+### class MotorGroup / ChassisMotorGroup
 
-电机组类，控制的最底层，速度环的载体，当前改电机组数量还挺麻烦，待优化
+电机组类，控制的最底层，速度环的载体。基类 `MotorGroup` 只做采样/前馈 PID/逐台下发，
+底盘专属的六态机、积分与压摆策略在派生类 `ChassisMotorGroup`——升降杆等机构直接用基类或另行派生。
+组内台数由构造时的 `motor_count` 决定，增减不改代码
 
 ### class Chassis
 
-底盘类，位置环的载体，控制的中间层，向上承接RobotAction，向下指挥MyMotorGroup
+底盘类，位置环的载体，控制的中间层，向上承接RobotAction，向下指挥左右两组 ChassisMotorGroup
 
 ### class RobotAction
 
@@ -54,9 +56,9 @@
 
 如 各种调试入口
 
-### AI_vision
+### AI_vision / AI_VISION_MENU
 
-未封装成类
+视觉菜单已封装成 `AI_VISION_MENU` 类（见上）；底层传感器取帧与识别结果仍由 `ai_vision.cpp` 的函数提供
 
 ## 上位机迁移
 
@@ -135,8 +137,14 @@ MENU_ITEM my_monitor[] = {
 };
 
 // 动作命令（可选，0x80~0x9F）
+// 字段顺序固定为：{处理函数, 字段类型表, 字段名表, 命令中文名, tag, 取值范围}
+//   tag 用 cmd_tag_make(参数个数, 特化类型) 拼；bit7（带取值范围）不用手填，
+//   发目录时按 ranges 是否为空自动置位，表项不会两处不一致
+//   ranges 为 nullptr 表示不带范围；非 nullptr 时按字段顺序紧凑排 {min1,max1,min2,max2,...}
+static const VALUE_TYPE cmd_f_type[] = {type_float};
 const CMD_ITEM my_cmds[] = {
-    {cmd_stop, 0x80, nullptr, nullptr, 0, "停止"},
+    {cmd_stop, nullptr, nullptr, "停止", cmd_tag_make(0, CMD_SPEC_STOP), nullptr},
+    {cmd_turn, cmd_f_type, (const char *[]){"角度(度)"}, "原地转向", cmd_tag_make(1, CMD_SPEC_NORMAL), nullptr},
     // ...
 };
 ```
